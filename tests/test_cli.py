@@ -10,21 +10,18 @@ dataclass defaults on a per-flag basis.
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from tests.fixtures import generate_synthetic_fixture as fixture_gen
 from traktorco import cli
 from traktorco.config import AppConfig
 from traktorco.core.pipeline import PipelineResult
 from traktorco.nml.constants import CueType
 from traktorco.nml.models import TempoInfo, TrackEntry
 from traktorco.nml.parser import AmbiguousTrackError, NmlParser, TrackNotFoundError
-
-sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
-import generate_synthetic_fixture as fixture_gen  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SAMPLE_COLLECTION = FIXTURES_DIR / "sample_collection.nml"
@@ -368,7 +365,7 @@ class TestBuildConfigFromArgs:
                 "8",
                 "--timbre-threshold",
                 "20.0",
-                "--max-drop-cues",
+                "--max-cues",
                 "1",
             ]
         )
@@ -376,7 +373,7 @@ class TestBuildConfigFromArgs:
 
         assert config.phrase_beats == 8
         assert config.timbre_change_distance_threshold == 20.0
-        assert config.max_drop_cues == 1
+        assert config.max_cues == 1
         # Untouched fields still default.
         assert (
             config.energy_change_threshold_db == AppConfig().energy_change_threshold_db
@@ -394,9 +391,13 @@ class TestBuildConfigFromArgs:
             ("--mfcc-count", "20", "mfcc_count", 20),
             ("--energy-threshold", "6.0", "energy_change_threshold_db", 6.0),
             ("--timbre-threshold", "25.0", "timbre_change_distance_threshold", 25.0),
-            ("--intro-fraction", "0.1", "intro_search_fraction", 0.1),
-            ("--outro-fraction", "0.3", "outro_search_fraction", 0.3),
-            ("--max-drop-cues", "5", "max_drop_cues", 5),
+            ("--max-cues", "5", "max_cues", 5),
+            (
+                "--relative-confidence-threshold",
+                "0.5",
+                "relative_confidence_threshold",
+                0.5,
+            ),
         ],
     )
     def test_every_tuning_flag_maps_to_its_config_field(
@@ -407,6 +408,42 @@ class TestBuildConfigFromArgs:
         )
         config = cli.build_config_from_args(args)
         assert getattr(config, field_name) == expected
+
+    def test_stems_dir_defaults_to_none(self):
+        args = cli.build_parser().parse_args(["track.mp3", "--nml", "collection.nml"])
+        config = cli.build_config_from_args(args)
+        assert config.stems_dir is None
+
+    def test_stems_dir_flag_overrides_config_field(self):
+        args = cli.build_parser().parse_args(
+            [
+                "track.mp3",
+                "--nml",
+                "collection.nml",
+                "--stems-dir",
+                "D:/CustomStems",
+            ]
+        )
+        config = cli.build_config_from_args(args)
+        assert config.stems_dir == str(Path("D:/CustomStems"))
+
+    def test_verify_defaults_to_fast(self):
+        args = cli.build_parser().parse_args(["track.mp3", "--nml", "collection.nml"])
+        config = cli.build_config_from_args(args)
+        assert config.verify == "fast"
+
+    def test_verify_flag_overrides_config_field(self):
+        args = cli.build_parser().parse_args(
+            ["track.mp3", "--nml", "collection.nml", "--verify", "smart"]
+        )
+        config = cli.build_config_from_args(args)
+        assert config.verify == "smart"
+
+    def test_verify_rejects_invalid_choice(self):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(
+                ["track.mp3", "--nml", "collection.nml", "--verify", "bogus"]
+            )
 
     def test_main_passes_overridden_config_through_to_pipeline(
         self, tmp_path, monkeypatch
@@ -436,4 +473,4 @@ class TestBuildConfigFromArgs:
         assert captured_kwargs["config"].phrase_beats == 32
         assert captured_kwargs["config"].energy_change_threshold_db == 7.5
         # Unspecified fields still default.
-        assert captured_kwargs["config"].max_drop_cues == AppConfig().max_drop_cues
+        assert captured_kwargs["config"].max_cues == AppConfig().max_cues

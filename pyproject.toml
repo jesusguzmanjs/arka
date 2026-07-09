@@ -10,10 +10,12 @@ requires-python = ">=3.10"
 dependencies = [
     "librosa>=0.10",
     "numpy>=1.24",
+    "ffmpeg-python>=0.2",
+    "soundfile>=0.12",
 ]
 
 [project.scripts]
-traktorco = "traktorco.cli:main"
+cuegrid = "traktorco.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -25,4 +27,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

@@ -24,11 +24,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_HOTCUE_SLOTS = 8  # Traktor supports 8 hotcue pads per deck (spec section 3.2)
 
-# Display names matching the illustrative <CUE_V2> examples in spec section 3.1.
+# Display name for the single, unified structural cue label (spec section
+# 6.1, v1.4) -- there are no more position-based intro/drop/outro roles.
 _LABEL_TO_NAME = {
-    "intro_end": "Intro End",
-    "drop": "Drop",
-    "outro_start": "Outro",
+    "cue": "Cue",
 }
 
 
@@ -75,7 +74,9 @@ def map_event_to_cue(event: DetectedEvent, occupied_slots: set[int]) -> CuePoint
 
 
 def map_events_to_cues(
-    events: list[DetectedEvent], existing_cues: list[CuePoint]
+    events: list[DetectedEvent],
+    existing_cues: list[CuePoint],
+    clear_existing: bool = False,
 ) -> list[CuePoint]:
     """Map every confirmed ``DetectedEvent`` to a ``CuePoint``, in chronological order.
 
@@ -85,6 +86,11 @@ def map_events_to_cues(
             ``TrackEntry.cues``), used to seed the set of occupied HOTCUE
             slots so this project never overwrites a slot the user (or a
             previous run of this tool) already assigned (spec section 3.4).
+        clear_existing: If ``True``, ignore existing standard HotCues
+            (``TYPE="0"``) when calculating occupied slots, treating those
+            slots as free. Grid/BPM (``TYPE="4"``) and Load (``TYPE="3"``)
+            markers are still considered occupied because the writer
+            preserves them.
 
     Returns:
         The new ``CuePoint``s to append, one per event that could be
@@ -92,7 +98,13 @@ def map_events_to_cues(
         simply absent from the result (already logged as a warning by
         ``map_event_to_cue``).
     """
-    occupied_slots = {cue.hotcue for cue in existing_cues if cue.hotcue != -1}
+    occupied_slots: set[int] = set()
+    for cue in existing_cues:
+        if cue.hotcue == -1:
+            continue
+        if clear_existing and cue.type == CueType.CUE:
+            continue  # standard HotCues will be cleared by the writer
+        occupied_slots.add(cue.hotcue)
 
     new_cues: list[CuePoint] = []
     for event in sorted(events, key=lambda e: e.time_ms):

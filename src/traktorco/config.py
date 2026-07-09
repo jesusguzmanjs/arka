@@ -10,11 +10,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# v1.10: Dynamic sensitivity presets. Each mode bundles an
+# (energy_threshold_db, timbre_threshold) pair. When ``--mode`` is
+# supplied on the CLI, these values override any individual
+# ``--energy-threshold`` / ``--timbre-threshold`` flags.
+DETECTION_MODES: dict[str, tuple[float, float]] = {
+    "soft": (2.0, 8.0),
+    "medium": (4.0, 18.0),
+    "hard": (7.0, 30.0),
+}
+
 
 @dataclass
 class AppConfig:
     # audio.beatgrid: phrase-candidate generation (spec section 4)
-    phrase_beats: int = 16  # base phrase granularity, in beats (4-bar block)
+    phrase_beats: int = 8  # base phrase granularity, in beats (2-bar block)
     major_phrase_multiple: int = (
         2  # every Nth candidate is also an 8-bar (32-beat) "major" boundary
     )
@@ -36,11 +46,27 @@ class AppConfig:
         12.0  # min Euclidean MFCC distance to flag a timbre change
     )
 
-    # core.mapping: classification of confirmed candidates into labels
-    intro_search_fraction: float = (
-        0.25  # intro_end must fall within the first 25% of the track
+    # audio.detector: unified structural-cue selection (spec section 6)
+    max_cues: int = 8  # cap on how many cues are written per track
+    relative_confidence_threshold: float = (
+        0.3  # keep only candidates >= this fraction of the track's max confidence
     )
-    outro_search_fraction: float = (
-        0.20  # outro_start must fall within the last 20% of the track
-    )
-    max_drop_cues: int = 3  # cap on how many "drop" cues are written per track
+
+    # v1.8 data export: write per-candidate telemetry to a CSV for offline tuning
+    export_csv_path: str | None = None
+
+    # v1.10: dynamic sensitivity mode (None = use individual thresholds)
+    detection_mode: str | None = None
+
+    # v2.1: explicit override for Traktor's native Stems/ root directory.
+    # None = auto-discover (nml.stems.resolve_stem_path's Music-folder-first,
+    # NML-sibling-fallback order; spec section 9.6).
+    stems_dir: str | None = None
+
+    # v2.2: Multi-Source Validation mode (spec section 10). "fast" (default)
+    # only analyzes the isolated drum stem (falling back to the Master
+    # track automatically if the stem is empty/ambient -- section 10.1).
+    # "smart" additionally cross-checks each candidate against a small
+    # window of the Master audio to classify it as a rhythm-driven "Drop"
+    # or a melodic "Breakdown" (section 10.2).
+    verify: str = "fast"

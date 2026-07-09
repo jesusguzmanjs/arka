@@ -15,10 +15,16 @@ import logging
 import platform
 import sys
 from pathlib import Path
+from typing import Any, cast
 
-from traktorco.config import AppConfig
-from traktorco.core.pipeline import run_pipeline
-from traktorco.nml.parser import AmbiguousTrackError, TrackNotFoundError
+from traktorco.config import DETECTION_MODES, AppConfig
+from traktorco.core.pipeline import run_batch_pipeline, run_pipeline
+from traktorco.nml.parser import (
+    AmbiguousPlaylistError,
+    AmbiguousTrackError,
+    PlaylistNotFoundError,
+    TrackNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +92,35 @@ def discover_default_nml_path() -> Path | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="traktorco",
+        prog="cuegrid",
         description=(
-            "Analyze a track with Grid-Guided Phrase Analysis and inject "
+            "Analyze track(s) with Grid-Guided Phrase Analysis and inject "
             "confirmed HotCues into a Traktor collection.nml."
         ),
     )
-    parser.add_argument(
-        "track_path", type=Path, help="Path to the audio file to analyze"
+
+    # Mutually exclusive track selection group (spec section 8.4)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "track_path",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Path to the audio file to analyze (v1.0 single-track mode)",
     )
+    selection.add_argument(
+        "--track-title",
+        type=str,
+        default=None,
+        help="Batch mode: process all tracks matching this TITLE",
+    )
+    selection.add_argument(
+        "--playlist",
+        type=str,
+        default=None,
+        help="Batch mode: process all tracks in the named playlist",
+    )
+
     parser.add_argument(
         "--nml",
         type=Path,
@@ -106,25 +132,85 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--title",
-        type=str,
+        "--stems-dir",
+        type=Path,
         default=None,
-        help="Disambiguate by track TITLE if the path alone matches multiple ENTRYs",
+        dest="stems_dir",
+        help=(
+            "Path to Traktor's native Stems root directory, for v2.0 Stems "
+            "Integration path prediction (spec section 9). If omitted, "
+            "auto-discovered: first ~/Music/Traktor/Stems/ (Traktor's own "
+            "default), falling back to a Stems/ folder next to --nml if "
+            "that does not exist. Only needed if you have repointed "
+            "Traktor's stem storage location in its preferences."
+        ),
     )
     parser.add_argument(
         "--artist",
         type=str,
         default=None,
-        help="Disambiguate by track ARTIST if the path alone matches multiple ENTRYs",
+        help=(
+            "Disambiguate by track ARTIST. In single-track mode, used with "
+            "--title to resolve ambiguous paths. In batch mode (--track-title), "
+            "narrows the title search."
+        ),
+    )
+    parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help=(
+            "(Single-track mode only) Disambiguate by track TITLE if the path "
+            "alone matches multiple ENTRYs. Not allowed with --track-title or --playlist."
+        ),
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable INFO-level logging"
     )
+    parser.add_argument(
+        "--clear-existing",
+        action="store_true",
+        default=False,
+        help=(
+            "Remove all existing standard HotCues from the matched ENTRY before "
+            "writing new ones. Grid markers (AutoGrid) and Load markers are never "
+            "removed. Use this when you want a clean slate of auto-generated cues."
+        ),
+    )
+    parser.add_argument(
+        "--verify",
+        type=str,
+        choices=["fast", "smart"],
+        default="fast",
+        help=(
+            "Multi-Source Validation mode (v2.2, spec section 10). 'fast' "
+            "(default) analyzes only the isolated drum stem (with an "
+            "automatic fallback to the Master track if the stem is "
+            "empty/ambient). 'smart' additionally cross-checks each "
+            "candidate against the Master audio, labeling it 'Drop (Rhythm)' "
+            "or 'Breakdown (Melodic)'."
+        ),
+    )
+
+    # Validation: --title is only valid with track_path (single-track mode)
+    # This is checked in main() rather than here since argparse group rules are limited
 
     tuning = parser.add_argument_group(
         "Grid-Guided Phrase Analysis tuning (advanced)",
         "Any flag omitted here falls back to the AppConfig dataclass default "
         "(spec section 2.2) -- these are not required for normal use.",
+    )
+    tuning.add_argument(
+        "--mode",
+        type=str,
+        choices=["soft", "medium", "hard"],
+        default=None,
+        help=(
+            "Dynamic sensitivity preset: 'soft' (energy=2.0, timbre=8.0), "
+            "'medium' (energy=4.0, timbre=18.0, default), "
+            "'hard' (energy=7.0, timbre=30.0). "
+            "Overrides --energy-threshold and --timbre-threshold when set."
+        ),
     )
     tuning.add_argument(
         "--phrase-beats",
@@ -187,28 +273,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tuning.add_argument(
-        "--intro-fraction",
-        type=float,
-        default=None,
-        help=(
-            "intro_end must fall within this fraction of the track's start "
-            f"(default: {AppConfig.intro_search_fraction})"
-        ),
-    )
-    tuning.add_argument(
-        "--outro-fraction",
-        type=float,
-        default=None,
-        help=(
-            "outro_start must fall within this fraction of the track's end "
-            f"(default: {AppConfig.outro_search_fraction})"
-        ),
-    )
-    tuning.add_argument(
-        "--max-drop-cues",
+        "--max-cues",
         type=int,
         default=None,
-        help=f"Cap on how many 'drop' cues are written per track (default: {AppConfig.max_drop_cues})",
+        help=f"Cap on how many cues are written per track (default: {AppConfig.max_cues})",
+    )
+    tuning.add_argument(
+        "--relative-confidence-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Keep only candidates whose confidence is at least this fraction "
+            "of the track's strongest candidate "
+            f"(default: {AppConfig.relative_confidence_threshold})"
+        ),
+    )
+
+    export = parser.add_argument_group(
+        "Data export (v1.8)",
+        "Export per-candidate telemetry to CSV for offline analysis and tuning.",
+    )
+    export.add_argument(
+        "--export-csv",
+        type=Path,
+        default=None,
+        dest="export_csv_path",
+        metavar="PATH",
+        help="Write per-candidate metrics to a CSV file for data-driven tuning",
     )
     return parser
 
@@ -227,9 +318,12 @@ _CONFIG_FIELD_BY_ARG_DEST = {
     "mfcc_count": "mfcc_count",
     "energy_threshold": "energy_change_threshold_db",
     "timbre_threshold": "timbre_change_distance_threshold",
-    "intro_fraction": "intro_search_fraction",
-    "outro_fraction": "outro_search_fraction",
-    "max_drop_cues": "max_drop_cues",
+    "max_cues": "max_cues",
+    "relative_confidence_threshold": "relative_confidence_threshold",
+    "export_csv_path": "export_csv_path",
+    "mode": "detection_mode",
+    "stems_dir": "stems_dir",
+    "verify": "verify",
 }
 
 
@@ -241,13 +335,33 @@ def build_config_from_args(args: argparse.Namespace) -> AppConfig:
     cleanly falls back to that field's own dataclass default -- there is
     no duplicated/hardcoded default value here to drift out of sync with
     ``config.py``.
+
+    v1.10: when ``--mode`` is supplied, the preset's bundled thresholds
+    override any individual ``--energy-threshold`` / ``--timbre-threshold``
+    values.
     """
-    overrides = {
+    overrides: dict[str, Any] = {
         field_name: getattr(args, arg_dest)
         for arg_dest, field_name in _CONFIG_FIELD_BY_ARG_DEST.items()
         if getattr(args, arg_dest) is not None
     }
-    return AppConfig(**overrides)
+
+    # v1.10: --mode preset overrides individual threshold flags
+    if args.mode is not None:
+        energy, timbre = DETECTION_MODES[args.mode]
+        overrides["energy_change_threshold_db"] = energy
+        overrides["timbre_change_distance_threshold"] = timbre
+
+    # argparse type=Path produces a Path object; AppConfig expects str | None
+    if "export_csv_path" in overrides and overrides["export_csv_path"] is not None:
+        overrides["export_csv_path"] = str(overrides["export_csv_path"])
+    if "stems_dir" in overrides and overrides["stems_dir"] is not None:
+        overrides["stems_dir"] = str(overrides["stems_dir"])
+
+    # cast() tells the type-checker we know the dict values match AppConfig's
+    # field types -- the keys are a closed set mapped explicitly above, and
+    # every value originates from a typed argparse argument or a literal.
+    return AppConfig(**cast(dict[str, Any], overrides))
 
 
 def _resolve_nml_path(explicit_nml: Path | None) -> Path | None:
@@ -269,6 +383,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
+    # Validation: --title is only allowed in single-track mode
+    if args.title is not None and args.track_path is None:
+        print(
+            "error: --title is only valid in single-track mode (with TRACK_PATH). "
+            "Use --artist to narrow batch title search.",
+            file=sys.stderr,
+        )
+        return 1
+
     nml_path = _resolve_nml_path(args.nml)
     if nml_path is None:
         print(
@@ -280,39 +403,100 @@ def main(argv: list[str] | None = None) -> int:
 
     config = build_config_from_args(args)
 
-    try:
-        result = run_pipeline(
-            nml_path=nml_path,
-            track_path=args.track_path,
-            config=config,
-            title=args.title,
-            artist=args.artist,
-        )
-    except AmbiguousTrackError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        print(
-            "\nMultiple tracks share this LOCATION. Narrow it down with "
-            "--title and/or --artist.",
-            file=sys.stderr,
-        )
-        return 1
-    except TrackNotFoundError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    # Route to single-track or batch pipeline based on selection mode
+    if args.track_path is not None:
+        # Single-track mode (v1.0)
+        try:
+            result = run_pipeline(
+                nml_path=nml_path,
+                track_path=args.track_path,
+                config=config,
+                title=args.title,
+                artist=args.artist,
+                clear_existing=args.clear_existing,
+            )
+        except AmbiguousTrackError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            print(
+                "\nMultiple tracks share this LOCATION. Narrow it down with "
+                "--title and/or --artist.",
+                file=sys.stderr,
+            )
+            return 1
+        except TrackNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
-    print(f"{result.entry.artist} - {result.entry.title}")
-    print(f"Detected {len(result.detected_events)} event(s):")
-    for event in result.detected_events:
-        print(
-            f"  {event.label:>12}  {event.time_ms:>12.3f} ms  confidence={event.confidence:.3f}"
-        )
+        print(f"{result.entry.artist} - {result.entry.title}")
+        print(f"Detected {len(result.detected_events)} event(s):")
+        for event in result.detected_events:
+            print(
+                f"  {event.label:>12}  {event.time_ms:>12.3f} ms  confidence={event.confidence:.3f}"
+            )
 
-    if result.written_cues:
-        print(f"Wrote {len(result.written_cues)} new CUE_V2 element(s) to {nml_path}")
+        if result.written_cues:
+            print(
+                f"Wrote {len(result.written_cues)} new CUE_V2 element(s) to {nml_path}"
+            )
+            if config.verify == "smart":
+                for cue in result.written_cues:
+                    print(f"  [{cue.hotcue}] {cue.name!r} @ {cue.start_ms:.3f} ms")
+        else:
+            print("No cues written (no confirmed events, or all HOTCUE slots occupied)")
+
+        return 0
+
     else:
-        print("No cues written (no confirmed events, or all HOTCUE slots occupied)")
+        # Batch mode (v1.1)
+        try:
+            batch_result = run_batch_pipeline(
+                nml_path=nml_path,
+                config=config,
+                playlist=args.playlist,
+                track_title=args.track_title,
+                artist=args.artist,
+                clear_existing=args.clear_existing,
+            )
+        except PlaylistNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except AmbiguousPlaylistError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            print(
+                "\nMultiple playlists share this name. Rename one in Traktor.",
+                file=sys.stderr,
+            )
+            return 1
+        except TrackNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
-    return 0
+        # Print per-track results (spec section 8.4 output format)
+        for track_result in batch_result.results:
+            if track_result.error is not None:
+                # Track was skipped
+                status = "[skipped]"
+                msg = f"{track_result.entry.artist} - {track_result.entry.title}   {track_result.error}"
+            else:
+                # Track succeeded
+                status = "[ok]"
+                event_count = (
+                    len(track_result.detected_events)
+                    if track_result.detected_events
+                    else 0
+                )
+                cue_count = len(track_result.written_cues)
+                msg = f"{track_result.entry.artist} - {track_result.entry.title}   {event_count} event(s), {cue_count} cue(s) written"
+
+            print(f"{status:10} {msg}")
+
+        # Print final tally
+        total = len(batch_result.results)
+        succeeded = batch_result.succeeded_count
+        skipped = batch_result.skipped_count
+        print(f"\nProcessed {succeeded}/{total} tracks ({skipped} skipped)")
+
+        return 0
 
 
 if __name__ == "__main__":

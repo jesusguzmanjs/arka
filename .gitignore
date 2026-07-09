@@ -7,3 +7,6 @@ build/
 dist/
 *.nml.bak
 tests/fixtures/sample_track.wav
+referencia_stems.py
+tests/fixtures/sample_collection.nml
+*.csv

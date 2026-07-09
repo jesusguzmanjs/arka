@@ -1,19 +1,28 @@
-# traktorco
+# cuegrid
 
-Analyzes audio tracks and automatically injects HotCues into Traktor
-Pro's `collection.nml`, using **Traktor's own BPM and beatgrid data** as
-the source of truth — no independent beat-detection or grid-fitting, and
-no snapping/quantization step, because every cue this tool writes is
-mathematically derived from the grid to begin with.
+A data-science and stem-separation-powered HotCue generation tool for
+Traktor Pro. **cuegrid** analyzes your audio tracks and automatically
+injects structural HotCues into Traktor's `collection.nml`, using
+**Traktor's own BPM and beatgrid data** as the source of truth — no
+independent beat-detection or grid-fitting, and no snapping/quantization
+step, because every cue this tool writes is mathematically derived from
+the grid to begin with.
 
 - Reads BPM and the grid anchor (`AutoGrid`) straight from your Traktor
   collection.
 - Analyzes only small, targeted windows of audio at musically meaningful
   phrase boundaries (every 16/32 beats) — never the whole track.
-- Confirms `intro_end`, `drop`, and `outro_start` cue points only where a
-  real energy or timbre change is detected.
+- Confirms structural cue points only where a real energy or timbre
+  change is detected, selecting the strongest, most confident changes
+  across the whole track (up to `--max-cues`) rather than fixed
+  intro/outro roles.
 - Writes new `<CUE_V2>` HotCue elements back into your `collection.nml`,
   never touching your existing cues, grid, or any other track data.
+- **Batch Processing:** Process single tracks, search by title, or
+  analyze entire playlists natively through the XML tree.
+- **Stem Integration:** When Traktor's native Stems are present, isolates
+  the drum/rhythm component for cleaner detection, with automatic
+  fallback to the full mix for ambient or drum-light material.
 
 Full technical specification: [`.openspec/2-spec.md`](.openspec/2-spec.md).
 
@@ -25,7 +34,7 @@ Requires **Python 3.10+**.
 
 ```bash
 git clone <this-repo>
-cd traktorco
+cd cuegrid
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # macOS/Linux
@@ -33,7 +42,7 @@ python -m venv .venv
 pip install -e .
 ```
 
-This installs the `traktorco` console command along with its runtime
+This installs the `cuegrid` console command along with its runtime
 dependencies (`librosa`, `numpy`).
 
 For running the test suite too:
@@ -53,59 +62,61 @@ pytest
 
 ## CLI usage
 
+The CLI supports three mutually exclusive target modes (Path, Title, or
+Playlist):
+
 ```
-traktorco TRACK_PATH [--nml NML_PATH] [--title TITLE] [--artist ARTIST]
-          [-v] [tuning flags...]
+cuegrid [TRACK_PATH | --track-title TITLE | --playlist NAME]
+        [--artist ARTIST] [--nml NML_PATH] [-v] [tuning flags...]
 ```
 
-### Basic example
-
+### 1. Single Track (By Path)
 ```bash
-traktorco "D:\Music\Artist - Track.flac"
+cuegrid "D:\Music\Artist - Track.flac"
 ```
 
-If `--nml` is omitted, `traktorco` auto-discovers your `collection.nml`
-(see [Auto-discovery](#auto-discovery-of-collectionnml) below). Output
-looks like:
-
+### 2. Batch Processing (By Playlist)
+Analyzes an entire Traktor playlist natively. If a track fails (e.g.
+missing BPM or corrupted audio), it is safely skipped without halting the
+batch.
+```bash
+cuegrid --playlist "My IDM Breaks"
 ```
-Artist - Track
-Detected 5 event(s):
-     intro_end      6997.217 ms  confidence=3.152
-          drop     27568.836 ms  confidence=10.403
-          drop     54997.662 ms  confidence=11.565
-          drop    137284.138 ms  confidence=19.706
-   outro_start    240142.234 ms  confidence=7.078
-Wrote 5 new CUE_V2 element(s) to C:\Users\you\Documents\Native Instruments\Traktor 4.4.0\collection.nml
+
+### 3. Batch Processing (By Title)
+Analyzes all tracks matching a specific title. You can narrow this down
+by adding the artist.
+```bash
+cuegrid --track-title "Song Name" --artist "Artist Name"
 ```
 
 ### `--nml`: pointing at a specific collection
 
 ```bash
-traktorco "D:\Music\Artist - Track.flac" --nml "D:\Backups\collection.nml"
+cuegrid --playlist "Techno Set" --nml "D:\Backups\collection.nml"
 ```
 
 Use this to target a specific collection file explicitly — useful if you
-have multiple Traktor installations, work from a backup, or run this
-tool in a script/CI context where auto-discovery isn't appropriate.
+have multiple Traktor installations, work from a backup, or run this tool
+in a script/CI context where auto-discovery isn't appropriate.
 
 ### Auto-discovery of `collection.nml`
 
-If `--nml` is not given, `traktorco` searches the standard Traktor
-install locations:
+If `--nml` is not given, `cuegrid` searches the standard Traktor install
+locations:
 
 - **Windows / macOS:** `~/Documents/Native Instruments/Traktor */collection.nml`
 
 Every installed Traktor version creates its own `Traktor x.x.x` folder
-under that root; `traktorco` checks all of them and picks the
-**most recently modified** `collection.nml`. If none is found anywhere,
-it exits with an error asking you to pass `--nml` explicitly.
+under that root; `cuegrid` checks all of them and picks the **most
+recently modified** `collection.nml`. If none is found anywhere, it exits
+with an error asking you to pass `--nml` explicitly.
 
 ### `--title` / `--artist`: disambiguating duplicate tracks
 
 A track is matched to an `<ENTRY>` in your collection by its file path.
 In the rare case that more than one `<ENTRY>` shares the exact same
-`LOCATION` (e.g. an edited/merged collection), `traktorco` will refuse to
+`LOCATION` (e.g. an edited/merged collection), `cuegrid` will refuse to
 guess and instead report the conflict:
 
 ```
@@ -117,8 +128,8 @@ Multiple tracks share this LOCATION. Narrow it down with --title and/or --artist
 Resolve it with either or both flags:
 
 ```bash
-traktorco "D:\Music\Artist - Track.flac" --title "Track (Extended Mix)"
-traktorco "D:\Music\Artist - Track.flac" --artist "Artist" --title "Track (Extended Mix)"
+cuegrid "D:\Music\Artist - Track.flac" --title "Track (Extended Mix)"
+cuegrid "D:\Music\Artist - Track.flac" --artist "Artist" --title "Track (Extended Mix)"
 ```
 
 Matching is case-insensitive and exact (not a substring search).
@@ -126,8 +137,8 @@ Matching is case-insensitive and exact (not a substring search).
 ### `-v` / `--verbose`
 
 Enables `INFO`-level logging (which `<ENTRY>` was matched, how many
-events were detected, how many cues were written, etc.). Without it,
-only warnings and the final summary are shown.
+events were detected, how many cues were written, etc.). Without it, only
+warnings and the final summary are shown.
 
 ### Tuning flags (advanced)
 
@@ -137,36 +148,91 @@ default, shown in `--help`:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--phrase-beats` | `16` | Base phrase granularity, in beats (a 4-bar block). Candidates are generated every N beats from the grid anchor. |
-| `--major-phrase-multiple` | `2` | Every Nth candidate is additionally tagged a "major" (8-bar / 32-beat) phrase boundary. |
+| `--mode` | (none) | Dynamic sensitivity preset: `soft`, `medium`, or `hard`. When set, overrides `--energy-threshold` and `--timbre-threshold`. See [Sensitivity Modes](#sensitivity-modes-v110). |
+| `--phrase-beats` | `8` | Base phrase granularity, in beats (a 2-bar block). Candidates are generated every N beats from the grid anchor. |
+| `--major-phrase-multiple` | `2` | Every Nth candidate is additionally tagged a "major" (4-bar / 16-beat) phrase boundary. |
 | `--sample-rate` | native | Resample analysis windows to this rate; omit to keep each track's native sample rate. |
 | `--hop-length` | `512` | Frame hop used for RMS/MFCC extraction within each window. |
-| `--window-beats` | `4.0` | Size of the before/after analysis window around each candidate, in beats (so it scales with tempo instead of using a fixed number of seconds). |
+| `--window-beats` | `4.0` | Size of the before/after analysis window around each candidate, in beats (1 bar). |
 | `--mfcc-count` | `13` | Number of MFCC coefficients extracted per window (timbre fingerprint size). |
 | `--energy-threshold` | `3.0` | Minimum absolute RMS energy change, in dB, to flag a candidate as significant. |
 | `--timbre-threshold` | `12.0` | Minimum Euclidean distance between MFCC vectors to flag a candidate as significant. |
-| `--intro-fraction` | `0.25` | `intro_end` must fall within this fraction of the track's start. |
-| `--outro-fraction` | `0.20` | `outro_start` must fall within this fraction of the track's end. |
-| `--max-drop-cues` | `3` | Maximum number of `drop` cues written per track. |
+| `--max-cues` | `8` | Maximum number of cues written per track. |
+| `--clear-existing` | (flag) | Clear existing standard HotCues (TYPE="0") before writing new ones. Grid/BPM (TYPE="4") and Load (TYPE="3") markers are preserved. **Smart slot reclamation:** when active, the tool calculates slot availability as if those old HotCues are already gone, preventing premature "all slots occupied" warnings and ensuring a perfect sequential fill from slot 0 upward. |
+| `--relative-confidence-threshold` | `0.3` | Keep only candidates whose confidence is at least this fraction of the track's strongest candidate. |
+| `--export-csv` | (none) | Write per-candidate telemetry to a CSV file for data-driven tuning (see [Data Export](#data-export-v18)). |
 
-Example — fewer, stronger drops only:
+### Sensitivity Modes (v1.10)
+
+Instead of manually tuning `--energy-threshold` and `--timbre-threshold`,
+use the `--mode` flag to pick a preset sensitivity:
+
+| Mode | Energy Threshold | Timbre Threshold | Best for |
+|---|---|---|---|
+| `soft` | 2.0 dB | 8.0 | Subtle transitions, ambient, downtempo |
+| `medium` | 4.0 dB | 18.0 | General-purpose electronic music (default) |
+| `hard` | 7.0 dB | 30.0 | Only the most dramatic drops/breaks |
 
 ```bash
-traktorco "D:\Music\Artist - Track.flac" --max-drop-cues 1 --energy-threshold 6.0
+# Gentle detection for ambient / downtempo
+cuegrid --playlist "Ambient" --mode soft
+
+# Only catch the biggest structural changes
+cuegrid --playlist "Hard Techno" --mode hard
 ```
 
-Run `traktorco --help` for the full, always-up-to-date list.
+When `--mode` is set, any individual `--energy-threshold` or
+`--timbre-threshold` flags are ignored in favor of the preset.
+
+Example — tuning for complex IDM structures (fewer, stronger texture
+shifts over energy drops):
+
+```bash
+cuegrid --playlist "Complex IDM" --max-cues 2 --timbre-threshold 8.0 --energy-threshold 15.0
+```
+
+Run `cuegrid --help` for the full, always-up-to-date list.
+
+### `--verify`: Multi-Source Validation (v2.2)
+
+`--verify {fast,smart}` (default: `fast`) controls how much
+cross-checking happens when a track has a native Drums/Rhythm stem (see
+Stems Integration):
+
+- **`fast` (default):** analyzes only the isolated drum stem. If the
+  extracted stem turns out to be practically silent/ambient (e.g.
+  Ambient or IDM tracks with little to no real drum content), this is
+  detected automatically via a lightning-fast energy probe, and `cuegrid`
+  transparently falls back to analyzing the original Master track instead
+  — no flag needed for this fallback, it's always on.
+- **`smart`:** on top of everything `fast` does, cross-checks every
+  confirmed cue against a small window of the Master audio and relabels
+  it accordingly:
+  - Rhythm-driven hit (drums *and* the full mix are both energetic) →
+    named `"Drop (Rhythm)"`.
+  - Melodic passage where the drums drop out but the mix stays energetic
+    → named `"Breakdown (Melodic)"`.
+
+  These names appear directly on the HotCue pad when you reload the
+  track in Traktor.
+
+```bash
+cuegrid "D:\Music\Artist - Track.flac" --verify smart
+```
+
+`smart` only ever decodes a couple of extra seconds of the Master file
+per confirmed cue — it never re-decodes the whole track.
 
 ---
 
 ## How Grid-Guided Phrase Analysis works
 
 Most auto-cue tools run beat/onset/novelty detection blindly across an
-entire track. `traktorco` takes a different, DJ-centric approach: in
+entire track. `cuegrid` takes a different, DJ-centric approach: in
 club-oriented electronic music, structural changes (drops, breakdowns,
 intro/outro boundaries) overwhelmingly land on **musical phrase
 boundaries** — 4-bar (16-beat) or 8-bar (32-beat) blocks. So instead of
-searching everywhere, `traktorco` only looks *there*.
+searching everywhere, `cuegrid` only looks *there*.
 
 ```mermaid
 flowchart TD
@@ -175,7 +241,7 @@ flowchart TD
     C --> D[Extract RMS energy + MFCC timbre for each window]
     D --> E[Score energy-delta dB + timbre distance]
     E --> F{Change significant?}
-    F -->|yes| G[Confirm as intro_end / drop / outro_start]
+    F -->|yes| G[Confirm as a structural cue]
     F -->|no| H[Discard candidate]
     G --> I[Map to lowest free HOTCUE slot 0-7]
     I --> J[Append CUE_V2 elements to collection.nml]
@@ -201,7 +267,7 @@ nearest beat afterward.
 
 ### 2. Only small windows are ever decoded
 
-For each candidate, `traktorco` decodes exactly two short audio windows —
+For each candidate, `cuegrid` decodes exactly two short audio windows —
 one immediately before it, one immediately after (sized in beats, so the
 window automatically scales with tempo) — using `librosa`'s
 offset/duration seeking. The rest of the track is never touched. For a
@@ -219,10 +285,12 @@ Each window pair is scored on two independent signals:
   (a numeric fingerprint of the sound's texture/instrumentation).
 
 A candidate is confirmed only if either signal crosses its threshold
-(`--energy-threshold` / `--timbre-threshold`). The earliest confirmed
-candidate near the start of the track becomes `intro_end`; the latest
-near the end becomes `outro_start`; the strongest remaining
-energy-rising candidates (up to `--max-drop-cues`) become `drop`.
+(`--energy-threshold` / `--timbre-threshold`) *and* its "after" window
+isn't practically silent (an anti-silence guard that keeps fade-outs from
+ever being confirmed). All confirmed candidates across the whole track
+form a single pool: only those within `--relative-confidence-threshold`
+of the track's strongest candidate survive, and the top `--max-cues` (by
+confidence) are written.
 
 ### 4. Cues are written, never anything else touched
 
@@ -238,18 +306,46 @@ appended as new `<CUE_V2>` elements. The writer:
   write of a run.
 
 For the full algorithm, data structures, and edge-case handling, see
-[`.openspec/2-spec.md`](.openspec/2-spec.md), sections 4 and 6.
+[`.openspec/2-spec.md`](.openspec/2-spec.md), sections 4, 6, and 8.
+
+---
+
+## Data Export (v1.8)
+
+Pass `--export-csv metrics.csv` to write per-candidate telemetry for
+every track analyzed. Each row represents one phrase-boundary candidate
+that was evaluated, with these columns:
+
+| Column | Description |
+|---|---|
+| `track_title` | `"Artist - Title"` string identifying the track |
+| `beat` | Beat index of the phrase-boundary candidate |
+| `time_ms` | Timestamp of the candidate in milliseconds |
+| `energy_delta_db` | RMS energy change (dB) across the candidate; positive = rising, negative = falling |
+| `timbre_dist` | Euclidean distance between before/after MFCC vectors |
+| `confidence` | Combined confidence score (arbitrary positive scale) |
+| `status` | Final disposition: `SELECTED`, `DISCARDED_LIMIT`, `REJECTED_THRESHOLD`, `REJECTED_SILENCE`, or `REJECTED_MISSING_WINDOW` |
+
+Rows are appended on each run, so you can accumulate data across multiple
+sessions. Open the CSV in any spreadsheet or load it into a database to
+filter by status, compare thresholds, and tune the detection parameters
+data-driven.
+
+```bash
+# Export telemetry while analyzing a playlist
+cuegrid --playlist "Techno Set" --export-csv tuning_data.csv -v
+```
 
 ---
 
 ## Safety notes
 
 - Always keep your own backup of `collection.nml` in addition to the
-  automatic `.bak` this tool creates — especially the first few times you
-  run it.
-- Close Traktor before running `traktorco` against your live collection,
+  automatic `.bak` this tool creates — especially the first few times
+  you run it.
+- Close Traktor before running `cuegrid` against your live collection,
   the same way you would for any other external collection editor.
-- Re-running `traktorco` on a track it has already processed is safe: it
+- Re-running `cuegrid` on a track it has already processed is safe: it
   will detect the already-used `HOTCUE` slots and either fill in
   remaining free slots or skip with a warning once all 8 are occupied —
   it will never overwrite a cue it (or you) already placed.

@@ -47,3 +47,9 @@ class TrackEntry:
     duration_ms: float = (
         0.0  # from <INFO PLAYTIME_FLOAT="..."> * 1000; bounds candidate generation
     )
+    peak_db: float | None = None  # from <LOUDNESS PEAK_DB="...">; None if absent
+    perceived_db: float | None = (
+        None  # from <LOUDNESS PERCEIVED_DB="...">; None if absent
+    )
+    audio_id: str | None = None  # from <ENTRY AUDIO_ID="...">; None if absent
+    flags: int | None = None  # from <INFO FLAGS="...">; None if absent (v2.0 stems)

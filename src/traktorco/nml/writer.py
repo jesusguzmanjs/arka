@@ -49,6 +49,7 @@ class NmlWriter:
         cues: list[CuePoint],
         title: str | None = None,
         artist: str | None = None,
+        clear_existing: bool = False,
     ) -> None:
         """Append ``cues`` as new ``<CUE_V2>`` elements on the matched ``ENTRY``.
 
@@ -56,6 +57,8 @@ class NmlWriter:
 
         - Locates the ``ENTRY`` via the same matching logic as
           ``NmlParser.find_entry`` (section 7) -- never re-derived here.
+        - Optionally clears existing standard HotCues before appending
+          (``clear_existing=True``), leaving Grid/Load markers untouched.
         - Only *appends* new ``TYPE=0`` ``<CUE_V2>`` children; the existing
           ``AutoGrid`` (``TYPE=4``) cue and every other existing child is
           left byte-for-byte untouched.
@@ -78,6 +81,10 @@ class NmlWriter:
                 6) -- must match whatever was used to resolve the
                 ``TrackEntry`` this ``cues`` list was computed from.
             artist: Optional disambiguation filter, same purpose.
+            clear_existing: If ``True``, remove all existing standard
+                HotCues (``TYPE="0"``) from the entry before appending.
+                Grid markers (``TYPE="4"``) and Load markers (``TYPE="3"``)
+                are never removed. Defaults to ``False``.
 
         Raises:
             TrackNotFoundError: if no ``ENTRY`` matches ``track_path``.
@@ -90,6 +97,37 @@ class NmlWriter:
             return
 
         entry_el = self._parser.find_entry_element(track_path, title, artist)
+        self.write_cues_to_element(entry_el, cues, clear_existing=clear_existing)
+        self._backup_if_needed()
+        self._write_atomic()
+
+    def write_cues_to_element(
+        self, entry_el: ET.Element, cues: list[CuePoint], clear_existing: bool = False
+    ) -> None:
+        """Append ``cues`` as new ``<CUE_V2>`` elements to a given ``<ENTRY>`` element.
+
+        This is the core primitive used by both ``write_cues`` (spec section 3.4)
+        and batch processing (spec section 8.3) to avoid re-deriving the
+        element by path in batch mode.
+
+        When ``clear_existing`` is ``True``, existing standard HotCues
+        (``TYPE="0"``) are removed before slot conflict checking and
+        appending. Grid and Load markers (``TYPE="4"`` / ``TYPE="3"``)
+        are never removed.
+
+        Args:
+            entry_el: The ``<ENTRY>`` element to append cues to (must be
+                the live element from the parsed tree).
+            cues: The new ``CuePoint``s to append.
+            clear_existing: Remove existing HotCues first if ``True``.
+
+        Raises:
+            HotcueSlotConflictError: if a cue's ``HOTCUE`` slot is already
+                occupied on the entry.
+        """
+        if clear_existing:
+            self._clear_hotcues(entry_el)
+
         occupied_slots = self._occupied_hotcue_slots(entry_el)
 
         for cue in cues:
@@ -102,8 +140,15 @@ class NmlWriter:
             if cue.hotcue != -1:
                 occupied_slots.add(cue.hotcue)
 
-        self._backup_if_needed()
-        self._write_atomic()
+    @staticmethod
+    def _clear_hotcues(entry_el: ET.Element) -> None:
+        """Remove all standard HotCue ``<CUE_V2>`` elements (``TYPE="0"``)
+        from the entry, leaving Grid (``TYPE="4"``), Load (``TYPE="3"``),
+        and other marker types untouched.
+        """
+        to_remove = [el for el in entry_el.findall("CUE_V2") if el.get("TYPE") == "0"]
+        for el in to_remove:
+            entry_el.remove(el)
 
     @staticmethod
     def _occupied_hotcue_slots(entry_el: ET.Element) -> set[int]:
