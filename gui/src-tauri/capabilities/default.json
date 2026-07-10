@@ -14,7 +14,7 @@
       "identifier": "shell:allow-spawn",
       "allow": [
         {
-          "name": "binaries/cuegrid",
+          "name": "binaries/cuegrid-core",
           "sidecar": true,
           "args": true
         }

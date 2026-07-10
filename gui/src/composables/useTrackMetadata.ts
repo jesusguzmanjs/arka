@@ -1,7 +1,7 @@
 // composables/useTrackMetadata.ts
 // See .openspec/3-player-spec.md §1 (Core Extension), §4.1 (Stage 1), §6 (Data Structures).
 //
-// Spawns the packaged Python core as a Tauri sidecar (binaries/cuegrid) with
+// Spawns the packaged Python core as a Tauri sidecar (binaries/cuegrid-core) with
 // the `--get-track-metadata <TRACK_PATH>` flag, buffers its one-shot JSON
 // stdout line, parses it on process close, and updates a module-scoped
 // singleton `usePlayerState` reactive store. Mirrors the spawn-buffer-parse
@@ -157,7 +157,7 @@ export function usePlayerState() {
 // §1.1 / §4.1 — sidecar spawn + buffer + parse-on-close
 // ---------------------------------------------------------------------------
 
-const SIDECAR_NAME = "binaries/cuegrid";
+const SIDECAR_NAME = "binaries/cuegrid-core";
 
 export interface FetchTrackMetadataResult {
   ok: boolean;
@@ -170,7 +170,7 @@ export interface FetchTrackMetadataResult {
 }
 
 /**
- * Spawn `binaries/cuegrid --get-track-metadata <trackPath>`, buffer stdout,
+ * Spawn `binaries/cuegrid-core --get-track-metadata <trackPath>`, buffer stdout,
  * and parse the single JSON line emitted on process close (§1.2, §4.1).
  *
  * The exit code is the final source of truth (2-core-spec.md §11.6): `0` →

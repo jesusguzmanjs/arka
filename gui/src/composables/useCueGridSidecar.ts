@@ -2,7 +2,7 @@
 // See .openspec/3-gui-spec.md §6.4, §6.6, §6.7 and .openspec/4-library-spec.md §2.5.
 //
 // Spawns the packaged Python core as a Tauri sidecar process
-// (binaries/cuegrid), streams its NDJSON stdout into useRunState in
+// (binaries/cuegrid-core), streams its NDJSON stdout into useRunState in
 // real-time, and exposes cancellation via the spawned Child handle.
 //
 // Process boundary: UI -> Command.sidecar -> OS process -> NDJSON on
@@ -18,7 +18,7 @@ import { preparePlayerForAnalysis } from "./useTrackMetadata";
 import type { CueGridConfig } from "../types/config";
 import type { SidecarMessage } from "../types/sidecar";
 
-const SIDECAR_NAME = "binaries/cuegrid";
+const SIDECAR_NAME = "binaries/cuegrid-core";
 
 /**
  * Builds the argv array for the sidecar directly from CueGridConfig.

@@ -21,7 +21,7 @@ import {
   isPlaylistTracksError,
 } from "../types/library";
 
-const SIDECAR_NAME = "binaries/cuegrid";
+const SIDECAR_NAME = "binaries/cuegrid-core";
 
 interface LibraryState {
   playlists: string[];
@@ -49,7 +49,7 @@ export function useLibraryState() {
   const { update, selectedTrackPath } = useConfigState();
 
   /**
-   * Spawn `binaries/cuegrid --list-playlists`, buffer stdout, and parse
+   * Spawn `binaries/cuegrid-core --list-playlists`, buffer stdout, and parse
    * the single JSON array line emitted on process close (2-core-spec.md
    * §12.3). Populates `state.playlists`. Relocated verbatim from
    * TargetSelector.vue's former onMounted hook (4-library-spec.md §3.1).
@@ -112,7 +112,7 @@ export function useLibraryState() {
   }
 
   /**
-   * Spawn `binaries/cuegrid --get-playlist-tracks <name>`, buffer stdout,
+   * Spawn `binaries/cuegrid-core --get-playlist-tracks <name>`, buffer stdout,
    * and parse the single JSON line emitted on process close
    * (4-library-spec.md §1.2). On a modeled error (§1.4) the message is
    * surfaced via `state.tracksError`; on success `state.tracks` is

@@ -555,8 +555,41 @@ npm run build    # vue-tsc --noEmit type-check, then vite build
 
 ### Packaging the sidecar
 
-`sync.ps1` (Windows) automates the core → GUI packaging loop: it runs
-PyInstaller against `core/src/cuegrid/cli.py`, moves the resulting binary
-into `gui/src-tauri/binaries/cuegrid-x86_64-pc-windows-msvc.exe`, and
-nudges Tauri's dev-server watcher to pick up the new sidecar without a
-full restart.
+CueGrid's sidecar identifier is `cuegrid-core` (`bundle.externalBin:
+["binaries/cuegrid-core"]` in `gui/src-tauri/tauri.conf.json`, scoped by
+`shell:allow-spawn` in `gui/src-tauri/capabilities/default.json`). Tauri
+requires the frozen binary on disk to carry the Rust target-triple suffix,
+e.g. `binaries/cuegrid-core-x86_64-pc-windows-msvc.exe` on 64-bit Windows.
+
+Two scripts drive this, for two different workflows:
+
+- **`sync.ps1` (dev loop):** runs PyInstaller against `core/cuegrid.spec`,
+  moves the output into `gui/src-tauri/binaries/`, and nudges Tauri's
+  dev-server watcher to hot-reload the new sidecar without a full restart.
+- **`build-win.ps1` (v1.9 production release):** the full, sequential
+  release pipeline —
+  1. `npm run --prefix gui build` — builds the production frontend,
+     gated by `vue-tsc --noEmit`.
+  2. Freezes the Python core with `pyinstaller --clean --noconfirm
+     cuegrid.spec` (see `core/cuegrid.spec` — a `--onefile` build with
+     `collect_submodules()` hidden-import coverage for `librosa`,
+     `audioread`, and `soundfile`'s runtime-conditional imports), then
+     moves/renames the result into
+     `gui/src-tauri/binaries/cuegrid-core-<target-triple>.exe`, detecting
+     the local target triple via `rustc -vV`.
+  3. Runs `npx tauri build` from `gui/`, which bundles `frontendDist`
+     (`gui/dist`, per `beforeBuildCommand`/`frontendDist` in
+     `tauri.conf.json`) and the sidecar binary into a native Windows
+     installer under `gui/src-tauri/target/release/bundle/`.
+
+  Run it from the repository root:
+
+  ```powershell
+  .\build-win.ps1
+  ```
+
+  or via the npm wrapper:
+
+  ```bash
+  npm run --prefix gui package
+  ```

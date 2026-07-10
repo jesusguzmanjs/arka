@@ -4,13 +4,13 @@
 Write-Host "`n[1/3] Compilando motor de Python con PyInstaller..." -ForegroundColor Cyan
 cd core
 $env:PYTHONPATH="src"
-pyinstaller --clean --onefile --name cuegrid src/cuegrid/cli.py
+pyinstaller --clean --noconfirm cuegrid.spec
 cd ..
 
 # 2. Mover el ejecutable a la carpeta de binarios de Tauri
 Write-Host "`n[2/3] Mudando nuevo binario a la estructura de Rust..." -ForegroundColor Cyan
-$SourceFile = "core\dist\cuegrid.exe"
-$DestFile = "gui\src-tauri\binaries\cuegrid-x86_64-pc-windows-msvc.exe"
+$SourceFile = "core\dist\cuegrid-core.exe"
+$DestFile = "gui\src-tauri\binaries\cuegrid-core-x86_64-pc-windows-msvc.exe"
 
 if (Test-Path $SourceFile) {
     Move-Item -Force -Path $SourceFile -Destination $DestFile
