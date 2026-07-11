@@ -24,9 +24,9 @@ DETECTION_MODES: dict[str, tuple[float, float, float]] = {
 @dataclass
 class AppConfig:
     # audio.beatgrid: phrase-candidate generation (spec section 4)
-    phrase_beats: int = 8  # base phrase granularity, in beats (2-bar block)
+    phrase_beats: int = 4  # base phrase granularity, in beats (2-bar block)
     major_phrase_multiple: int = (
-        2  # every Nth candidate is also an 8-bar (32-beat) "major" boundary
+        1  # every Nth candidate is also an 8-bar (32-beat) "major" boundary
     )
 
     # audio.loader: decoding a small window around each candidate
@@ -35,7 +35,7 @@ class AppConfig:
 
     # audio.detector: sizing the before/after analysis window, scaled in beats (not seconds)
     # so it automatically adapts to the track's tempo.
-    window_beats: float = 4.0  # 1 bar of context on each side of a candidate
+    window_beats: float = 2.0  # 1 bar of context on each side of a candidate
     mfcc_count: int = 13
 
     # audio.features: significance thresholds for confirming a candidate as a real event
