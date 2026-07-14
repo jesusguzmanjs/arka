@@ -13,15 +13,14 @@
 // (ActionBar, AudioPlayer) reacts to the same singleton source of truth.
 
 import { nextTick, reactive, toRefs } from "vue";
-import { Command } from "@tauri-apps/plugin-shell";
+import { invoke } from "@tauri-apps/api/core"; // Swapeado por la API nativa de invocación
 import { useConfigState } from "./useConfigState";
+import { useCueGridSidecar } from "./useCueGridSidecar";
 import {
   type LibraryTrack,
   type PlaylistTracksResult,
   isPlaylistTracksError,
 } from "../types/library";
-
-const SIDECAR_NAME = "binaries/cuegrid-core";
 
 interface LibraryState {
   playlists: string[];
@@ -47,76 +46,51 @@ let selectionToken = 0;
 
 export function useLibraryState() {
   const { update, selectedTrackPath } = useConfigState();
+  const { nmlPathOverride } = useCueGridSidecar();
 
   /**
-   * Spawn `binaries/cuegrid-core --list-playlists`, buffer stdout, and parse
-   * the single JSON array line emitted on process close (2-core-spec.md
-   * §12.3). Populates `state.playlists`. Relocated verbatim from
-   * TargetSelector.vue's former onMounted hook (4-library-spec.md §3.1).
+   * Invokes `call_cuegrid_core` with `["--list-playlists"]` via Rust resource resolving.
+   * Populates `state.playlists`. Relocated verbatim from TargetSelector.vue's former
+   * onMounted hook (4-library-spec.md §3.1).
    */
   async function loadPlaylists(): Promise<void> {
     state.playlistsLoading = true;
-    const command = Command.sidecar(SIDECAR_NAME, ["--list-playlists"]);
-    let buffer = "";
-    let stderrText = "";
 
-    command.stdout.on("data", (chunk: string) => {
-      buffer += chunk;
-    });
-    command.stderr.on("data", (chunk: string) => {
-      stderrText += chunk;
-    });
+    const args = ["--list-playlists"];
+    if (nmlPathOverride.value) {
+      args.push("--nml", nmlPathOverride.value);
+    }
 
-    return new Promise<void>((resolve) => {
-      command.on("close", () => {
-        const raw = buffer.trim();
-        if (!raw) {
-          if (stderrText.trim()) {
-            console.error("[--list-playlists] stderr:", stderrText.trim());
-          }
-          state.playlists = [];
-          state.playlistsLoading = false;
-          resolve();
-          return;
-        }
-        try {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed) && parsed.every((p) => typeof p === "string")) {
-            state.playlists = parsed;
-          } else {
-            console.error("[--list-playlists] unexpected JSON shape:", parsed);
-            state.playlists = [];
-          }
-        } catch (err) {
-          console.error("[--list-playlists] failed to parse stdout:", err, raw);
-          state.playlists = [];
-        }
-        state.playlistsLoading = false;
-        resolve();
-      });
+    try {
+      // Llamamos al puente nativo de Rust pasando los argumentos estructurados
+      const raw = await invoke<string>("call_cuegrid_core", { args });
+      const trimmed = raw.trim();
 
-      command.on("error", (err: string) => {
-        console.error("[--list-playlists] spawn error:", err);
+      if (!trimmed) {
         state.playlists = [];
         state.playlistsLoading = false;
-        resolve();
-      });
+        return;
+      }
 
-      command.spawn().catch((err: unknown) => {
-        console.error("[--list-playlists] failed to spawn sidecar:", err);
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed) && parsed.every((p) => typeof p === "string")) {
+        state.playlists = parsed;
+      } else {
+        console.error("[--list-playlists] unexpected JSON shape:", parsed);
         state.playlists = [];
-        state.playlistsLoading = false;
-        resolve();
-      });
-    });
+      }
+    } catch (err) {
+      console.error("[--list-playlists] run or parse error:", err);
+      state.playlists = [];
+    } finally {
+      state.playlistsLoading = false;
+    }
   }
 
   /**
-   * Spawn `binaries/cuegrid-core --get-playlist-tracks <name>`, buffer stdout,
-   * and parse the single JSON line emitted on process close
-   * (4-library-spec.md §1.2). On a modeled error (§1.4) the message is
-   * surfaced via `state.tracksError`; on success `state.tracks` is
-   * replaced wholesale.
+   * Invokes `call_cuegrid_core` with `["--get-playlist-tracks", name]` via Rust resource
+   * resolving. On a modeled error (§1.4) the message is surfaced via `state.tracksError`;
+   * on success `state.tracks` is replaced wholesale.
    *
    * §2.4 clearing rule: also clears `selectedTrackPath` unconditionally
    * so a stale preview from a previous playlist can't survive the switch.
@@ -128,83 +102,47 @@ export function useLibraryState() {
     state.tracksLoading = true;
     state.tracksError = null;
 
-    const command = Command.sidecar(SIDECAR_NAME, [
-      "--get-playlist-tracks",
-      name,
-    ]);
-    let buffer = "";
-    let stderrText = "";
+    const args = ["--get-playlist-tracks", name];
+    if (nmlPathOverride.value) {
+      args.push("--nml", nmlPathOverride.value);
+    }
 
-    command.stdout.on("data", (chunk: string) => {
-      buffer += chunk;
-    });
-    command.stderr.on("data", (chunk: string) => {
-      stderrText += chunk;
-    });
+    try {
+      const raw = await invoke<string>("call_cuegrid_core", { args });
 
-    return new Promise<void>((resolve) => {
-      command.on("close", () => {
-        // Stale response — another playlist was clicked while we were waiting.
-        if (myToken !== selectionToken) {
-          resolve();
-          return;
-        }
+      // Stale response — another playlist was clicked while we were waiting.
+      if (myToken !== selectionToken) {
+        return;
+      }
 
-        const raw = buffer.trim();
-        if (!raw) {
-          state.tracks = [];
-          state.tracksError =
-            stderrText.trim() ||
-            "Sidecar returned no output for this playlist.";
-          state.tracksLoading = false;
-          resolve();
-          return;
-        }
-
-        let parsed: PlaylistTracksResult;
-        try {
-          parsed = JSON.parse(raw) as PlaylistTracksResult;
-        } catch (err) {
-          state.tracks = [];
-          state.tracksError = `Failed to parse sidecar output: ${String(err)}`;
-          state.tracksLoading = false;
-          resolve();
-          return;
-        }
-
-        if (isPlaylistTracksError(parsed)) {
-          state.tracks = [];
-          state.tracksError = parsed.message;
-        } else {
-          state.tracks = parsed;
-          state.tracksError = null;
-        }
-        state.tracksLoading = false;
-        resolve();
-      });
-
-      command.on("error", (err: string) => {
-        if (myToken !== selectionToken) {
-          resolve();
-          return;
-        }
+      const trimmed = raw.trim();
+      if (!trimmed) {
         state.tracks = [];
-        state.tracksError = `Sidecar spawn error: ${err}`;
+        state.tracksError = "Sidecar returned no output for this playlist.";
         state.tracksLoading = false;
-        resolve();
-      });
+        return;
+      }
 
-      command.spawn().catch((err: unknown) => {
-        if (myToken !== selectionToken) {
-          resolve();
-          return;
-        }
+      const parsed = JSON.parse(trimmed) as PlaylistTracksResult;
+      if (isPlaylistTracksError(parsed)) {
         state.tracks = [];
-        state.tracksError = `Failed to spawn sidecar: ${String(err)}`;
+        state.tracksError = parsed.message;
+      } else {
+        state.tracks = parsed;
+        state.tracksError = null;
+      }
+    } catch (err) {
+      if (myToken !== selectionToken) {
+        return;
+      }
+      console.error("[--get-playlist-tracks] execution error:", err);
+      state.tracks = [];
+      state.tracksError = typeof err === "string" ? err : String(err);
+    } finally {
+      if (myToken === selectionToken) {
         state.tracksLoading = false;
-        resolve();
-      });
-    });
+      }
+    }
   }
 
   /**

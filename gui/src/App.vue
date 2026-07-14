@@ -13,15 +13,18 @@
 
 import AppHeader from "./components/AppHeader.vue";
 import ConfigPanel from "./components/ConfigPanel.vue";
-import ActionBar from "./components/ActionBar.vue";
+// import ActionBar from "./components/ActionBar.vue";
 import TelemetryConsole from "./components/TelemetryConsole.vue";
 import TelemetryToggleButton from "./components/TelemetryToggleButton.vue";
 import SummaryBadge from "./components/SummaryBadge.vue";
 import LibraryBrowser from "./components/LibraryBrowser.vue";
 
-import { defineAsyncComponent, onBeforeUnmount, ref } from "vue";
+import { defineAsyncComponent, ref } from "vue";
 import { useRunState } from "./composables/useRunState";
 import { useCueGridSidecar } from "./composables/useCueGridSidecar";
+import { onMounted } from 'vue';
+
+const { discoverAndSetDefaultNml } = useCueGridSidecar();
 
 // Carga perezosa del reproductor: no pesa en el arranque inicial
 const AudioPlayer = defineAsyncComponent(() => import("./components/AudioPlayer.vue"));
@@ -46,65 +49,28 @@ const isTelemetryOpen = ref(false);
 // ConfigPanel + ActionBar's actual rendered height. 320px comfortably fits
 // the verify/sensitivity/clear rows + the full-width CTA + status line at
 // the smallest supported window size.
-const PLAYER_MIN = 160;
-const CONFIG_MIN = 320;
+// PLAYER_MIN/playerHeight (revised): measured against AudioPlayer.vue's
+// actual rendered content now that it owns a header row, the overview
+// strip (h-10), the zoomview canvas (h-40), a transport + zoom-button row,
+// a conditional cue-jump-pad row, and a save/discard row, separated by
+// gap-2 spacing inside p-2 padding. The prior 160/220 budget was sized for
+// an earlier, shorter revision of the player and was silently clipping
+// every row below the zoomview against this section's overflow-hidden —
+// the controls existed in the DOM but were outside the visible box.
+onMounted(async () => {
+  // Nada más arrancar la app, descubrimos la ruta del NML.
+  // Esto tardará unos milisegundos y poblará nmlPathOverride.value
+  await discoverAndSetDefaultNml();
 
-const playerHeight = ref(220);
-const configHeight = ref(360);
-
-// Which splitter is currently being dragged (null = none). Only one splitter
-// remains, but we keep the target-typed shape for clarity and future-proofing.
-type SplitterTarget = "player-config" | null;
-const dragging = ref<SplitterTarget>(null);
-// Snapshot of cursor Y and the two affected panel heights at drag start
-// so we can compute deltas smoothly without accumulating drift.
-let dragStartY = 0;
-let dragStartTop = 0;
-let dragStartBottom = 0;
-
-function onSplitterDown(target: Exclude<SplitterTarget, null>, e: MouseEvent) {
-  // Prevent text selection while dragging the handle.
-  e.preventDefault();
-  dragging.value = target;
-  dragStartY = e.clientY;
-  dragStartTop = playerHeight.value;
-  dragStartBottom = configHeight.value;
-  window.addEventListener("mousemove", onWindowMouseMove);
-  window.addEventListener("mouseup", onWindowMouseUp);
-}
-
-function onWindowMouseMove(e: MouseEvent) {
-  if (!dragging.value) return;
-  const delta = e.clientY - dragStartY;
-
-  if (dragging.value === "player-config") {
-    // Growing player shrinks config, and vice versa. Clamp both sides to
-    // their minimums so neither block can collapse.
-    const newPlayer = dragStartTop + delta;
-    const newConfig = dragStartBottom - delta;
-    if (newPlayer >= PLAYER_MIN && newConfig >= CONFIG_MIN) {
-      playerHeight.value = newPlayer;
-      configHeight.value = newConfig;
-    }
-  }
-}
-
-function onWindowMouseUp() {
-  dragging.value = null;
-  window.removeEventListener("mousemove", onWindowMouseMove);
-  window.removeEventListener("mouseup", onWindowMouseUp);
-}
-
-onBeforeUnmount(() => {
-  // Defensive: if the component unmounts mid-drag, drop the listeners.
-  window.removeEventListener("mousemove", onWindowMouseMove);
-  window.removeEventListener("mouseup", onWindowMouseUp);
+  // A partir de este momento, CUALQUIER otra llamada (leer playlists,
+  // actualizar cues, etc) usará la ruta fija de forma automática.
 });
+
 </script>
 
 <template>
   <div
-    class="h-screen w-screen flex flex-col bg-zinc-950 text-primary font-ui overflow-hidden"
+    class="h-screen w-screen overflow-hidden flex flex-col bg-zinc-950 text-primary font-ui"
     @contextmenu.prevent
   >
     <!-- Chassis top bar: branding + NML indicator (kept outside the
@@ -113,43 +79,37 @@ onBeforeUnmount(() => {
 
     <!-- Resizable modular rack: exactly two deck blocks separated by a
          single thin high-tech splitter handle. -->
-    <div class="flex-1 min-h-0 flex flex-col">
+    <div class="flex-1 min-h-0 flex flex-col gap-1.5 overflow-hidden p-1.5">
       <!-- ── Block 1: PlayerRack ─────────────────────────────────── -->
       <section
-        class="bg-zinc-900 border border-zinc-800/80 rounded-lg shadow-inner m-1.5 overflow-hidden flex flex-col flex-1 min-h-0"
-        :style="{ height: playerHeight + 'px' }"
+        class="h-[320px] shrink-0 bg-zinc-900 border border-zinc-800/80 rounded-lg shadow-inner overflow-hidden flex flex-col"
       >
         <!-- AudioPlayer keeps a fixed-height sub-region at the top of
              Block 1; no independent splitter against LibraryBrowser. -->
-        <div class="shrink-0">
+        <div class="h-full shrink-0">
           <AudioPlayer :disabled="status === 'running'" />
         </div>
         <!-- LibraryBrowser is Block 1's flex-1 filler, occupying all
              remaining height underneath the player. -->
-        <div class="flex-1 min-h-0 overflow-hidden">
-          <LibraryBrowser :disabled="status === 'running'" />
-        </div>
       </section>
 
       <!-- Splitter: PlayerRack ↔ ConfigRack (the only splitter left) -->
-      <div
-        class="h-1 cursor-ns-resize bg-transparent hover:bg-teal-500/60 transition-all duration-200 select-none shrink-0"
-        @mousedown="onSplitterDown('player-config', $event)"
-      />
+      <section class="flex flex-1 min-h-[140px] flex-col overflow-hidden bg-zinc-900 border border-zinc-800/80 rounded-lg shadow-inner">
+        <LibraryBrowser :disabled="status === 'running'" />
+      </section>
 
       <!-- ── Block 2: ConfigRack (anti-clip protected) ──────────── -->
       <section
-        class="bg-zinc-900 border border-zinc-800/80 rounded-lg shadow-inner m-1.5 overflow-hidden flex flex-col"
-        :style="{ height: configHeight + 'px' }"
+        class="h-[210px] shrink-0 bg-zinc-900 border border-zinc-800/80 rounded-lg shadow-inner overflow-hidden flex flex-col"
       >
         <div
-          class="flex items-center gap-2 px-4 py-2 border-b border-zinc-800/80 border-l-2 border-l-teal-500/30"
+          class="flex items-center gap-2 px-4 py-2 border-b border-zinc-800/80 border-l-2 border-l-secondary/30"
         >
           <span class="text-xs uppercase tracking-widest text-muted">Config & Run</span>
         </div>
-        <div class="flex-1 min-h-0 overflow-y-auto flex flex-col">
-          <ConfigPanel :locked="status === 'running'" />
-          <ActionBar />
+        <div class="flex-1 min-h-0 overflow-hidden flex flex-col">
+          <ConfigPanel :disabled="status === 'running'" />
+          <!-- <ActionBar /> -->
         </div>
       </section>
     </div>
@@ -164,7 +124,7 @@ onBeforeUnmount(() => {
       <button
         type="button"
         :disabled="!analysisStatus"
-        class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-zinc-700/80 bg-zinc-900/80 text-muted text-xs font-mono backdrop-blur-sm transition-all duration-200 enabled:hover:text-primary enabled:hover:border-teal-500/60 enabled:hover:bg-zinc-800/90 disabled:cursor-not-allowed disabled:opacity-50"
+        class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-zinc-700/80 bg-zinc-900/80 text-muted text-xs font-mono backdrop-blur-sm transition-all duration-200 enabled:hover:text-primary enabled:hover:border-secondary/60 enabled:hover:bg-zinc-800/90 disabled:cursor-not-allowed disabled:opacity-50"
         @click="exportTelemetry"
       >
         Export
@@ -205,17 +165,26 @@ body,
 
 /* Slim dark scrollbars for the telemetry console. */
 *::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 6px;
+  height: 6px;
 }
 *::-webkit-scrollbar-track {
-  background: transparent;
+  background: #121212;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2a2a2e;
-  border-radius: 6px;
+  background: #7a4a00;
+  border-radius: 999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: #3a3a3e;
+  background: #d27b00;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #7a4a00 #121212;
+}
+
+.scrollbar-amber {
+  scrollbar-color: #7a4a00 #121212;
 }
 </style>

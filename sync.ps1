@@ -1,31 +1,31 @@
-# Script de sincronización automática para CueGrid
+# Script de sincronización automática para CueGrid (Versión RESOURCES 0ms)
 
-# 1. Forzar entorno limpio y compilar Python con PyInstaller
-Write-Host "`n[1/3] Compilando motor de Python con PyInstaller..." -ForegroundColor Cyan
+Write-Host "`n[1/3] Compilando motor de Python con PyInstaller (ONEDIR)..." -ForegroundColor Cyan
 cd core
 $env:PYTHONPATH="src"
 pyinstaller --clean --noconfirm cuegrid.spec
 cd ..
 
-# 2. Mover el ejecutable a la carpeta de binarios de Tauri
-Write-Host "`n[2/3] Mudando nuevo binario a la estructura de Rust..." -ForegroundColor Cyan
-$SourceFile = "core\dist\cuegrid-core.exe"
-$DestFile = "gui\src-tauri\binaries\cuegrid-core-x86_64-pc-windows-msvc.exe"
+Write-Host "`n[2/3] Mudando motor a la carpeta de Recursos de Tauri..." -ForegroundColor Cyan
 
-if (Test-Path $SourceFile) {
-    Move-Item -Force -Path $SourceFile -Destination $DestFile
-    Write-Host "-> Binario copiado con éxito." -ForegroundColor Green
+$SourceFolder = "core\dist\cuegrid-core"
+$DestFolder = "gui\src-tauri\resources\cuegrid-core"
+
+if (Test-Path $SourceFolder) {
+    if (Test-Path $DestFolder) {
+        Remove-Item -Recurse -Force -Path $DestFolder
+    }
+
+    Copy-Item -Recurse -Force -Path $SourceFolder -Destination $DestFolder
+    Write-Host "-> Carpeta de motor (ONEDIR) copiada a resources con éxito." -ForegroundColor Green
 } else {
-    Write-Host "-> ERROR: No se encontró el ejecutable compilado por PyInstaller." -ForegroundColor Red
+    Write-Host "-> ERROR: No se encontró la compilación en core\dist\cuegrid-core." -ForegroundColor Red
     Exit
 }
 
-# 3. El truco maestro: Actualizar el timestamp de lib.rs para engañar al watcher de Cargo
 Write-Host "`n[3/3] Forzando recarga en caliente de Tauri..." -ForegroundColor Cyan
 $LibRsPath = "gui\src-tauri\src\lib.rs"
 if (Test-Path $LibRsPath) {
     (Get-Item $LibRsPath).LastWriteTime = Get-Date
-    Write-Host "====== ¡HECHO! Tu app de escritorio se está reiniciando sola con el nuevo código ======" -ForegroundColor Green
-} else {
-    Write-Host "-> AVISO: No se pudo tocar lib.rs, si Tauri está corriendo reinícialo a mano." -ForegroundColor Yellow
+    Write-Host "====== ¡HECHO! App reiniciando con el motor nativo ======" -ForegroundColor Green
 }

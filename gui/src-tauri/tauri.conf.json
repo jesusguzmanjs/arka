@@ -14,9 +14,9 @@
       {
         "title": "CueGrid",
         "width": 1024,
-        "height": 768,
+        "height": 800,
         "minWidth": 900,
-        "minHeight": 700,
+        "minHeight": 800,
         "resizable": true
       }
     ],
@@ -38,8 +38,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": [
-      "binaries/cuegrid-core"
+    "resources": [
+      "resources/cuegrid-core/**/*"
     ]
+
   }
 }

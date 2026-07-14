@@ -1,13 +1,9 @@
 // composables/useTrackMetadata.ts
 // See .openspec/3-player-spec.md §1 (Core Extension), §4.1 (Stage 1), §6 (Data Structures).
 //
-// Spawns the packaged Python core as a Tauri sidecar (binaries/cuegrid-core) with
-// the `--get-track-metadata <TRACK_PATH>` flag, buffers its one-shot JSON
-// stdout line, parses it on process close, and updates a module-scoped
-// singleton `usePlayerState` reactive store. Mirrors the spawn-buffer-parse
-// pattern already used by TargetSelector.vue's `--list-playlists` call
-// (3-gui-spec.md §3.3), NOT the NDJSON streaming pattern of
-// useCueGridSidecar.ts.
+// Spawns the packaged Python core via Rust Resource architecture with
+// the `--get-track-metadata <TRACK_PATH>` flag, fetches its JSON stdout,
+// parses it, and updates a module-scoped singleton `usePlayerState` reactive store.
 //
 // This file also owns the §6 `usePlayerState` singleton and the §1.3/§1.4
 // TypeScript type definitions, since the spec's §3.2 file layout splits them
@@ -15,47 +11,24 @@
 // internal state is private to this composable's consumers (§3.3) — keeping
 // them co-located avoids a premature split that no other module reads.
 
-import { reactive, toRefs } from "vue";
-import { Command } from "@tauri-apps/plugin-shell";
+import { markRaw, reactive, toRefs } from "vue";
+import { invoke } from "@tauri-apps/api/core"; // Swapeado por la API nativa de invocación
+import { useCueGridSidecar } from "./useCueGridSidecar";
+import type {
+  ExistingCue,
+  SuperJSON,
+  TrackMetadata,
+  TrackMetadataError,
+  TrackMetadataResult,
+} from "../types/trackMetadata";
+import { isTrackMetadataError } from "../types/trackMetadata";
 
 // ---------------------------------------------------------------------------
 // §1.3 / §1.4 / §6 — Data Structures (TypeScript)
 // ---------------------------------------------------------------------------
 
-/** §6 — mirrors §1.3's `type` serialization (name, not int value). */
-export type CueTypeName = "CUE" | "FADE_IN" | "FADE_OUT" | "LOAD" | "LOOP";
-
-/** §1.3 — a single pre-existing HotCue, GRID excluded upstream by the core. */
-export interface ExistingCue {
-  hotcue: number; // -1 = unbound (no pad)
-  name: string;
-  start_ms: number;
-  type: CueTypeName;
-}
-
-/** §1.3 — success schema, single JSON line on stdout. */
-export interface TrackMetadata {
-  artist: string;
-  title: string;
-  bpm: number;
-  grid_anchor_ms: number;
-  existing_cues: ExistingCue[];
-}
-
-/** §1.4 — error schema, flat two-key object on the same stdout channel. */
-export interface TrackMetadataError {
-  error: "not_found" | "ambiguous";
-  message: string;
-}
-
-export type TrackMetadataResult = TrackMetadata | TrackMetadataError;
-
-/** §6 — single-key discriminator, exactly as specified. */
-export function isTrackMetadataError(
-  r: TrackMetadataResult,
-): r is TrackMetadataError {
-  return "error" in r;
-}
+export type { ExistingCue, SuperJSON, TrackMetadata, TrackMetadataError, TrackMetadataResult };
+export { isTrackMetadataError } from "../types/trackMetadata";
 
 // ---------------------------------------------------------------------------
 // §6 — usePlayerState singleton (mirrors useRunState.ts's shape)
@@ -77,6 +50,7 @@ interface PlayerState {
   markers: PlayerMarker[];
   markerStage: MarkerStage | null;
   isLoadingTrack: boolean; // §3.7 — shared concurrency lock, read by LibraryBrowser.vue too
+  previewCache: Map<string, SuperJSON>;
 }
 
 const playerState = reactive<PlayerState>({
@@ -86,6 +60,7 @@ const playerState = reactive<PlayerState>({
   markers: [],
   markerStage: null,
   isLoadingTrack: false,
+  previewCache: markRaw(new Map<string, SuperJSON>()),
 });
 
 /**
@@ -145,8 +120,8 @@ export function usePlayerState() {
       playerState.markerStage = null;
     },
     /** §3.7 — shared concurrency lock. Set true at the start of a track
-     *  load, false on the first terminal event (ready / metadata error /
-     *  decode error). Read by LibraryBrowser.vue to inert row clicks. */
+     * load, false on the first terminal event (ready / metadata error /
+     * decode error). Read by LibraryBrowser.vue to inert row clicks. */
     setLoadingTrack(value: boolean): void {
       playerState.isLoadingTrack = value;
     },
@@ -154,10 +129,8 @@ export function usePlayerState() {
 }
 
 // ---------------------------------------------------------------------------
-// §1.1 / §4.1 — sidecar spawn + buffer + parse-on-close
+// §1.1 / §4.1 — core execution via Rust resources bridge
 // ---------------------------------------------------------------------------
-
-const SIDECAR_NAME = "binaries/cuegrid-core";
 
 export interface FetchTrackMetadataResult {
   ok: boolean;
@@ -170,108 +143,96 @@ export interface FetchTrackMetadataResult {
 }
 
 /**
- * Spawn `binaries/cuegrid-core --get-track-metadata <trackPath>`, buffer stdout,
- * and parse the single JSON line emitted on process close (§1.2, §4.1).
+ * Executes `cuegrid-core --get-track-metadata <trackPath>` via Rust resources bridge.
  *
- * The exit code is the final source of truth (2-core-spec.md §11.6): `0` →
- * success schema (§1.3), `1` → error schema (§1.4). Both shapes travel on
- * stdout, so this function only needs the close event — no stderr code path.
- *
- * Does NOT touch `usePlayerState` itself; the caller (AudioPlayer.vue) owns
- * the reactive update so it can interleave the `convertFileSrc` + wavesurfer
- * load with the metadata write. Returns a discriminated result object so the
- * caller can branch without try/catch.
+ * The exit code and output follow the final source of truth (2-core-spec.md §11.6):
+ * success schema (§1.3) or error schema (§1.4). Both shapes travel on stdout.
  */
-export async function fetchTrackMetadata(
-  trackPath: string,
-): Promise<FetchTrackMetadataResult> {
-  const command = Command.sidecar(SIDECAR_NAME, [
-    "--get-track-metadata",
-    trackPath,
-  ]);
-
-  // §1.2 — exactly one JSON line on stdout; buffer the whole stream and parse
-  // on close, exactly like TargetSelector.vue's --list-playlists consumption.
-  let buffer = "";
-
-  command.stdout.on("data", (chunk: string) => {
-    buffer += chunk;
-  });
-
-  // §1.2 routes the modeled error case through stdout, not stderr — so stderr
-  // only ever carries non-JSON noise (a stray traceback that bypassed the
-  // modeled path, a third-party warning). Capture it for diagnostics but do
-  // not let it drive the result.
-  let stderrText = "";
-  command.stderr.on("data", (chunk: string) => {
-    stderrText += chunk;
-  });
-
-  return new Promise<FetchTrackMetadataResult>((resolve) => {
-    command.on("close", (data: { code: number | null }) => {
-      const raw = buffer.trim();
-      const code = data.code;
-
-      // No stdout at all — process failed before printing the modeled line.
-      if (raw.length === 0) {
-        resolve({
-          ok: false,
-          fault:
-            stderrText.trim() ||
-            `Sidecar exited with code ${code ?? "null"} and no stdout.`,
-        });
-        return;
-      }
-
-      let parsed: TrackMetadataResult;
-      try {
-        parsed = JSON.parse(raw) as TrackMetadataResult;
-      } catch (err) {
-        resolve({
-          ok: false,
-          fault: `Failed to parse sidecar stdout as JSON: ${String(err)}`,
-        });
-        return;
-      }
-
-      // §1.4 — error schema is a flat two-key object; the exit code is `1`
-      // but we trust the JSON shape over the code (the spec's `"error" in obj`
-      // check is the documented discriminator).
-      if (isTrackMetadataError(parsed)) {
-        resolve({ ok: false, error: parsed });
-        return;
-      }
-
-      // §1.3 — success schema. Sanity-check the required fields so a malformed
-      // core build doesn't silently feed `undefined` into the waveform code.
-      if (
-        typeof parsed.artist !== "string" ||
-        typeof parsed.title !== "string" ||
-        typeof parsed.bpm !== "number" ||
-        typeof parsed.grid_anchor_ms !== "number" ||
-        !Array.isArray(parsed.existing_cues)
-      ) {
-        resolve({
-          ok: false,
-          fault: "Sidecar returned a success-shaped object missing required fields.",
-        });
-        return;
-      }
-
-      resolve({ ok: true, metadata: parsed });
-    });
-
-    command.on("error", (err: string) => {
-      resolve({ ok: false, fault: `Sidecar spawn error: ${err}` });
-    });
-
-    // Spawn the process. If spawn() itself rejects (e.g. sidecar binary
-    // missing), resolve with a fault — the close handler won't fire.
-    command.spawn().catch((err: unknown) => {
-      resolve({
-        ok: false,
-        fault: `Failed to spawn sidecar: ${String(err)}`,
-      });
-    });
-  });
-}
+ export async function fetchTrackMetadata(
+   trackPath: string,
+ ): Promise<FetchTrackMetadataResult> {
+   const cached = playerState.previewCache.get(trackPath);
+   if (cached) return { ok: true, metadata: cached };
+ 
+   const { nmlPathOverride } = useCueGridSidecar();
+   const args = ["--get-track-metadata", trackPath];
+   if (nmlPathOverride.value) {
+     args.push("--nml", nmlPathOverride.value);
+   }
+ 
+   try {
+     // Invocamos el puente genérico. Pedimos 'any' porque Rust puede devolver string o el objeto.
+     const rawStdout = await invoke<any>("call_cuegrid_core", { args });
+     
+     let parsed: any;
+ 
+     if (typeof rawStdout === "string") {
+       // 1. Limpiamos cualquier warning de consola que haya antes/después del JSON
+       const firstBrace = rawStdout.indexOf('{');
+       const lastBrace = rawStdout.lastIndexOf('}');
+ 
+       if (firstBrace === -1 || lastBrace === -1) {
+         return {
+           ok: false,
+           fault: "Core resource exited and returned no JSON output.",
+         };
+       }
+ 
+       const cleanStr = rawStdout.substring(firstBrace, lastBrace + 1);
+ 
+       try {
+         parsed = JSON.parse(cleanStr);
+         // 2. Si Rust devolvió un JSON doblemente serializado ("{\"artist..."), 
+         // el primer parse devuelve un string literal. Hacemos un segundo parse automático.
+         if (typeof parsed === "string") {
+           parsed = JSON.parse(parsed);
+         }
+       } catch (err) {
+         return {
+           ok: false,
+           fault: `Failed to parse core stdout as JSON: ${String(err)}`,
+         };
+       }
+     } else {
+       // Si el puente de Tauri ya lo ha parseado nativamente en Rust
+       parsed = rawStdout; 
+     }
+ 
+     if (isTrackMetadataError(parsed)) {
+       return { ok: false, error: parsed };
+     }
+ 
+     // 3. ACTUALIZACIÓN: Verificamos el nuevo esquema de 3 Bandas (l, m, h) en el color_map
+     if (
+       typeof parsed.artist !== "string" ||
+       typeof parsed.title !== "string" ||
+       typeof parsed.bpm !== "number" ||
+       typeof parsed.grid_anchor_ms !== "number" ||
+       !Array.isArray(parsed.existing_cues) ||
+       !Array.isArray(parsed.waveform_peaks) ||
+       !parsed.waveform_peaks.every((value: any) => typeof value === "number" && Number.isFinite(value)) ||
+       !Array.isArray(parsed.color_map) ||
+       !parsed.color_map.every(
+         (bucket: any) =>
+           bucket !== null &&
+           typeof bucket === "object" &&
+           typeof bucket.l === "number" && Number.isFinite(bucket.l) &&
+           typeof bucket.m === "number" && Number.isFinite(bucket.m) &&
+           typeof bucket.h === "number" && Number.isFinite(bucket.h)
+       )
+     ) {
+       return {
+         ok: false,
+         fault: "Core returned a success-shaped object missing required fields (check l, m, h).",
+       };
+     }
+ 
+     return { ok: true, metadata: parsed as TrackMetadata };
+ 
+   } catch (err) {
+     return {
+       ok: false,
+       fault: `Core execution bridge error: ${typeof err === "string" ? err : String(err)}`,
+     };
+   }
+ }

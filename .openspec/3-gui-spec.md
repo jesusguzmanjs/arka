@@ -1,6 +1,6 @@
 # Spec: CueGrid GUI (Phase 2 — Tauri + Vue 3)
 
-Status: Proposed v1.7 (single-track context menu and status lifecycle) — architecture only, not yet implemented
+Status: Current implementation synchronized 2026-07-13 (Vue/Tauri shell, Peaks.js player, library browser, and Python sidecar flow)
 (v1.7 adds the single-track context-menu interaction, conditional player teardown, and reactive analysis status messages; v1.5 adds the Include Stems binary switch, removes the Fast/Smart verify
 selector, adds dynamic Stem availability badges in the track list, and
 retains the mandatory post-operation synchronization loop between Vue
@@ -21,6 +21,66 @@ dark-theme color tokens, the two-block resizable rack, the
 floating TelemetryConsole overlay, the module-scoped composable
 state pattern, and the Tauri sidecar plumbing — is preserved
 unchanged.)
+
+## Current implementation synchronization
+
+The checked-out GUI is no longer the create-tauri-app scaffold described by
+the historical sections below. The current source of truth is:
+
+- `App.vue` owns a strict `h-screen w-screen overflow-hidden` dark root. The
+  HTML/body/#app ancestor chain is also overflow-hidden. Its inner rack is a
+  bounded `flex-1 min-h-0 flex flex-col overflow-hidden` stack containing a
+  fixed-height `AudioPlayer` card, a flexible `LibraryBrowser` card, and a
+  fixed-height configuration card. `ActionBar` is not mounted by the current
+  `App.vue`; the Library Browser footer owns the active playlist/current-track
+  analysis controls.
+- Scrolling is delegated to internal containers. `LibraryBrowser.vue` keeps
+  separate `min-h-0 overflow-y-auto scrollbar-amber` containers for playlists
+  and the track table; `AudioPlayer.vue` owns its own vertical overflow. No
+  page-level scrolling is permitted.
+- `gui/tailwind.config.js` defines the semantic Amber/Ochre roles
+  `primary`, `secondary`, `accent`, and `warning`, alongside dark `base`,
+  `panel`, `elevated`, and `console` surfaces. Blue/green stage colors and
+  teal as the brand accent are legacy terminology, not current visual rules.
+- `AudioPlayer.vue` uses Peaks.js, a local `TrackData`/`cueState`
+  model, custom grid/cue markers, eight computed pad slots, custom wheel
+  handling, and a local dirty/save boundary. `CueContextMenu.vue` owns the
+  cue deletion menu shell and emits only `close` and `delete` events.
+- The sidecar name is `binaries/cuegrid-core`. `useCueGridSidecar.ts` builds
+  playlist or single-track analysis arguments, includes the in-memory
+  `nmlPathOverride` when applicable, parses NDJSON for analysis, and exposes
+  `updateTrackCues`, `deleteCue`, and `discoverAndSetDefaultNml`. Metadata and
+  playlist queries are one-shot JSON sidecar calls.
+
+Any older section that prescribes a three-block resizable rack, a mounted
+`ActionBar`, Wavesurfer APIs, or blue/green marker stages is historical and is
+superseded by this synchronization section and the more detailed current
+contracts in `3-player-spec.md` and `4-library-spec.md`.
+
+### Current component and visual contract
+
+```text
+App.vue (h-screen w-screen overflow-hidden)
+├── AppHeader
+├── AudioPlayer card (fixed 320px region)
+├── LibraryBrowser card (flexible region; two internal scroll columns)
+├── Config card (fixed 210px region; ConfigPanel)
+├── SummaryBadge
+└── fixed Export button + TelemetryToggleButton / TelemetryConsole overlay
+```
+
+The semantic color roles are:
+
+| Role | Current value/meaning |
+|---|---|
+| `primary` | Main amber action and enabled pad surface (`#edb40b`) |
+| `secondary` | Pale ochre supporting borders/highlights (`#F7D15F`) |
+| `accent` | Dark ochre hover/active marker emphasis (`#AA8208`) |
+| `warning` | Warning/dirty-state emphasis (`#f43f5e`) |
+
+The root layout must preserve `min-h-0` through every flex ancestor. A child
+that owns a list or waveform may scroll inside its own bounded box, but the
+document, body, and application shell must remain fixed to the viewport.
 
 ## 1. Scope
 
@@ -547,7 +607,68 @@ successfully` for a playlist batch run, as defined in §5.4. A failed or
 cancelled run may set an appropriate error/cancellation message, but must not
 restore the removed idle label.
 
-## 6. Tauri Sidecar Architecture
+## 5.8 Phase 1 GUI Audio Player Contract
+
+The first GUI Audio Player phase is defined by `3-player-spec.md` §Phase 1
+GUI Audio Player Architecture. This section records the shell-level
+obligations and prevents later component work from weakening that contract:
+
+- `AudioPlayer.vue` must use **Peaks.js** with a precise `zoomview` and an
+  `overview` minimap. `peaks.destroy()` is mandatory on component unmount.
+- Grid bars and beats are custom non-draggable markers (`editable: false`);
+  bars occur at every fourth beat and use a more prominent line than the
+  subtle standard beat line.
+- Hotcues use bottom-anchored custom HTML markers. Valid cues are brand-color
+  and draggable; gray off-grid cues are locked. Valid cue drags snap to the
+  nearest one-beat interval derived from BPM and grid anchor.
+- Cue movement is local GUI state, not a live Rust/backend disk write. The
+  shared player state exposes `hasUnsavedChanges`; when it is true, the UI
+  renders a prominent **Save Changes** action. Save is explicit and clears
+  the flag only after backend confirmation.
+- The frontend is a renderer, not an audio-analysis engine. It consumes the
+  Python/librosa frequency map defined in `2-core-spec.md` §2.3.1 and must
+  not run real-time FFT or heavy frequency analysis in JavaScript.
+
+## 6. Tauri Core Resource Architecture
+
+### Resource-bridge architecture amendment (authoritative)
+
+This amendment supersedes all `@tauri-apps/plugin-shell`, `Command.sidecar`,
+`externalBin`, and `--onefile` wording elsewhere in this section and in older
+GUI specifications. The Core is a packaged Tauri **resource**, not a Tauri
+sidecar. `@tauri-apps/plugin-shell` is not a GUI or Rust dependency, is not
+registered by `lib.rs`, and no shell capability is granted.
+
+The PyInstaller build uses **`--onedir`**. The complete output directory is
+copied to `gui/src-tauri/resources/cuegrid-core/`; Tauri bundles it with the
+resource glob `resources/cuegrid-core/**/*`. At runtime Rust resolves:
+
+```text
+app.path().resource_dir()/resources/cuegrid-core/cuegrid-core.exe
+```
+
+and launches that executable with `std::process::Command`. This avoids the
+per-launch extraction performed by PyInstaller `--onefile`, materially
+reducing Core cold-start latency.
+
+Rust exposes `call_cuegrid_core(args)` for one-shot Core operations. It runs
+the resource, collects stdout through process completion, validates a
+successful exit, and returns the complete UTF-8 stdout string to Vue. Stage 1
+therefore uses:
+
+```ts
+invoke<string>("call_cuegrid_core", {
+  args: ["--get-track-metadata", trackPath],
+})
+```
+
+`useTrackMetadata.ts` then trims and parses one JSON value; it never spawns a
+browser-owned process, assembles stdout chunks, or manages a sidecar child.
+Long-running analysis remains a separate Rust streaming command
+(`start_analysis_stream`) that forwards NDJSON lines as Tauri events and is
+cancelled through the Rust-owned process handle. Both one-shot and streaming
+paths resolve the executable only through the packaged resource directory.
+
 
 ### 6.1 Process boundary overview
 
@@ -636,6 +757,16 @@ argv array directly from `CueGridConfig`, mirroring `cli.py`'s parser 1:1.
 The old Fast/Smart verify-mode selector is not part of the configuration
 state or argument payload.
 
+The current implementation uses `selectedPlaylist` for the main batch run
+and `selectedTrackPath` for the single-track row action. It invokes the
+packaged binary as `binaries/cuegrid-core` and adds `--nml` whenever the
+discovered/overridden `nmlPathOverride` is available. Manual player saves use
+the separate argv shape
+`[trackPath, "--update-cues", JSON.stringify(cues), "--nml", nmlPath]` and
+manual deletion uses
+`[trackPath, "--delete-cue", String(hotcueIndex), "--nml", nmlPath]`; both
+resolve completion from the process exit code.
+
 ```ts
 function buildArgs(cfg: CueGridConfig): string[] {
   const args: string[] = []
@@ -657,17 +788,13 @@ function buildArgs(cfg: CueGridConfig): string[] {
 }
 ```
 
-### 6.5 Required core-side change: a machine-readable output mode
+### 6.5 Implemented core-side machine-readable output mode
 
-**This is a dependency this spec introduces on `2-core-spec.md`, not an
-implementation this document performs.** `cli.py`'s `main()` currently
-prints human-readable text (`print(f"{result.entry.artist} - ...")`,
-etc. — see lines 430–497) with no structured mode. For the proposal's
-requirement that "the Python engine ... communicat[es] with the
-frontend via structured JSON over stdout" to be satisfiable, the core
-needs a new `--json` flag that switches `main()`'s output to newline-
-delimited JSON (NDJSON: one JSON object per line, flushed eagerly so the
-GUI can stream progress rather than wait for EOF).
+The current `cli.py` implements `--json` and emits newline-delimited JSON
+(NDJSON: one JSON object per line, flushed eagerly) for the analysis sidecar.
+This is an implemented interface, not a pending dependency. The one-shot
+metadata, playlist, discovery, update, and delete operations intentionally
+use their own JSON or exit-code contracts and do not enter the NDJSON stream.
 
 Per `CLAUDE.md`, this should be raised as an addition to
 `2-core-spec.md` before implementation — it is called out here only to
@@ -743,7 +870,7 @@ async function run(config: CueGridConfig) {
 }
 ```
 
-Key points this section fixes as the plan (not yet implemented):
+Key points enforced by the current implementation:
 - **Line buffering is required**: `stdout.on("data", ...)` delivers
   chunks, not lines; NDJSON parsing must buffer and split on `\n`,
   carrying over any partial final line to the next chunk.

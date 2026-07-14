@@ -1,5 +1,9 @@
 # Spec: Native Library Browser (Phase 4 — Two-Column Playlist/Tracklist UI)
 
+**Current status override (2026-07-13):** implemented in the checked-out
+`LibraryBrowser.vue`; the historical proposal status immediately below is no
+longer authoritative.
+
 Status: Proposed v1.1 — architecture only, not yet implemented (v1.1
 adds a tracklist Action/Load column, fixes the right-column
 internal-scroll bug, adds the cross-component `isLoadingTrack`
@@ -10,6 +14,36 @@ Source of truth: `1-proposal.md` (product goals), `2-core-spec.md` (core
 pipeline/CLI contract), `3-gui-spec.md` (Tauri + Vue 3 component
 architecture, state management, sidecar plumbing), `3-player-spec.md`
 (waveform player, Tauri asset bridge, two-stage sync flow)
+
+## Current implementation synchronization (2026-07-13)
+
+`LibraryBrowser.vue` is implemented as a self-contained panel with one
+optional `disabled` prop. It loads playlist names on mount, loads tracks after
+a playlist click, and writes a selected track's `location_path` to the shared
+configuration state for `AudioPlayer.vue` to watch. The right-hand table has
+Load, Stems, Artist, and Title columns; row double-click and the Load icon use
+the same preview action. A separate context menu exposes the current
+track-level **Analyze track** action.
+
+The current `App.vue` layout places the browser in its own flexible card
+between the fixed-height player and configuration cards. The application root
+and all ancestors are viewport-bounded and `overflow-hidden`. Only the
+playlist list and track table wrappers scroll, each with `min-h-0
+overflow-y-auto scrollbar-amber`; the browser root and document do not become
+scroll containers. The browser footer owns playlist/current-track analysis
+buttons and status text.
+
+All one-shot library calls use the packaged `binaries/cuegrid-core` sidecar:
+`--list-playlists` at boot and `--get-playlist-tracks NAME` after selection.
+The frontend maintains the discovered NML path in the module-scoped
+`nmlPathOverride` state and passes it to query/mutation calls where the current
+implementation includes it. A selection token discards late playlist
+responses so an older request cannot overwrite a newer selection.
+
+The panel uses the semantic Amber/Ochre roles from `gui/tailwind.config.js`:
+selected rows use `bg-elevated text-accent`, ordinary track text uses
+`text-primary`, and hover/load affordances use the semantic primary/accent
+roles. Blue/green/teal references in older layout examples are historical.
 
 This document is the binding technical specification for Phase 4: **the
 removal of the manual, free-text `TargetSelector.vue` target picker and
@@ -1166,6 +1200,30 @@ subtracted, not `configHeight` (Block 2). Concretely:
   render hundreds of rows.
 
 ---
+
+### 5.4 Current DOM sizing and scroll contract
+
+The current template uses this structural contract:
+
+```html
+<section class="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+  <div class="flex-1 min-h-0 flex">
+    <div class="flex w-[min(22rem,34%)] min-h-0 shrink-0 flex-col">
+      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">...</div>
+    </div>
+    <div class="flex min-w-0 flex-1 min-h-0 flex-col">
+      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">...</div>
+    </div>
+  </div>
+  <div class="shrink-0 ... p-2">analysis actions and status</div>
+</section>
+```
+
+The left column is approximately 34% wide, capped at 22rem; the right column
+receives the remaining width. The header and footer are shrink-0. Loading,
+error, empty, and table states are constrained by the same flex/min-h-0 chain.
+The `table-fixed` table stays inside the right scroll wrapper, and sticky
+headers belong to that wrapper rather than to the page.
 
 ## 6. Supersession Table
 

@@ -1,6 +1,6 @@
 # Spec: Traktor Auto-Cue Automation
 
-Status: Proposed v1.7 (single-track sidecar contract) — architecture only, not yet implemented
+Status: Current implementation synchronized 2026-07-13 (single-track, batch, metadata, playlist, discovery, NDJSON, and cue-mutation sidecar contracts)
 Source of truth: `.openspec/1-proposal.md`
 
 This document is the binding technical specification for the project. Per
@@ -8,6 +8,31 @@ This document is the binding technical specification for the project. Per
 described here. If an edge case is discovered during implementation, this
 file must be updated (via a proposed diff) before code changes proceed.
 All open questions from the v1 draft were resolved in sections 6 and 7.
+
+## Current implementation synchronization
+
+The current package is under `core/src/cuegrid/`, not a root `src/`
+directory. The implementation currently takes precedence over historical
+revision notes below that still describe a feature as "proposed" or "not yet
+implemented". In particular, batch processing, `--json` NDJSON output,
+`--list-playlists`, `--get-playlist-tracks`, `--get-track-metadata`,
+`--discover-nml`, `--update-cues`, and `--delete-cue` are implemented in
+`cuegrid.cli`.
+
+`NmlParser` loads `collection.nml` once and retains both the normalized
+`Path` (`nml_path`) and live `ElementTree`. `core.pipeline` creates one parser
+per single-track or batch run, passes the parsed `TrackEntry` into analysis,
+and gives the same parser to `NmlWriter`. `NmlWriter` mutates that in-memory
+tree and uses the retained path for the `.bak` backup and atomic `.tmp` to NML
+replacement. This is the shared read/write document model for both automated
+analysis and frontend-originated manual changes.
+
+The frontend-facing write paths are deliberately separate: `--update-cues`
+updates existing standard HotCues or creates missing standard HotCues from
+`[{"hotcue": number, "start_ms": number}]`; `--delete-cue` removes exactly one
+standard `TYPE="0"` cue by its zero-based `HOTCUE` slot. Neither operation
+runs audio analysis. The CLI resolves the NML path before constructing the
+parser, and the process exit code is authoritative for the sidecar caller.
 
 **Revision note (v2):** the audio analysis strategy was fundamentally
 changed from blind whole-track novelty detection to **Grid-Guided Phrase
@@ -26,15 +51,35 @@ is purely additive. This section of the document is a **proposal**:
 any of section 8's requirements. Do not implement v1.1 code until this
 proposal is reviewed and the Status line above is updated to "Resolved".
 
-**Revision note (v2.2, resolved):** adds **Multi-Source Validation** (new
-section 10): Empty Stem Detection (falling back to the Master track when
-an extracted drum stem is practically silent/ambient) and, behind a new
-`--verify smart` flag, Smart Validation Gating (cross-checking each
-confirmed candidate against the Master audio to classify it as
-`"Drop (Rhythm)"` or `"Breakdown (Melodic)"`). Purely additive on top of
-v2.0/v2.1's stem-swap (section 9); `--verify fast` remains available as an
-advanced override, while v1.5 makes `smart` the default when Stems are
-active. Both modes retain the always-on empty-stem fallback.
+**Revision note (v2.2, superseded by v2.7):** the former Multi-Source
+Validation design used stem-only detection followed by optional Master
+cross-validation and `--verify smart` relabeling. That post-detection
+classifier/filter architecture is retired. Empty-stem handling remains as
+source-availability fallback, while the current section 10 defines Parallel
+Signal Fusion with simultaneous Master and Drum envelopes.
+
+**Revision note (v2.5, resolved):** pauses structural scoring boosts and adds
+mechanical cue guards. `major_phrase_multiple` may continue to tag candidates
+for traceability, but it must not affect confidence or selection priority. A
+candidate with `beat_index < 8` is rejected before audio feature decoding.
+During mapping, a candidate is rejected when it is fewer than 8 beats from any
+active existing cue or previously accepted new cue. Existing standard HotCues
+are excluded from this active set only when `clear_existing` is true; retained
+markers remain active.
+
+**Revision note (v2.7, proposed):** Smart Mode is being refactored from a
+post-detection classifier/filter into **Parallel Signal Fusion**. When a drum
+stem is available, the detector extracts aligned onset/energy envelopes from
+both the Master track and the Drums/Rhythm stem simultaneously, then selects
+peaks from their weighted combination. The new defaults are
+`master_weight = 0.6` and `drum_weight = 0.4`. Standard single-track analysis
+is strictly backward compatible: without a drum stem it uses
+`master_weight = 1.0`, `drum_weight = 0.0`, and skips all stem calculations.
+The binary `Smart_Boost` telemetry field is deprecated and is replaced by
+`Drum_Weight_Applied`; `Drum_Score` is the exact drum RMS at the combined peak
+frame index.
+
+
 
 **Revision note (v2.3, proposed):** adds **Machine-Readable JSON Output**
 (new section 11): a new `--json` flag that switches `cli.py` to emit
@@ -71,13 +116,10 @@ structurally distinct detection behavior rather than merely shifting an
 absolute threshold. Do not implement this revision until this Status line
 is updated to "Resolved".
 
-**Revision note (v1.5, proposed):** replaces the implicit/GUI-controlled
-Stems choice with an explicit `--no-stems` CLI override. Stems are active by
- default and use the advanced `smart` multi-source validation path; when
- `--no-stems` is present, the pipeline bypasses the `FLAGS & 0x40` availability
- check and analyzes the original Master file even when a valid `.stem.mp4`
- exists. Do not implement this revision until this Status line is updated to
- "Resolved".
+**Revision note (v1.5, superseded by v2.7):** the explicit `--no-stems` CLI
+override remains supported. Its Master-only behavior is now defined by
+section 10's strict backward-compatible fallback; it no longer selects a
+post-detection multi-source validation path.
 
 **Revision note (v1.7, proposed):** formalizes the single-track CLI/sidecar
 contract in section 8.6. A single-track invocation receives one absolute
@@ -140,8 +182,13 @@ for v1.1:
 
 ## 2. Architectural Layout
 
-Modular Python package under `src/`, organized by responsibility so that XML
+Modular Python package under `core/src/cuegrid/`, organized by responsibility so that XML
 handling, audio analysis, and orchestration never live in the same module.
+
+The authoritative package paths are `core/src/cuegrid/cli.py`,
+`core/src/cuegrid/core/pipeline.py`, and `core/src/cuegrid/nml/writer.py`.
+The older tree illustration immediately below is retained as historical
+context only; it must not be used to infer a root-level `src/` directory.
 
 ```
 traktorco/
@@ -205,15 +252,15 @@ traktorco/
 
 | Module | Responsibility | Must NOT do |
 |---|---|---|
-| `nml.parser` | Read-only XML parsing (`xml.etree.ElementTree`), locate `ENTRY` by matching `LOCATION` (`DIR`+`FILE`+`VOLUME`), by playlist `NAME` (section 8.1), or by track `TITLE` (section 8.2); extract `TempoInfo` and existing `CuePoint`s | Never mutate the tree |
-| `nml.writer` | Insert/replace `<CUE_V2>` children on a given `ENTRY`, serialize the whole `NML` tree back to disk atomically with a `.bak` backup of the original file | Never re-parse or re-derive cue math |
+| `nml.parser` | Load `collection.nml` once, retain `nml_path` and the live `ElementTree`, locate `ENTRY` by `LOCATION`, playlist, or title, and shape metadata/query results | Does not mutate the tree |
+| `nml.writer` | Reuse the parser's live tree to append generated cues, update manual cue positions/create missing cues, delete one standard HotCue, and serialize atomically with a `.bak` backup | Never re-parse or re-derive cue math; never alter `TYPE=4` grid markers |
 | `audio.beatgrid` | Pure math: beat length + phrase-candidate generation (section 4) from BPM/grid anchor/duration alone | Never read files or decode audio |
 | `audio.loader` | Decode only a small requested window of audio (`offset`/`duration`) to a mono waveform + sample rate | Never decode/load a whole track |
 | `audio.features` | Pure math: energy-delta / timbre-distance / confidence scoring on precomputed RMS + MFCC values (section 6) | Never call `librosa` directly; never read files |
 | `audio.detector` | Orchestrate: for each phrase candidate, call `audio.loader` for the before/after windows, run `librosa.feature.rms`/`mfcc` on them, score via `audio.features`, confirm + label `DetectedEvent`s | Never analyze anything outside a candidate's window; never touch XML |
 | `core.mapping` | Decide `CueType` + `HOTCUE` slot per detected label | Never read/write files |
-| `core.pipeline` | Wires the above together for one track (`run_pipeline`, unchanged from v1.0) or a batch of tracks (`run_batch_pipeline`, section 8.3): parse/select NML entries → generate phrase candidates → targeted detection → map → write, per track, continuing past any single track's failure in batch mode | Should contain no XML- or DSP-specific logic itself; must never let one track's exception abort the rest of a batch (section 8.3) |
-| `cli` | Argument parsing, logging setup, calls `core.pipeline`; enforces the mutually-exclusive track-selection flags (section 8.4) | No business logic |
+| `core.pipeline` | Creates and retains the parser for one run, selects entries, resolves audio sources, detects events, maps cues, and delegates writes to the matching writer; exposes `serialize_gui_payload` and sequential batch callbacks | Should contain no XML- or DSP-specific logic itself; must isolate failures per batch track |
+| `cli` | Resolves/discovers the NML path, parses arguments, routes read-only queries, manual cue mutations, single-track analysis, batch analysis, NDJSON, and GUI export | Does not duplicate detection or XML mutation logic |
 
 ### 2.2 Configuration (`config.py`)
 
@@ -250,9 +297,14 @@ class AppConfig:
     max_cues: int = 8                              # cap on how many cues are written per track
     relative_confidence_threshold: float = 0.30    # keep candidates >= this fraction of track max confidence
 
-    # v2.2/v1.5 Multi-Source Validation (section 10): smart is the default
-    # whenever Stems are active; --no-stems forces Master-only analysis.
-    verify: str = "smart"
+    # Parallel Signal Fusion (section 10): when a drum stem is available,
+    # combine aligned Master and Drum energy envelopes before peak selection.
+    # If no drum stem is available, the pipeline overrides these values with
+    # master_weight=1.0 and drum_weight=0.0 and skips stem calculations.
+    master_weight: float = 0.6
+    drum_weight: float = 0.4
+
+    # Source selection override; --no-stems forces standard Master-only mode.
     no_stems: bool = False
 ```
 
@@ -284,14 +336,58 @@ maximum confidence, while **Hard** acts strictly and demands at least 50% of
 maximum confidence.
 
 Note what is deliberately **absent**: there is no whole-track peak-picking
-config (`peak_pre_max`, `peak_delta`, etc.) and no `min_cue_spacing_beats`.
-Both are obsolete under Grid-Guided Phrase Analysis — candidates are, by
-construction, always at least `phrase_beats` apart, so minimum-spacing
-de-duplication is no longer needed (see section 4). There is also no
-position-based intro/outro window config — section 6 evaluates the whole
-track as a single, unified pool of candidates.
+config (`peak_pre_max`, `peak_delta`, etc.). A fixed millisecond spacing
+config is also unnecessary: the mechanical mapper enforces a fixed 8-beat
+minimum using the track BPM. The first 8 beats are a fixed intro protection
+margin; the existing outro guard remains in section 6.
+
+### 2.3.1 Frequency visualization export boundary
+
+This is the binding cross-boundary rule for future spectrum/frequency
+rendering in the GUI:
+
+- The Python core owns all frequency preprocessing and band detection. It
+  may use `librosa` to derive low/bass, mid, high/treble, or equivalent
+  normalized bands from the audio.
+- The Vue/Tauri frontend must not calculate real-time FFTs, spectrograms, or
+  other heavy frequency features in JavaScript. Rust is likewise a transport
+  boundary, not an audio-analysis implementation.
+- The core exports a lightweight visualization payload, aligned to waveform
+  samples or fixed time buckets. A conforming payload contains a version,
+  duration, bucket interval, and normalized band values, for example:
+
+  ```json
+  {
+    "version": 1,
+    "duration_ms": 240000,
+    "bucket_ms": 50,
+    "bands": [
+      {"low": 0.72, "mid": 0.41, "high": 0.18},
+      {"low": 0.68, "mid": 0.44, "high": 0.21}
+    ]
+  }
+  ```
+
+- Band values are presentation inputs only: they are normalized to `[0, 1]`
+  and must not be interpreted by the GUI as analysis confidence, cue
+  validity, or beat-grid data.
+- Peaks.js consumes the pre-calculated peaks as a **dumb silhouette renderer**.
+  The frontend's CSS-mask layer consumes the color map for presentation; neither
+  it nor Peaks.js may invoke FFT/frequency analysis during initial rendering,
+  zoom, pan, playback, or marker interaction.
+- The payload may be transported as sidecar JSON, cached metadata, or an
+  equivalent Tauri response, but the transport must preserve the ownership
+  boundary: Python computes; the frontend renders. Exact transport framing
+  is deferred until the spectrum feature is formally scheduled.
+
+This export is additive to the targeted cue-detection pipeline. It must not
+silently turn `audio.loader` or the existing detector into a whole-track
+analysis path; the explicit Stage 1 preview decode in section 15 is the sole
+exception. It has its own low-rate decoding, bounded visual-output contract,
+and Vue RAM-cache strategy.
 
 ### 2.3 Data structures (`nml/models.py`)
+
 
 ```python
 from dataclasses import dataclass, field
@@ -443,6 +539,26 @@ duplicated, or overwritten by the writer.
 - Before writing, copy the original file to `<name>.nml.bak` if a backup
   for this run does not already exist.
 
+### 3.5 Frontend-originated cue mutations
+
+The GUI uses the same retained parser/writer document model for manual edits:
+
+- `cuegrid TRACK_PATH --update-cues JSON_STRING [--nml PATH]` is a
+  metadata-only mutation path. The JSON value is an array of objects with
+  numeric `hotcue` (the NML zero-based slot) and `start_ms` (the cue start
+  position). Existing standard `TYPE="0"` nodes are updated in place so
+  their existing attributes are preserved; missing slots are created with
+  default point-cue attributes. The operation performs no audio analysis.
+- `cuegrid TRACK_PATH --delete-cue HOTCUE_INDEX [--nml PATH]` removes exactly
+  one standard HotCue. It never removes the `TYPE="4"` grid marker or other
+  marker types, and it writes only after a matching node has been found.
+- Both paths instantiate `NmlParser` once, pass it to `NmlWriter`, create the
+  `.bak` backup when needed, and replace the original NML atomically. A failed
+  write restores the in-memory node removed by `delete_cue` before re-raising.
+- The frontend treats the sidecar exit code as the commit result. Local cue
+  dragging/deletion remains dirty UI state until an explicit save or a
+  dedicated delete operation succeeds.
+
 ---
 
 ## 4. Grid-Guided Phrase Candidate Generation
@@ -584,9 +700,9 @@ def generate_phrase_candidates(
     return candidates
 ```
 
-`audio.detector` (section 6) consumes this list directly; `core.pipeline`
-no longer performs any post-hoc snapping or spacing de-duplication, since
-both are now structural guarantees of this generator.
+`audio.detector` consumes this list directly; `core.pipeline` performs no
+post-hoc snapping. The later `core.mapping` step still applies the resolved
+8-beat active-cue spacing guard from section 6.1.
 
 ---
 
@@ -656,10 +772,11 @@ so fade-outs can never be selected.
    `audio.loader.load_window`:
    - `before = load_window(path, offset_sec=(candidate.time_ms - window_ms) / 1000, duration_sec=window_ms / 1000, sr=config.sample_rate)`
    - `after  = load_window(path, offset_sec=candidate.time_ms / 1000, duration_sec=window_ms / 1000, sr=config.sample_rate)`
-   - If `before`'s offset would be negative (candidate is within the first
-     `window_ms` of the track, i.e. `n = 0`), skip the `before` window
-     entirely; this candidate cannot be scored (there is no evidence to
-     evaluate; see step 5) and is dropped from the pool. Do not clamp the
+   - If `candidate.beat_index < 8`, reject the candidate immediately with
+     `REJECTED_INTRO_MARGIN` and do not decode any audio windows.
+   - Otherwise, if `before`'s offset would be negative, skip the `before`
+     window entirely; this candidate cannot be scored (there is no evidence
+     to evaluate; see step 5) and is dropped from the pool. Do not clamp the
      offset to `0`, which would shrink and bias the window.
    - If `after`'s window would run past `duration_ms`, truncate its
      `duration_sec` to what remains, rather than skipping it.
@@ -694,11 +811,14 @@ so fade-outs can never be selected.
      `confidence < max_confidence * config.relative_confidence_threshold`.
      This keeps the cue set proportional to how dramatic the track's
      *strongest* change is, rather than a fixed absolute cutoff.
-   - Rank the survivors by `confidence` descending (ties broken in favor
-     of `is_major_phrase` candidates) and keep the top `config.max_cues`.
+   - Rank the survivors by `confidence` descending and keep the top
+     `config.max_cues`; `is_major_phrase` is traceability metadata only while
+     structural scoring is paused.
    - Sort the kept candidates by `time_ms`/`beat_index` ascending for the
      final output — ranking-by-confidence only decides *which* candidates
-     survive, not their output order.
+     survive, not their output order. During mapping, reject a candidate when
+     it is fewer than 8 beats from any retained existing cue or accepted new
+     cue; log the rejection and do not assign it a slot.
    - If no candidate is significant, the result is an empty list — a
      valid, silent outcome, not an error. There is no fallback to
      non-significant candidates.
@@ -1330,11 +1450,11 @@ NI's native stem `.mp4` multiplexes 5 audio streams: stream `0:0` is the
 full mix, and `0:1`-`0:4` are the four isolated stems (Drums, Bass,
 Vocals, Melody/Other, per NI's own stem template) -- `0:1` (Drums/Rhythm)
 is the default and the only stream this project currently uses. The
-resulting WAV is handed to the existing `load_window(offset_sec=,
-duration_sec=)` exactly as any other audio file would be -- `audio.loader`
-gains this one new function but `load_window` itself, and everything
-downstream of it (`audio.detector`, `audio.features`), is completely
-unmodified.
+resulting WAV is handed to the existing seek-based loader alongside the
+original Master path. Section 10 defines the detector changes required to
+extract both aligned envelopes and fuse them; the drum file is no longer a
+replacement source for the Master signal and must never be used as a
+post-detection validation-only input.
 
 ### 9.5 Dependency
 
@@ -1392,118 +1512,133 @@ fallbacks entirely. `core.pipeline._resolve_analysis_source` gains a
 
 ---
 
-## 10. Multi-Source Validation (v2.2)
+## 10. Parallel Signal Fusion (Smart Mode, proposed v2.7)
 
-v2.0/v2.1's stem-swap (section 9) is a major win for tracks with a clean
-Drums/Rhythm stem, but two edge cases remained unhandled:
+Smart Mode is **not** a post-detection classifier, validation pass, or binary
+filter. It is a parallel signal-fusion architecture: when a valid Drums/Rhythm
+stem is available, the pipeline analyzes the original Master track and the
+aligned drum stem at the same time. It extracts onset/energy envelopes for
+both sources, normalizes them onto the same frame index, and selects peaks
+from one combined signal. This allows Master-only events and rhythm-driven
+events to compete in the same detection pass without relabeling or rejecting
+already-detected cues afterward.
 
-1. Some genres (Ambient, IDM, etc.) legitimately have an empty or
-   near-silent drum stem -- analyzing it directly would starve the
-   detector of any real signal.
-2. Even for tracks with a real drum stem, the detector cannot currently
-   distinguish a rhythm-driven "Drop" from a melodic "Breakdown" --
-   both can register as a significant energy/timbre change on the
-   isolated drum stem alone (a breakdown often *removes* drums, which
-   also reads as a big change).
+The combined energy used for peak selection is:
 
-v2.2 adds a new `--verify {fast,smart}` CLI flag and v1.5 adds the
-explicit `--no-stems` boolean override. The default is now `smart` while
-Stems are active. `--no-stems` disables the stem source and therefore also
-skips Stem-based validation, regardless of `--verify`; the original Master
-file is analyzed directly. These controls do not change core detection math
-(section 6) or the underlying stem-swap decision (section 9.3) -- the
-refinements sit entirely inside `core.pipeline`/`audio.loader`.
-
-### 10.1 Empty Stem Detection (Option C) -- runs in both modes
-
-Implemented in `audio.loader.measure_audio_energy`/`is_drum_stem_empty`,
-called from `core.pipeline._resolve_analysis_source` immediately after
-`extract_drum_stem` succeeds (i.e. as a new step 4, after the existing
-steps in section 9.3):
-
-1. `measure_audio_energy(path)` reads a small, fixed number of short,
-   evenly-spaced chunks (`_ENERGY_PROBE_CHUNK_COUNT=8` chunks of
-   `_ENERGY_PROBE_CHUNK_SEC=0.5`s each) via `soundfile`, seeking directly
-   to each chunk -- never decoding the whole file -- and returns the
-   mean RMS energy across them.
-2. `is_drum_stem_empty(path)` compares that mean RMS against
-   `DRUM_STEM_SILENCE_RMS_THRESHOLD = 0.01`. Below it, the stem is
-   considered practically drumless/ambient.
-3. If the extracted drum stem is empty, `_resolve_analysis_source` logs
-   `"Drum stem is empty/ambient for ...; falling back to original
-   Master audio"`, deletes the temporary stem WAV, and returns
-   `(fallback_path, None)` -- exactly the same graceful-degradation
-   shape as every other fallback branch in section 9.3. This runs
-   unconditionally (regardless of `--verify`), since it protects *any*
-   mode from analyzing silence.
-
-### 10.2 Smart Validation Gating (Option A) -- `--verify smart` only
-
-When `config.verify == "smart"` **and** a real (non-empty) drum stem was
-used for analysis (i.e. `_resolve_analysis_source` returned a non-`None`
-temp WAV), `core.pipeline` runs one additional pass after mapping events
-to `CuePoint`s but before deleting the temp stem WAV or writing to the
-NML:
-
-1. **Detection pass (unchanged):** `detect_events` still runs against
-   the isolated drum stem exactly as in fast mode (section 6/9) to get
-   the confirmed candidate list -- smart mode is a *post-hoc*
-   classification layer, not a different detection algorithm.
-2. **Validation pass
-   (`core.pipeline._classify_events_against_master`):** for each
-   confirmed `DetectedEvent`, decode one small window
-   (`_SMART_VALIDATION_WINDOW_SEC = 2.0` seconds, centered on the
-   event's timestamp -- i.e. 1 second before/after) from *both* the
-   drum stem and the original Master audio file, via the existing
-   `audio.loader.load_window` seek path (never a full decode of
-   either file).
-3. **Classification:** compare each window's RMS energy against
-   `_SMART_HIGH_ENERGY_RMS_THRESHOLD = 0.02`:
-   - Drum energy high **and** Master energy high -> label
-     `"Drop (Rhythm)"`.
-   - Drum energy low/zero **but** Master energy high -> label
-     `"Breakdown (Melodic)"`.
-   - Any other combination (both low, or -- which should not happen
-     since the drum stem is a strict subset of the mix -- drum high but
-     Master low) leaves the cue's default `"Cue"` name untouched.
-4. **Relabeling:** the matching `CuePoint.name` (matched by
-   `start_ms == event.time_ms`) is overwritten with the classification
-   label before the cue is written to the NML, so Traktor displays
-   `"Drop (Rhythm)"`/`"Breakdown (Melodic)"` directly on the imported
-   HotCue pad instead of the generic `"Cue"`.
-
-This keeps smart mode's overhead tight: at most `2 * config.max_cues`
-targeted micro-reads of the Master file (one drum-stem read + one
-Master read per confirmed event), never a full decode of either file.
-
-### 10.3 CLI (`cli.py`)
-
-```
---verify {fast,smart}   Multi-Source Validation mode; default: smart
---no-stems              Bypass native Stems and force Master-file analysis
+```text
+combined_energy = (master_energy * master_weight) + (drum_energy * drum_weight)
 ```
 
-`--no-stems` is a plain boolean flag mapped to `AppConfig.no_stems`. It has
-precedence over every Stems decision: the pipeline must not inspect or rely
-on `FLAGS & 0x40`, resolve a `.stem.mp4`, extract a drum stem, or run
-Stem-based Master cross-validation. It must pass the original Master path
-directly to the normal detector. With the flag omitted, Stems are active;
-when a valid drum stem is available, the default `smart` mode applies, and
-Option C empty/ambient-drum-stem detection always falls back to the Master
-file. `--verify fast` remains available as an advanced CLI-only override,
-but it does not alter the `--no-stems` precedence rule.
+For every aligned frame `i`, this is evaluated as:
 
-Mapped through `_CONFIG_FIELD_BY_ARG_DEST["verify"] = "verify"` and the
-corresponding `no_stems` mapping, so `AppConfig` is the single source of
-truth `core.pipeline` reads from.
+```text
+combined_energy[i] = (master_energy[i] * master_weight)
+                   + (drum_energy[i] * drum_weight)
+```
 
-### 10.4 Data structures
+The configured weights are non-negative, have defaults of
+`master_weight = 0.6` and `drum_weight = 0.4`, and are applied before peak
+selection. The resulting combined envelope is then passed through the normal
+phrase-boundary, significance, confidence, and cue-selection rules in section
+6. The drum signal is therefore an input to detection, not a post-detection
+filter.
 
-No new fields are needed on `nml.models.CuePoint` -- it already has a
-mutable `name: str` field (spec section 2.3) that `nml.writer` already
-serializes as the `<CUE_V2 NAME="...">` attribute, so smart
-classification only needs to overwrite that field in place on the
-already-mapped `CuePoint` before the writer runs.
+### 10.1 Weight parameters and strict backward compatibility
+
+`AppConfig` exposes the following fusion parameters:
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `master_weight` | `0.6` | Contribution of the Master onset/energy envelope |
+| `drum_weight` | `0.4` | Contribution of the Drums/Rhythm onset/energy envelope |
+
+The no-stem path is a strict backward-compatibility mode. If no drum stem is
+provided or a stem cannot be resolved/extracted, the pipeline must
+automatically use:
+
+```text
+master_weight = 1.0
+drum_weight = 0.0
+```
+
+It must also skip stem extraction, stem decoding, stem envelope calculation,
+and all other drum-specific work in that path. Standard single-track
+analysis therefore retains the Master-only signal and its prior performance
+profile rather than paying Smart Mode's additional processing cost.
+
+An explicit `--no-stems` request has the same result and takes precedence over
+stem discovery. An empty or practically silent stem must be treated as no
+usable drum stem for fusion, cleanly falling back to the same Master-only
+parameters and avoiding a zero-information drum signal.
+
+### 10.2 Parallel envelope extraction and peak selection
+
+When a usable drum stem exists:
+
+1. Decode aligned analysis windows from the Master and drum sources for each
+   phrase candidate using the existing seek-based loader.
+2. Extract onset/energy envelopes from both windows with the same frame and
+   hop configuration. Frame `i` in each envelope must refer to the same
+   musical time in the source files.
+3. Apply the configured weights using the formula above to produce
+   `combined_energy[i]`.
+4. Select the candidate peak from the combined envelope, retaining the exact
+   drum RMS value at that combined peak frame for telemetry as `Drum_Score`.
+5. Apply the existing significance, relative-confidence, anti-silence, and
+   mechanical cue guards to the fused result. No later Master-vs-Drum
+   classification or Smart validation gate is permitted.
+
+The Master and drum envelopes are sample/frame aligned because the native
+Traktor stem streams share the Master timeline. If their decoded windows
+produce different frame counts, the implementation must use the common valid
+frame range rather than inventing an offset or padding a source with signal.
+
+### 10.3 CLI and source selection
+
+The source-selection override remains:
+
+```text
+--no-stems   Bypass native Stems and force Master-only analysis
+```
+
+With the flag omitted, a valid non-empty drum stem enables Parallel Signal
+Fusion. Missing, invalid, unextractable, or empty stems use the strict
+Master-only fallback in section 10.1. There is no `--verify smart` post-hoc
+classification mode in the new architecture; Smart Mode denotes the fused
+analysis path itself.
+
+### 10.4 Telemetry and CSV schema
+
+The binary `Smart_Boost` flag is deprecated and must not be emitted by new
+telemetry writers. The replacement field is `Drum_Weight_Applied`:
+
+- In fused Smart Mode, it stores the applied drum/master alpha/beta ratio,
+  represented as the numeric ratio `drum_weight / master_weight` (for the
+  default weights, `0.4 / 0.6 = 0.666666...`).
+- In standard Master-only mode, it stores `0.0`.
+
+`Drum_Score` is not a boolean, classifier score, or post-detection boost. It
+is the exact drum RMS energy measured at the frame index where the combined
+signal selected the peak. In standard mode, where no drum signal is computed,
+`Drum_Score` is `N/A`.
+
+The GUI last-run cache and any exported per-candidate CSV must use this stable
+schema shape:
+
+```text
+track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
+```
+
+The deprecated `Smart_Boost` column must not appear in this schema. Cache
+overwrite/GUI export behavior remains as defined in section 14.
+
+### 10.5 Empty stem handling
+
+A fast, chunked RMS probe may still determine whether an extracted drum stem
+is practically silent. If it is below the documented silence threshold, the
+stem temporary file must be deleted and the pipeline must take the exact
+Master-only fallback from section 10.1. This is source availability handling,
+not a post-detection filter.
 
 ---
 
@@ -1552,7 +1687,7 @@ it is a pure output-mode switch read directly off `args.json` inside
 docstring note (section 2.2) that only *tunable thresholds* live on that
 dataclass is preserved by keeping `--json` out of it entirely.
 
-`--json` is compatible with every existing flag (`--verify`, `--mode`,
+`--json` is compatible with every existing flag (`--mode`,
 single-track and batch selection, `--clear-existing`, etc.) with one
 presentation-only interaction: when `--json` is given, `-v`/`--verbose`
 no longer changes `logging.basicConfig`'s destination -- see 11.5 --
@@ -1655,15 +1790,13 @@ written it to the entry -- i.e. after `writer.write_cues`/
 track currently in progress:
 
 ```json
-{"type": "cue_written", "hotcue": 2, "name": "Drop (Rhythm)", "start_ms": 64500.0}
+{"type": "cue_written", "hotcue": 2, "name": "Cue", "start_ms": 64500.0}
 ```
 
 - `hotcue`, `name`, `start_ms`: `CuePoint.hotcue`, `CuePoint.name`,
-  `CuePoint.start_ms` verbatim. `name` reflects any v2.2 Smart
-  Validation Gating relabeling (section 10.2) already applied by
-  `_apply_smart_classification` before the write, so `--verify smart`
-  runs surface `"Drop (Rhythm)"`/`"Breakdown (Melodic)"` here exactly
-  as they appear on the HotCue pad in Traktor.
+  `CuePoint.start_ms` verbatim. `name` is not post-hoc relabeled by Smart
+  Mode; peak selection is determined by the fused Master/Drum signal before
+  the cue is written.
 
 **`track_complete`** -- emitted once per track, after that track's
 processing finishes (success or failure), before the next track's
@@ -1876,7 +2009,7 @@ not here.
 
 ---
 
-## 13. HotCue Deletion for the GUI Sidecar (v1.3, proposed)
+## 13. HotCue Deletion and Manual Cue Synchronization for the GUI Sidecar (implemented)
 
 This section defines a destructive, single-track CLI operation for the
 Phase 3 player. It is deliberately separate from `--clear-existing`:
@@ -1957,13 +2090,37 @@ represented by NML index `1`, as defined in 13.1.
   update, and rollback contract is defined in `3-player-spec.md` section
   3.13/4.4.
 
+### 13.5 Manual cue update contract (`--update-cues`)
+
+The complementary non-analysis command is:
+
+```text
+cuegrid TRACK_PATH --update-cues '[{"hotcue": 0, "start_ms": 12000.0}]' [--nml COLLECTION_NML]
+```
+
+The CLI accepts the JSON array before normal track-selector validation,
+resolves the selected NML path, constructs `NmlParser(nml_path)`, and calls
+`NmlWriter(parser).update_track_hotcues(...)`. The writer resolves the target
+`ENTRY` using the same path/title/artist matching rules as analysis, updates
+the `START` value of matching standard HotCues, creates missing `TYPE="0"`
+nodes with default point-cue attributes, then backs up and atomically writes
+the parser's retained XML tree. The frontend sends this command from
+`useCueGridSidecar().updateTrackCues()` after the user presses **Save Changes**.
+
+The standalone `--delete-cue` command remains the authoritative physical
+deletion path for one slot. A client that removes a cue from local state must
+either invoke that command or otherwise issue an explicit deletion operation;
+omitting a cue from the update list alone is not a deletion instruction for
+`update_track_hotcues`.
+
 ---
 
 ## 14. Last-Run Telemetry Cache (v1.8)
 
 The Python sidecar engine must persist the evaluation metrics produced by
 its most recent execution loop in a fixed internal cache file named
-`last_run_telemetry.csv`. The file is located in the application's local
+`last_run_telemetry.csv`. The schema below reflects Parallel Signal Fusion;
+`Smart_Boost` is deprecated and must not be written. The file is located in the application's local
 data directory and is an implementation-owned cache, not a user-selected
 output path.
 
@@ -1972,7 +2129,7 @@ output path.
 The cache CSV must contain the following fields:
 
 ```text
-track_title,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db
+track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
 ```
 
 Each execution must overwrite `last_run_telemetry.csv` rather than append
@@ -1980,3 +2137,98 @@ to it. After an execution completes, the file therefore contains telemetry
 exclusively from that most recent execution loop; stale rows from earlier
 executions must not remain in the cache. The CSV header and field names
 are part of the sidecar contract and must remain stable for GUI export.
+
+---
+
+## 15. Stage 1 Track-Preview Super JSON (`--get-track-metadata`)
+
+`--get-track-metadata` is a read-only preview operation, but it is no longer
+an NML-only query. After resolving the `TrackEntry`, it must decode the
+requested audio file as mono at `sr=11025`, then return the original metadata
+together with renderer-ready waveform and color data in one single-line JSON
+object (the **Super JSON**). This deliberately moves preview DSP out of the
+browser: Web Audio decoding and browser-side analysis produce disruptive CPU
+spikes, whereas the Python sidecar can perform the work once and Vue can reuse
+the result from RAM on later previews.
+
+### 15.1 Decode and aggregation contract
+
+- The command loads the complete preview signal through `librosa` at exactly
+  `sr=11025`. This decode is for Stage 1 preview generation only; it does not
+  alter the targeted, partial-decode cue-analysis contract in sections 5--6.
+- `waveform_peaks` is calculated by truncating the decoded signal to its largest
+  whole multiple of 128 samples and grouping it with `reshape(-1, 128)`.
+  For every row, extract the minimum and maximum and interleave them as
+  `[min, max, min, max, ...]`.
+- Before conversion to the required signed `int8` JSON representation, apply
+  visual dynamic-range expansion to every interleaved peak:
+  `sign(x) * abs(x) ** exaggeration_factor`, where the current
+  `exaggeration_factor` is `1.8`. Then scale by 127 and convert to `int8`
+  (`[-128, 127]`). This is presentation data, not an acoustic measurement:
+  it intentionally suppresses mid/low-level audio toward the centre axis and
+  preserves sharp transients for a high-contrast DJ waveform.
+- Vue must not pad, resample, requantize, or re-extract the peaks. The
+  128-sample grouping is mandatory because it preserves the detail required
+  for deep zoom levels.
+- The sidecar builds the HPSS spectrogram with
+  `librosa.stft(y, n_fft=512, hop_length=512)` before running
+  `librosa.decompose.hpss`. The short `n_fft=512` analysis window tightly
+  resolves fast transients (notably kick drums) and prevents their sub-bass
+  tails from being misclassified as sustained harmonic material.
+- It computes RMS energy independently for the resulting harmonic and
+  percussive signals, aggregates those values into chronological **500 ms**
+  buckets, and emits one color entry per bucket. `p` is the
+  normalized percussive RMS and `h` is the normalized harmonic RMS for that
+  bucket. Both values are finite JSON numbers in `[0, 1]`; silence is
+  represented as `{ "p": 0, "h": 0 }`.
+- The preview decode/HPSS failure is a command failure: it must not return a
+  metadata-only success object that would be indistinguishable from a complete
+  preview payload.
+
+### 15.2 Success schema
+
+Every successful `--get-track-metadata` response includes the pre-existing
+metadata fields (`artist`, `title`, `bpm`, `grid_anchor_ms`, and
+`existing_cues`) plus these required fields:
+
+```json
+{
+  "artist": "Carbon Based Lifeforms",
+  "title": "Central Plains",
+  "bpm": 128.0,
+  "grid_anchor_ms": 356.0,
+  "existing_cues": [],
+  "waveform_peaks": [-15, 23, -28, 35],
+  "color_map": [{"p": 0.81, "h": 0.24}, {"p": 0.36, "h": 0.68}]
+}
+```
+
+| Field | Type | Contract |
+|---|---|---|
+| `waveform_peaks` | `int8[]` serialized as JSON numbers | Interleaved min/max values from 128-sample `reshape(-1, 128)` windows at `sr=11025`; each value is in `[-128, 127]`. |
+| `color_map` | `{ p: number, h: number }[]` | Chronological 500 ms HPSS RMS buckets from `n_fft=512`/`hop_length=512`; `p` is percussive and `h` is harmonic normalized energy. |
+
+The one-shot framing, existing metadata shaping rules, JSON error schema, and
+exit-code semantics otherwise remain unchanged. The response is designed to
+be cached as an indivisible value by `trackPath`; clients must not persist a
+partial payload or recompute its peaks/colors in JavaScript.
+
+---
+
+## 16. Core Resource Build and Deployment
+
+The packaged core is a PyInstaller **`--onedir`** resource bundle, not a
+`--onefile` executable. The distributable directory is named `cuegrid-core/`
+and contains `cuegrid-core.exe` together with every required Python runtime
+library and native dependency. Tauri packages that complete directory beneath
+its application resources as `resources/cuegrid-core/` and launches the
+executable at `resources/cuegrid-core/cuegrid-core.exe` through Rust resource
+resolution.
+
+This layout is a cold-start requirement. `--onefile` self-extracts to a
+temporary location at every launch; `--onedir` avoids that decompression work,
+which is particularly important for Stage 1 metadata/preview requests invoked
+from the player. The Rust bridge owns resource-path resolution and process
+launching; neither Vue nor the operating system `PATH` may be used to locate a
+system Python or a loose core executable. The GUI-side invocation and resource
+copy rules are specified in `3-gui-spec.md` §6.

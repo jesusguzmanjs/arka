@@ -8,17 +8,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "dialog:default",
-    "shell:allow-kill",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        {
-          "name": "binaries/cuegrid-core",
-          "sidecar": true,
-          "args": true
-        }
-      ]
-    }
+    "dialog:default"
   ]
 }

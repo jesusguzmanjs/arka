@@ -24,10 +24,12 @@ logger = logging.getLogger(__name__)
 
 _MAX_HOTCUE_SLOTS = 8  # Traktor supports 8 hotcue pads per deck (spec section 3.2)
 
-# Two cues within this many milliseconds of each other are considered the
-# same timeline position -- a detected event this close to an existing cue
-# (manual or from a previous run) is redundant and must be skipped rather
-# than assigned to a different HOTCUE slot at (essentially) the same time.
+# Mechanical spacing guard. The production path compares beat indices so
+# spacing follows the track BPM rather than a fixed millisecond tolerance.
+MIN_CUE_DISTANCE_BEATS = 8
+
+# Backward-compatible fallback for direct callers that do not provide BPM/grid
+# information. The pipeline always uses MIN_CUE_DISTANCE_BEATS.
 TOLERANCE_MS = 50.0
 
 # Display name for the single, unified structural cue label (spec section
@@ -65,6 +67,8 @@ def map_events_to_cues(
     events: list[DetectedEvent],
     existing_cues: list[CuePoint],
     clear_existing: bool = False,
+    bpm: float | None = None,
+    grid_anchor_ms: float = 0.0,
 ) -> list[CuePoint]:
     """Map every confirmed ``DetectedEvent`` to a ``CuePoint``, in chronological order.
 
@@ -76,9 +80,13 @@ def map_events_to_cues(
             previous run of this tool) already assigned (spec section 3.4).
         clear_existing: If ``True``, ignore existing standard HotCues
             (``TYPE="0"``) when calculating occupied slots, treating those
-            slots as free. Grid/BPM (``TYPE="4"``) and Load (``TYPE="3"``)
+            slots as free. Grid/BPM (``TYPE="4"``) and Load (``TYPE="3``)
             markers are still considered occupied because the writer
             preserves them.
+        bpm: Track BPM used to convert retained cue timestamps to beat
+            positions for the 8-beat spacing guard. If omitted, retain the
+            legacy millisecond fallback for direct callers.
+        grid_anchor_ms: Beat-zero timestamp used with ``bpm``.
 
     Returns:
         The new ``CuePoint``s to append, one per event that could be
@@ -88,14 +96,19 @@ def map_events_to_cues(
     """
     occupied_slots: set[int] = set()
     existing_times: list[float] = []
+    active_cue_beats: list[float] = []
+    beat_length = 60000.0 / bpm if bpm is not None and bpm > 0 else None
     for cue in existing_cues:
         is_being_cleared = clear_existing and cue.type == CueType.CUE
         if not is_being_cleared:
-            # Track the timestamp so new events too close to it are treated
-            # as redundant, regardless of whether this cue is bound to a
-            # HOTCUE slot (spec section 3.4 addendum: no two cues -- of any
-            # kind -- should trigger at effectively the same instant).
+            # Retained cues occupy timeline space even when unbound to a
+            # HOTCUE slot, so new candidates are checked against all active
+            # cue positions.
             existing_times.append(cue.start_ms)
+            if beat_length is not None:
+                active_cue_beats.append(
+                    (cue.start_ms - grid_anchor_ms) / beat_length
+                )
         if cue.hotcue == -1:
             continue
         if is_being_cleared:
@@ -123,14 +136,26 @@ def map_events_to_cues(
     has_warned_full = False
 
     for event in sorted(events, key=lambda e: e.time_ms):
-        if any(abs(event.time_ms - t) <= TOLERANCE_MS for t in existing_times):
+        if beat_length is not None:
+            if any(
+                abs(event.beat_index - active_beat) < MIN_CUE_DISTANCE_BEATS
+                for active_beat in active_cue_beats
+            ):
+                logger.debug(
+                    "Rejected: too close to existing cue (beat=%d, "
+                    "minimum_distance_beats=%d)",
+                    event.beat_index,
+                    MIN_CUE_DISTANCE_BEATS,
+                )
+                continue
+        elif any(abs(event.time_ms - t) <= TOLERANCE_MS for t in existing_times):
             logger.debug(
                 "Skipping event at %.3fms: redundant with an existing cue "
                 "within %.1fms.",
                 event.time_ms,
                 TOLERANCE_MS,
             )
-            continue  # already have a cue at (essentially) this instant
+            continue
 
         cue = map_event_to_cue(event, occupied_slots)
 
@@ -144,5 +169,9 @@ def map_events_to_cues(
         new_cues.append(cue)
         occupied_slots.add(cue.hotcue)
         existing_times.append(cue.start_ms)
+        if beat_length is not None:
+            # Keep existing and newly accepted cues in one active set so the
+            # next candidate is checked against both.
+            active_cue_beats.append(float(event.beat_index))
 
     return new_cues

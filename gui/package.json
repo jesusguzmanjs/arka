@@ -14,7 +14,6 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-shell": "^2.3.5",
     "konva": "^9.3.22",
     "peaks.js": "^4.0.0",
     "vue": "^3.5.13",

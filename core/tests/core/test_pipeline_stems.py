@@ -99,7 +99,7 @@ class TestResolveAnalysisSource:
                 )
 
             mock_extract.assert_called_once_with(fake_sidecar)
-            assert path == fake_wav
+            assert path == "/music/test.flac"
             assert temp == fake_wav
 
     def test_falls_back_when_extraction_fails(self, tmp_path):
@@ -205,5 +205,5 @@ class TestResolveAnalysisSource:
                         entry, "/music/test.flac", nml_path
                     )
 
-            assert path == fake_wav
+            assert path == "/music/test.flac"
             assert temp == fake_wav

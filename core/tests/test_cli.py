@@ -144,6 +144,46 @@ def _fake_result(
     return PipelineResult(entry=entry, detected_events=[], written_cues=[])
 
 
+class TestExportGui:
+    def test_parser_registers_export_gui(self):
+        args = cli.build_parser().parse_args(["track.mp3", "--export-gui"])
+
+        assert args.export_gui is True
+        assert args.json is False
+
+    def test_emits_one_json_document_without_stdout_logs(self, tmp_path, monkeypatch, capsys):
+        captured_kwargs = {}
+
+        def fake_run_pipeline(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _fake_result()
+
+        monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+
+        exit_code = cli.main(
+            ["track.mp3", "--nml", str(nml_path), "--export-gui", "--verbose"]
+        )
+
+        assert exit_code == 0
+        output = capsys.readouterr()
+        payload = json.loads(output.out)
+        assert output.out.count("\n") == 1
+        assert payload == {
+            "track_path": str(Path("track.mp3").resolve()),
+            "bpm": 140.0,
+            "grid_anchor_ms": 0.0,
+            "duration_ms": 10_000.0,
+            "cues": [],
+        }
+        assert captured_kwargs["track_path"] == Path("track.mp3")
+
+    def test_rejects_ndjson_combination(self, capsys):
+        assert cli.main(["track.mp3", "--export-gui", "--json"]) == 1
+        assert "cannot be combined" in capsys.readouterr().err
+
+
 class TestMainArgumentPassthrough:
     def test_passes_title_and_artist_to_pipeline(self, tmp_path, monkeypatch, capsys):
         captured_kwargs = {}

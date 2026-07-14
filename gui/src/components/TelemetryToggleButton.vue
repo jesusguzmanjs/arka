@@ -47,7 +47,7 @@ const isRunning = computed(() => status.value === "running");
 <template>
   <button
     type="button"
-    class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-zinc-700/80 bg-zinc-900/80 text-muted text-xs font-mono backdrop-blur-sm transition-all duration-200 hover:text-primary hover:border-teal-500/60 hover:bg-zinc-800/90"
+    class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-zinc-700/80 bg-zinc-900/80 text-muted text-xs font-mono backdrop-blur-sm transition-all duration-200 hover:text-primary hover:border-secondary/60 hover:bg-zinc-800/90"
     :class="{ 'opacity-60 hover:opacity-100': !hasUnseen && !isRunning }"
     :title="open ? 'Close telemetry console' : 'Open telemetry console'"
     @click="emit('toggle')"
@@ -60,7 +60,7 @@ const isRunning = computed(() => status.value === "running");
     />
     <span
       v-else-if="isRunning"
-      class="inline-block w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse"
+      class="inline-block w-1.5 h-1.5 rounded-full bg-accent animate-pulse"
       aria-hidden="true"
     />
   </button>

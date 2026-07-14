@@ -1,21 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build recipe for the CueGrid Python core sidecar (v1.9).
+"""PyInstaller build recipe for the CueGrid Python core resource (v2.0).
 
-Freezes ``src/cuegrid/cli.py`` into a single-file, standalone Windows
-executable that Tauri packages as an ``externalBin`` sidecar under the
-``cuegrid-core`` identifier. See ``../.openspec/3-gui-spec.md`` §6.2 and
-``../README.md`` ("Packaging the sidecar") for the full pipeline this
-build step feeds into.
+Freezes ``src/cuegrid/cli.py`` into an uncompressed directory structure (--onedir)
+that Tauri packages inside its ``resources`` bundle under the ``resources/cuegrid-core``
+path. This eliminates runtime extraction latency (0ms cold start).
+See ``../.openspec/3-gui-spec.md`` and ``../README.md`` for the full pipeline.
 
 Build with:
 
     cd core
     pyinstaller --clean cuegrid.spec
 
-Output: ``dist/cuegrid-core.exe``. The orchestration scripts at the repo
-root (``build-win.ps1`` / ``sync.ps1``) move and rename this artifact into
-``gui/src-tauri/binaries/cuegrid-core-<target-triple>.exe``, per Tauri's
-sidecar naming contract (Rust target-triple suffix required).
+Output: ``dist/cuegrid-core/`` folder containing ``cuegrid-core.exe`` and its DLLs.
+The orchestration scripts at the repo root (``sync.ps1``) move this entire folder
+into ``gui/src-tauri/resources/cuegrid-core``.
 """
 
 from PyInstaller.utils.hooks import collect_submodules
@@ -45,6 +43,9 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=None,
     noarchive=False,
     optimize=0,
 )
@@ -53,20 +54,30 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    [],  # <--- Limpiamos las binarios de aquí adentro
+    exclude_binaries=True,  # <--- CRUCIAL: Indica a PyInstaller que los binarios van fuera, en la carpeta
     name='cuegrid-core',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+# EL BLOQUE MAESTRO: COLLECT es el que junta el EXE con todas sus dependencias (.dll, etc.)
+# y crea la carpeta estructurada 'cuegrid-core' dentro de dist/
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='cuegrid-core',  # Esto define el nombre de la carpeta de salida
 )

@@ -64,9 +64,13 @@ class AppConfig:
     # NML-sibling-fallback order; spec section 9.6).
     stems_dir: str | None = None
 
-    # v2.2/v1.5: Stems-active Multi-Source Validation defaults to "smart".
-    # --no-stems forces analysis of the original Master file and bypasses
-    # native Stem lookup entirely; Option C still protects Stems-active runs
-    # from empty/ambient drum stems (section 10).
+    # v2.7 Parallel Signal Fusion: combine aligned Master and Drum energy
+    # envelopes before peak selection. If no usable drum stem is provided,
+    # the detector overrides these with Master-only weights (1.0 / 0.0).
+    master_weight: float = 0.6
+    drum_weight: float = 0.4
+
+    # Deprecated compatibility field. Smart Mode is now the fused path;
+    # this value no longer selects a post-detection validation algorithm.
     verify: str = "smart"
     no_stems: bool = False

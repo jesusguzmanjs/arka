@@ -28,11 +28,11 @@ const locked = computed(() => props.disabled || status.value === "running");
 </script>
 
 <template>
-  <section class="bg-panel border-b border-border px-6 py-4">
-    <div class="flex flex-col gap-3">
-      <div class="flex flex-wrap items-stretch gap-y-4 pt-1">
+  <section class="flex flex-1 min-h-0 items-center justify-center overflow-y-auto scrollbar-amber bg-panel border-b border-border px-4 py-6">
+    <div class="mx-auto flex w-full max-w-2xl flex-col gap-5">
+      <div class="flex flex-wrap items-center justify-center gap-x-2 gap-y-4">
         <!-- Section 1: boolean controls share one vertical rhythm and switch primitive. -->
-        <div class="flex flex-col justify-center gap-2 border-r border-zinc-800 pr-8">
+        <div class="flex flex-col justify-center gap-2 border-r border-zinc-800 pr-6">
           <div class="grid min-h-6 grid-cols-[8rem_2.75rem] items-center gap-3">
             <span class="text-sm text-muted">Include stems</span>
             <IncludeStemsSwitch
@@ -52,7 +52,7 @@ const locked = computed(() => props.disabled || status.value === "running");
         </div>
 
         <!-- Section 2: sensitivity options. -->
-        <div class="flex items-center gap-3 border-r border-zinc-800 px-8">
+        <div class="flex items-center gap-3 border-r border-zinc-800 px-6">
           <span class="w-24 shrink-0 text-sm text-muted">Sensitivity</span>
           <SensitivitySelect
             :model-value="sensitivity"
@@ -62,7 +62,7 @@ const locked = computed(() => props.disabled || status.value === "running");
         </div>
 
         <!-- Section 3: maximum cue count. -->
-        <div class="flex items-center gap-3 pl-8">
+        <div class="flex items-center gap-3 pl-6">
           <span class="w-24 shrink-0 text-sm text-muted">Max Cues</span>
           <MaxCuesSelect
             :model-value="maxCues"
@@ -73,10 +73,7 @@ const locked = computed(() => props.disabled || status.value === "running");
       </div>
 
       <!-- validation hint (revised per 4-library-spec.md §3.4) -->
-      <p
-        v-if="!isValid"
-        class="text-xs text-warn pt-1"
-      >
+      <p v-if="!isValid" class="text-center text-xs text-warn">
         Select a playlist in the Library Browser above to enable the run.
       </p>
     </div>

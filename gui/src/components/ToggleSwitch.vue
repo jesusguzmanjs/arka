@@ -25,8 +25,8 @@ function toggle() {
     :aria-label="ariaLabel"
     :title="title"
     :disabled="disabled"
-    class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border border-zinc-700 transition-colors focus:outline-none focus:ring-2 focus:ring-teal-400/50 disabled:cursor-not-allowed disabled:opacity-50"
-    :class="modelValue ? 'bg-teal-500/80' : 'bg-zinc-800'"
+    class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border border-zinc-700 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+    :class="modelValue ? 'bg-primary/80' : 'bg-zinc-800'"
     @click="toggle"
   >
     <span

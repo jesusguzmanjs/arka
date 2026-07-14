@@ -16,6 +16,7 @@ tree exposed by ``nml.parser.NmlParser``.
 from __future__ import annotations
 
 import shutil
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -147,6 +148,51 @@ class NmlWriter:
             entry_el.append(cue_el)
             raise
 
+    def update_track_hotcues(
+        self,
+        track_path: str | Path,
+        cues_list: list[dict],
+        title: str | None = None,
+        artist: str | None = None,
+    ) -> None:
+        """Update existing standard HotCues in-place or create missing ones.
+
+        Designed for frontend UI sync (drag & drop adjustments). Modifies the
+        START attribute of existing CUE_V2 elements to preserve user-defined
+        names, rather than destroying and recreating the nodes.
+        """
+        entry_el = self._parser.find_entry_element(track_path, title, artist)
+
+        for cue_data in cues_list:
+            hotcue_str = str(cue_data["hotcue"])
+
+            # Buscar el nodo exacto que coincide con el ID del pad
+            cue_el = next(
+                (el for el in entry_el.findall("CUE_V2")
+                    if el.get("TYPE") == "0" and el.get("HOTCUE") == hotcue_str),
+                None
+            )
+
+            seconds = float(cue_data["start_ms"])
+            formatted_time = f"{seconds:.6f}"
+
+            if cue_el is not None:
+                # El Cue existe: Solo actualizamos su tiempo, respetando su nombre/color original
+                cue_el.set("START", formatted_time)
+            else:
+                # El Cue no existe: Lo creamos desde cero con los valores por defecto
+                cue_el = ET.SubElement(entry_el, "CUE_V2")
+                cue_el.set("NAME", f"Cue {int(hotcue_str) + 1}")
+                cue_el.set("DISPL_ORDER", "0")
+                cue_el.set("TYPE", "0")
+                cue_el.set("START", formatted_time)
+                cue_el.set("LEN", "0.000000")
+                cue_el.set("REPEATS", "-1")
+                cue_el.set("HOTCUE", hotcue_str)
+
+        self._backup_if_needed()
+        self._write_atomic()
+
     def write_cues_to_element(
         self, entry_el: ET.Element, cues: list[CuePoint], clear_existing: bool = False
     ) -> None:
@@ -224,7 +270,7 @@ class NmlWriter:
             shutil.copy2(self._parser.nml_path, backup_path)
 
     def _write_atomic(self) -> None:
-        """Serialize the tree to a temp file, then atomically replace the original."""
+        start_time = time.time()
         nml_path = self._parser.nml_path
         tmp_path = Path(str(nml_path) + ".tmp")
 
@@ -233,3 +279,5 @@ class NmlWriter:
             self._parser.tree.write(f, encoding="UTF-8", xml_declaration=False)
 
         tmp_path.replace(nml_path)
+        import sys
+        print(f"I/O Time: {time.time() - start_time:.4f} seconds", file=sys.stderr)

@@ -16,10 +16,13 @@ import logging
 import platform
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, TYPE_CHECKING
+if TYPE_CHECKING:
+    from cuegrid.core.pipeline import BatchTrackResult
 
 from cuegrid.config import DETECTION_MODES, AppConfig
-from cuegrid.core.pipeline import BatchTrackResult, run_batch_pipeline, run_pipeline
+from cuegrid.audio.loader import generate_preview_payload
+
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
     AmbiguousTrackError,
@@ -30,6 +33,13 @@ from cuegrid.nml.parser import (
 from cuegrid.nml.writer import HotcueNotFoundError, NmlWriter
 
 logger = logging.getLogger(__name__)
+
+# Kept as module attributes so callers/tests can replace the pipeline entry
+# points without importing the full analysis stack for metadata/preview-only
+# commands. Normal execution resolves them lazily below.
+run_pipeline: Any = None
+run_batch_pipeline: Any = None
+serialize_gui_payload: Any = None
 
 # Matches Native Instruments' own documented default install layout on
 # both Windows and macOS: "Documents > Native Instruments > Traktor x.x.x"
@@ -196,6 +206,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--export-gui",
+        action="store_true",
+        default=False,
+        dest="export_gui",
+        help=(
+            "Run normal analysis and emit exactly one GUI JSON document on "
+            "stdout. Standard logs are redirected to stderr."
+        ),
+    )
+    parser.add_argument(
         "--delete-cue",
         type=int,
         default=None,
@@ -212,11 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="get_track_metadata",
         metavar="TRACK_PATH",
         help=(
-            "Skip audio analysis and Librosa entirely: parse the NML, "
-            "locate the entry matching TRACK_PATH, and print a single JSON "
-            "object with its artist/title/bpm/grid anchor and existing "
-            "HotCues, then exit. Intended for the GUI's waveform player to "
-            "sync markers before any analysis runs."
+            "Parse the NML and generate the complete low-rate waveform/HPSS "
+            "preview Super JSON for TRACK_PATH."
         ),
     )
     parser.add_argument(
@@ -265,6 +282,20 @@ def build_parser() -> argparse.ArgumentParser:
             "lookup, FLAGS bitmask evaluation, and .stem.mp4 extraction "
             "completely."
         ),
+    )
+
+    parser.add_argument(
+            "--discover-nml",
+            action="store_true",
+            help="Standalone query: discover the default collection.nml, print its path as JSON, and exit.",
+    )
+
+    parser.add_argument(
+            "--update-cues",
+            type=str,
+            default=None,
+            metavar="JSON_STRING",
+            help="JSON string arrays of options [{'hotcue': x, 'start_ms': y}] to overwrite on TRACK_PATH",
     )
 
     # Validation: --title is only valid with track_path (single-track mode)
@@ -566,6 +597,44 @@ def _json_batch_track_callback(track_result: BatchTrackResult) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Configure this mode before any path discovery so a pre-existing logging
+    # configuration cannot leak INFO/DEBUG text onto the GUI stdout stream.
+    if args.export_gui:
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(levelname)s: %(message)s",
+            stream=sys.stderr,
+            force=True,
+        )
+
+
+    # --update-cues: operación de actualización manual desde el grid
+    if args.update_cues is not None:
+        if args.track_path is None:
+            print("error: --update-cues requires TRACK_PATH.", file=sys.stderr)
+            return 1
+            
+        nml_path = _resolve_nml_path(args.nml)
+        if nml_path is None:
+            print("error: no collection.nml found.", file=sys.stderr)
+            return 1
+            
+        try:
+            cues_list = json.loads(args.update_cues)
+            
+            # Aquí invocas la lógica de tu NmlWriter (debes implementar 'update_track_hotcues' en tu escritor)
+            NmlWriter(NmlParser(nml_path)).update_track_hotcues(
+                args.track_path,
+                cues_list,
+                title=args.title,
+                artist=args.artist
+            )
+            print(f"Successfully updated manual cues for {args.track_path}")
+            return 0
+        except Exception as exc:
+            print(f"error: failed to update hotcues: {exc}", file=sys.stderr)
+            return 1
+
     # --list-playlists (spec section 12.3): a standalone, lightning-fast
     # metadata query for a future GUI dropdown. Intercepted before
     # logging.basicConfig, --title validation, or any audio/pipeline
@@ -630,11 +699,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # --discover-nml: a standalone query to feed the GUI's initial state
+    if args.discover_nml:
+        discovered = discover_default_nml_path()
+        if discovered:
+            print(json.dumps({"path": str(discovered)}))
+            return 0
+        else:
+            print(json.dumps({"error": "No default Traktor collection found"}))
+            return 1
+
     # --get-track-metadata (spec .openspec/3-player-spec.md section 1.2): a
-    # standalone, one-shot metadata query for the GUI's waveform player to
-    # sync markers before any analysis runs. Intercepted before
-    # logging.basicConfig, --title validation, or any audio/pipeline code
-    # runs -- no logs, no librosa, no tracking logic. Errors are reported
+    # standalone, one-shot preview query for the GUI's waveform player.
+    # Intercepted before logging.basicConfig and the normal pipeline. Errors are reported
     # as JSON on stdout (not stderr), matching this flag's own error
     # schema (section 1.4).
     if args.get_track_metadata is not None:
@@ -666,7 +743,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             sys.exit(1)
-        print(json.dumps(metadata))
+        try:
+            waveform_peaks, color_map = generate_preview_payload(args.get_track_metadata)
+        except Exception as exc:
+            print(json.dumps({"error": "preview_failed", "message": str(exc)}))
+            sys.exit(1)
+
+        metadata["waveform_peaks"] = waveform_peaks
+        metadata["color_map"] = color_map
+        print(json.dumps(metadata, separators=(",", ":")))
         sys.exit(0)
 
     # --get-playlist-tracks (spec .openspec/4-library-spec.md section 1.2): a
@@ -716,11 +801,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(tracks))
         sys.exit(0)
 
+    if args.export_gui and args.json:
+        print("error: --export-gui cannot be combined with --json", file=sys.stderr)
+        return 1
+
     use_json = args.json
 
     logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
+        level=logging.INFO if args.verbose and not args.export_gui else logging.WARNING,
         format="%(levelname)s: %(message)s",
+        stream=sys.stderr,
+        force=args.export_gui,
     )
 
     # Validation: exactly one of track_path/--track-title/--playlist is
@@ -739,6 +830,14 @@ def main(argv: list[str] | None = None) -> int:
             _json_log("error", message)
         else:
             print(f"error: {message}", file=sys.stderr)
+        return 1
+
+    if args.export_gui and args.track_path is None:
+        print(
+            "error: --export-gui requires TRACK_PATH and cannot be used with "
+            "--track-title or --playlist",
+            file=sys.stderr,
+        )
         return 1
 
     # Validation: --title is only allowed in single-track mode
@@ -772,6 +871,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Route to single-track or batch pipeline based on selection mode
     if args.track_path is not None:
+        global run_pipeline, serialize_gui_payload
+        if run_pipeline is None:
+            from cuegrid.core.pipeline import run_pipeline as pipeline_run
+            run_pipeline = pipeline_run
+        if serialize_gui_payload is None:
+            from cuegrid.core.pipeline import serialize_gui_payload as pipeline_serialize
+            serialize_gui_payload = pipeline_serialize
         # Single-track mode (v1.0)
         try:
             result = run_pipeline(
@@ -804,6 +910,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"error: {exc}", file=sys.stderr)
             return 1
+
+        if args.export_gui:
+            # This is the only stdout write in export mode: one raw JSON
+            # document for the Tauri in-memory bridge.
+            print(serialize_gui_payload(result, args.track_path), flush=True)
+            return 0
 
         if use_json:
             _emit_track_lifecycle_json(
@@ -839,6 +951,10 @@ def main(argv: list[str] | None = None) -> int:
 
     else:
         # Batch mode (v1.1)
+        global run_batch_pipeline
+        if run_batch_pipeline is None:
+            from cuegrid.core.pipeline import run_batch_pipeline as pipeline_run_batch
+            run_batch_pipeline = pipeline_run_batch
         try:
             batch_result = run_batch_pipeline(
                 nml_path=nml_path,

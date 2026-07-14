@@ -37,6 +37,14 @@ import soundfile as sf
 
 logger = logging.getLogger(__name__)
 
+if not hasattr(ffmpeg, "Error"):
+    class _FfmpegCompatibilityError(Exception):
+        def __init__(self, *args: object) -> None:
+            super().__init__(*args)
+            self.stderr = args[-1] if args and isinstance(args[-1], bytes) else None
+
+    ffmpeg.Error = _FfmpegCompatibilityError  # type: ignore[attr-defined]
+
 # NI's native stem format multiplexes 5 audio streams into one .stem.mp4:
 # stream 0 is the original full mix, and streams 1-4 are the four isolated
 # stems (Drums, Bass, Vocals, Melody/Other, per NI's own stem template).
@@ -45,6 +53,108 @@ logger = logging.getLogger(__name__)
 # detector instead of the full mix.
 DRUMS_STEM_STREAM_INDEX = 1
 
+PREVIEW_SAMPLE_RATE = 11025
+PREVIEW_PEAK_WINDOW = 128
+PREVIEW_HOP_LENGTH = 512
+PREVIEW_BUCKET_MS = 500
+
+
+def generate_preview_payload(path: str | Path) -> tuple[list[int], list[dict[str, float]]]:
+    """Generate the renderer-ready Stage 1 waveform and HPSS color map.
+
+    This intentionally uses one complete low-rate decode. The normal analysis
+    path continues to use :func:`load_window` and is not affected.
+    """
+    import warnings
+    import numpy as np
+    import librosa
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="soundfile")
+        y, _ = librosa.load(str(path), sr=PREVIEW_SAMPLE_RATE, mono=True)
+
+    if y.size == 0:
+        return [], []
+
+    # --- 1. Waveform Peaks (Optimized Vectorized Extraction) ---
+    full_length = (y.size // PREVIEW_PEAK_WINDOW) * PREVIEW_PEAK_WINDOW
+    peak_chunks = y[:full_length].reshape(-1, PREVIEW_PEAK_WINDOW)
+
+    if peak_chunks.size:
+        wave_min = peak_chunks.min(axis=1)
+        wave_max = peak_chunks.max(axis=1)
+
+        # Interleave [min, max, min, max...] efficiently
+        peaks = np.empty(wave_min.size + wave_max.size, dtype=np.float32)
+        peaks[0::2] = wave_min
+        peaks[1::2] = wave_max
+
+        # ---------------------------------------------------------
+        # EL FILTRO TRAKTOR: Expansión de rango dinámico visual
+        # Elevamos a una potencia (1.5 o 2.0) para afilar los picos.
+        # Usamos np.sign y np.abs para mantener la polaridad negativa intacta.
+        # ---------------------------------------------------------
+        exaggeration_factor = 1.8  # Juega con este número (1.0 es lineal, 2.0 es muy exagerado)
+        peaks = np.sign(peaks) * (np.abs(peaks) ** exaggeration_factor)
+
+        # Peaks.js audiowaveform format REQUIRES 8-bit integers [-128, 127]
+        # It DOES NOT support 16-bit or floats.
+        peaks_int8 = (peaks * 127).astype(np.int8)
+        waveform_peaks = peaks_int8.tolist()
+    else:
+        waveform_peaks = []
+
+    # --- 2. 3-Band EQ Color Map (Frecuencias Puras - Ultrarrápido) ---
+    S = np.abs(librosa.stft(y, n_fft=512, hop_length=PREVIEW_HOP_LENGTH))
+    
+    # Obtenemos a cuántos Hz equivale cada fila del espectrograma
+    freqs = librosa.fft_frequencies(sr=PREVIEW_SAMPLE_RATE, n_fft=512)
+    
+    # Buscamos los índices de corte (Ajustables a tu gusto)
+    # Graves (Kick/Sub): de 0 a 250 Hz
+    # Medios (Voces/Sintes): de 250 a 2500 Hz
+    # Agudos (Platillos/Aire): más de 2500 Hz
+    idx_low = np.where(freqs < 250)[0][-1]
+    idx_mid = np.where(freqs < 2500)[0][-1]
+    
+    # Sumamos la energía de cada banda por columna (tiempo)
+    low_energy = S[:idx_low, :].sum(axis=0)
+    mid_energy = S[idx_low:idx_mid, :].sum(axis=0)
+    high_energy = S[idx_mid:, :].sum(axis=0)
+
+    # Agrupamos en los buckets de tiempo
+    frames_per_bucket = max(
+        1, round(PREVIEW_BUCKET_MS / 1000 * PREVIEW_SAMPLE_RATE / PREVIEW_HOP_LENGTH)
+    )
+
+    trim_frames = len(low_energy) - (len(low_energy) % frames_per_bucket)
+
+    if trim_frames > 0:
+        # Hacemos la media de cada bucket
+        l_buckets = low_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+        m_buckets = mid_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+        h_buckets = high_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+
+        # Normalizamos usando el valor más alto absoluto de cualquier banda
+        max_val = max(l_buckets.max(), m_buckets.max(), h_buckets.max())
+        if max_val > 0:
+            l_buckets = l_buckets / max_val
+            m_buckets = m_buckets / max_val
+            h_buckets = h_buckets / max_val
+
+        # Devolvemos l (low), m (mid) y h (high)
+        color_map = [
+            {
+                "l": round(float(l), 4),
+                "m": round(float(m), 4),
+                "h": round(float(h), 4)
+            }
+            for l, m, h in zip(l_buckets, m_buckets, h_buckets)
+        ]
+    else:
+        color_map = []
+
+    return waveform_peaks, color_map
 
 def load_window(
     path: str | Path,

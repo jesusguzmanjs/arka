@@ -1,5 +1,9 @@
 # Spec: Integrated Waveform Player & Grid Visualizer (Phase 3)
 
+**Current status override (2026-07-13):** implemented in the checked-out
+`AudioPlayer.vue`; the historical proposal status immediately below is no
+longer authoritative.
+
 Status: Proposed v1.5 — architecture only, not yet implemented
 (v1.5 adds the mandatory post-operation synchronization loop and
 `resetPlayerState()` sanitization contract for every asynchronous NML
@@ -12,13 +16,200 @@ pad/keyboard triggers, §3.11's global keyboard shortcut mapping, and
 §4.3's session-scoped stage persistence, §5.4's marker-label
 collision mitigation, and §5.1's two fixed stage colors — BLUE for
 Stage 1 and GREEN for Stage 2 — are all preserved unchanged)
-Source of truth: `1-proposal.md` (Phase 2 GUI), `2-core-spec.md` (core
+Source of truth: `1-proposal.md` (GUI), `2-core-spec.md` (core
 pipeline/CLI contract), `3-gui-spec.md` (existing Tauri + Vue 3
 component architecture and sidecar plumbing, whose v1.2 revision
 cross-references the unified pad/keyboard transport contract defined
 here in §3.9–§3.12)
 
-This document is the binding technical specification for Phase 3: a
+> **Phase 1 architecture amendment:** The requirements in the following
+> section are binding for the first GUI Audio Player implementation and
+> supersede any conflicting legacy Wavesurfer/Regions-plugin wording in this
+> document. The player library is definitively **Peaks.js**.
+
+## Current implementation synchronization (2026-07-13)
+
+The checked-out `AudioPlayer.vue` implementation supersedes legacy wording in
+this document that refers to Wavesurfer, Regions, blue/green stage colors,
+remaining-time indicators, or a shared player store as the player's actual
+rendering state.
+
+- Peaks.js owns one `zoomview` and one `overview` view. `AudioPlayer.vue`
+  stores the live instance in a `shallowRef`, maintains local `TrackData` and
+  `cueState`, and destroys the Peaks instance, audio element, resize observer,
+  and Web Audio context during teardown.
+- Track selection calls `--get-track-metadata` through the native
+  `call_cuegrid_core` resource bridge. The response supplies BPM, grid anchor,
+  optional duration, existing cues, int8 waveform peaks, and HPSS color data.
+  After a successful analysis run, the player reconciles cue-written log
+  entries for the current track; manual drag changes remain local until **Save
+  Changes** calls `--update-cues`.
+- The CSS-mask color layer is synchronized by `syncZoomGradientLoop()` while
+  Peaks.js supplies the white waveform silhouette. The same loop performs
+  fractal grid LOD; Konva marker destruction removes retained line references
+  to keep viewport culling stable.
+- The visual palette is semantic Amber/Ochre: primary/secondary/accent roles
+  are used for enabled pads, markers, borders, and hover states; warning is
+  used for dirty/save feedback. The marker implementation also uses explicit
+  amber/ochre hex values for Peaks/Konva drawing.
+- The eight virtual pads are derived by `padSlots`, a computed array of
+  exactly eight positions. Array index `N - 1` is always NML `HOTCUE` id
+  `N - 1`; an empty NML slot remains an explicit disabled pad and never causes
+  later cues to shift left.
+- `activePad` is reactive hardware-feedback state. Pressing a valid pad sets
+  it, the active class uses a bright accent, scale/inner-shadow treatment,
+  and release clears it. `endCuePreview` returns early unless the releasing
+  pad is the currently active pad, preventing mouse-leave panic behavior.
+- Global keyboard handlers bail out through `isFocusedOnInput()` before
+  handling Space, Enter, or digit keys `1`-`8`; digit keydown also ignores
+  `event.repeat`. This prevents search and text fields from triggering player
+  shortcuts.
+- The cue deletion menu is a separate `CueContextMenu.vue` component with
+  `x`, `y`, and `visible` props and `close`/`delete` emits. Pad mouse events
+  use `.left` and `.prevent` modifiers, while the context-menu event uses
+  `@contextmenu.prevent`, keeping playback and menu event paths separate.
+  The current handler removes the selected cue from local `cueState`, marks
+  the player dirty, and closes the menu; the sidecar composable also exposes
+  the authoritative `--delete-cue` operation for physical NML deletion.
+
+### Modular player architecture contract (2026-07-14, authoritative)
+
+The player is no longer permitted to be a monolithic implementation. The
+following module boundaries are mandatory and supersede conflicting legacy
+file-layout and self-contained-component wording in §3.2 and §3.3.
+`components/AudioPlayer.vue` remains the orchestrator: it owns track loading,
+Peaks initialization/destruction, player-event wiring, drag persistence,
+sidecar calls, dirty state, and the module-scoped `usePlayerState()` loading
+lock in §3.7. It must not reintroduce marker rendering, RAF math, global
+keyboard listener lifecycle, or presentational section markup.
+
+```
+gui/src/
+  components/
+    AudioPlayer.vue          # orchestration and persistence boundary
+    PlayerHeader.vue         # metadata/countdown/cue counters
+    PlayerTransport.vue      # transport controls and eight cue pads
+    PlayerWaveform.vue       # Peaks DOM shell, mask, resize ownership
+  composables/
+    useGridMath.ts           # pure, framework-free beat-grid math
+    usePeaksMarkers.ts       # Konva/Peaks marker construction and tracking
+    useWaveformSync.ts       # spectral CSS mask plus the one RAF loop
+    usePlayerKeyboard.ts     # input-safe global keyboard lifecycle
+```
+
+#### Pure composable APIs
+
+`useGridMath.ts` has **no Vue, DOM, Peaks, or Konva imports**. It exports the
+following deterministic functions and types; `buildGrid()` produces ascending
+time order and keeps negative offsets so §0.2 bar math is correct on both
+sides of the anchor.
+
+```ts
+interface GridTrackData { bpm: number; grid_anchor_ms: number; duration_ms: number; }
+interface GridPoint { timeMs: number; isBar: boolean; offset: number; }
+function beatMs(bpm: number): number;
+function snapToGrid(positionMs: number, bpm: number, anchorMs: number): number;
+function buildGrid(data: GridTrackData): GridPoint[];
+```
+
+`usePeaksMarkers.ts` exclusively owns custom Konva point-marker painting. Its
+`gridLines` array is private, is reset before `points.removeAll()`, and each
+zoomview grid marker removes its reference in `destroy()`.
+
+```ts
+interface PlayerCue { id: number; position_ms: number; is_valid: boolean; }
+interface GridLineReference { line: Konva.Line; offset: number; }
+function usePeaksMarkers(): {
+  markerHeight(options: unknown, group: Konva.Group): number;
+  createPointMarker(options: unknown): unknown;
+  paintAllMarkers(instance: Peaks.Instance, track: GridTrackData, cues: readonly PlayerCue[]): void;
+  getGridLines(): readonly GridLineReference[];
+};
+```
+
+`useWaveformSync.ts` owns the §0.7 clipping-mask width/left arithmetic,
+three-band low/mid/high HEX interpolation, and the sole 60 FPS
+`syncZoomGradientLoop`. It exposes `trackCssGradient`, `startSyncLoop()`, and
+`stopSyncLoop()`. The loop must preserve §0.8's three-decimal opacity rounding
+and hard-disable invisible Konva nodes with `line.visible(opacity > 0)`. A
+second RAF loop is prohibited. The gradient consumes only precomputed
+`color_map`; browser frequency analysis remains prohibited by §0.6.
+
+`usePlayerKeyboard.ts` exports `isFocusedOnInput()` and accepts transport
+callbacks (`togglePlay`, `stop`, `hasPad`, `previewStart`, `previewEnd`). It
+binds `window` `keydown`/`keyup` in `onMounted` and unbinds the same functions
+in `onBeforeUnmount`, retaining the input-safe behavior in §3.11.
+
+#### Presentational component contracts
+
+All child components use typed props-down/events-up communication. They may
+not import the player singleton, sidecar, Peaks initialization, or persistence
+composables.
+
+```ts
+// PlayerHeader.vue
+interface PlayerHeaderProps {
+  hasTrack: boolean; trackHeaderLabel: string; bpmLabel: string;
+  remainingLabel: string; cueCount: number; validCueCount: number;
+}
+
+// PlayerTransport.vue
+interface PlayerTransportProps {
+  hasTrack: boolean; isPlaying: boolean;
+  padSlots: readonly (PlayerCue | null)[]; activePad: number | null;
+}
+type PlayerTransportEmits = {
+  play: []; stop: []; jump: [padIndex: number];
+  previewStart: [padIndex: number]; previewEnd: [padIndex: number];
+  // Required only to preserve the local delete UI in §3.13.
+  contextMenu: [event: MouseEvent, cue: PlayerCue];
+};
+
+// PlayerWaveform.vue
+interface PlayerWaveformProps {
+  hasTrack: boolean; isLoading: boolean; isSaving: boolean;
+  trackCssGradient: string;
+}
+type PlayerWaveformEmits = {
+  resize: []; wheel: [event: WheelEvent]; zoomIn: []; zoomOut: [];
+};
+```
+
+`PlayerHeader.vue` renders only the already-derived metadata, BPM, remaining
+time, and counters from §3.6. `PlayerTransport.vue` emits `play`, `stop`,
+`jump`, `preview-start`, and `preview-end` to the orchestrator and owns no
+playback state. Its narrowly scoped `context-menu` emit is the sole exception
+needed for the existing §3.13 local cue-delete command. `PlayerWaveform.vue`
+contains the raw overview/zoomview divs and absolute clipping-mask/gradient
+shell. It owns its `ResizeObserver` and window `resize` binding, debounces the
+`resize` emit by 100 ms, and exposes only the four element handles needed to
+initialize Peaks and the §0.7 synchronizer; it must not create Peaks itself.
+
+The shared `usePlayerState().isLoadingTrack` concurrency lock remains the
+single source of truth required by §3.7. Refactoring may not replace it with a
+component-local loading ref; `AudioPlayer.vue` sets it before teardown and
+clears it at the same terminal boundary as before.
+
+### Peaks.js wheel navigation contract
+
+The zoomview binds `@wheel.prevent="handleZoomWheel"` and has
+`overflow: hidden`; native scrolling is completely blocked in every wheel
+case. `ZOOM_LEVELS` must include the restored `128` level.
+
+`handleZoomWheel` controls the complete zoom/pan interaction. It calculates a
+new zoom level and calls `setZoom`, then calculates the corresponding
+`setStartTime` around the pointer position. Horizontal panning converts wheel
+movement to time using the current visible duration and container width.
+Every resulting start time is bounded with
+`Math.max(0, Math.min(nextStartTime, duration_ms - visibleDuration))`; visible
+duration/zoom values are likewise bounded with `Math.min`/`Math.max` between
+the smallest supported window and `duration_ms`. These bounds are mandatory:
+wheel input must never scroll the player before time zero or after the end of
+the track. `Shift + wheel` pans, `Ctrl + wheel`/`Meta + wheel` zooms around the
+pointer, and unmodified wheel input remains consumed without native page
+scrolling.
+
+This document is the binding technical specification for the GUI Audio Player:
 waveform player and beatgrid visualizer embedded in the existing CueGrid
 GUI, giving the user a visual preview of a track's existing HotCues
 *before* running analysis, a live repaint of the newly injected HotCues
@@ -37,12 +228,164 @@ field, `CueGridConfig` field, or NML read/write behavior changes.
 
 ---
 
+## Phase 1 GUI Audio Player Architecture
+
+### 0.1 Rendering library and dual-view layout
+
+- **Peaks.js** is the mandated audio waveform rendering library. New player
+  work must not introduce Wavesurfer.js or another waveform library.
+- `AudioPlayer.vue` owns one Peaks.js instance with both required views:
+  - `zoomview` for precise waveform inspection, cue editing, and snapping.
+  - `overview` as the minimap/navigation view for whole-track movement.
+- The two views represent the same loaded track and share the same marker
+  state; navigation in the overview must not create a second independent
+  source of truth.
+- **Lifecycle invariant:** `peaks.destroy()` must always be called when
+  `AudioPlayer.vue` unmounts. The call is mandatory even when the component
+  is being removed during a track change or analysis transition, and exists
+  to release Peaks.js event handlers, views, and audio resources.
+
+### 0.2 Grid representation
+
+- The beatgrid is rendered as custom, non-draggable markers with
+  `editable: false`.
+- Every mathematical beat is represented by a subtle vertical **Beat** line.
+- Every fourth beat (for example beat indices 0, 4, 8, …) is represented by
+  a thicker, more prominent vertical **Bar** line.
+- Grid markers are visual projections of the track BPM and grid anchor; they
+  are not Hotcue objects and must not be persisted as Hotcues.
+
+### 0.3 Hotcue representation and editability
+
+- Each Hotcue is rendered as a custom HTML marker consisting of a vertical
+  line and a numbered label box anchored strictly to the **bottom** of the
+  waveform. The bottom anchor keeps labels and marker chrome out of the
+  waveform's main visual area.
+- A valid, on-grid cue uses the GUI brand color (for example teal) and is
+  draggable with `editable: true`.
+- An off-grid/out-of-phase cue is rendered in gray and is strictly locked
+  with `editable: false`; it must not be made draggable by a UI affordance.
+- Marker editability is determined from the cue's grid validity, not from
+  whether the cue happens to have a Hotcue pad number.
+
+### 0.4 Snap-to-grid drag logic
+
+- A valid cue may not be dropped at an arbitrary millisecond position.
+- On every valid-cue drag completion, the GUI computes the nearest one-beat
+  position using the track BPM and grid anchor:
+
+  `beat_ms = 60_000 / bpm`
+
+  `snapped_ms = grid_anchor_ms + round((dropped_ms - grid_anchor_ms) / beat_ms) * beat_ms`
+
+- The marker and reactive cue state must use `snapped_ms`, subject to track
+  duration bounds. The drop position must never be treated as the final cue
+  position before this quantization step.
+- Off-grid cues are locked and therefore have no drag or snap path.
+
+### 0.5 Dirty state and persistence boundary
+
+- Repositioning a Hotcue updates GUI state only. It must **not** trigger a
+  live disk write to Traktor's `collection.nml` through the Rust backend.
+- The player state must expose a boolean `hasUnsavedChanges`. It becomes
+  `true` after a successful local cue reposition and remains true until an
+  explicit save succeeds or the user discards/reloads the edits.
+- While `hasUnsavedChanges` is true, the GUI must show a prominent
+  **Save Changes** button. Save is an explicit user action and is the only
+  path in this phase that may request persistence through the Rust/Tauri
+  boundary.
+- A failed save must preserve the dirty state and the locally edited cue
+  positions so the user can retry; a successful save clears the flag only
+  after the backend confirms completion.
+
+### 0.6 Cross-boundary spectrum rendering (“God Mode”)
+
+- The Vue/Tauri frontend **must not** compute real-time FFTs or perform
+  heavy frequency analysis in JavaScript to colorize the waveform.
+- The Python core, using `librosa`, owns preprocessing and frequency-band
+  detection (for example low/bass versus high/treble). It exports a
+  lightweight frequency visualization map/data payload for the GUI.
+- Peaks.js is a deliberately **dumb silhouette renderer** for this data: it
+  receives pre-calculated peaks but paints only white on Zinc-950. The CSS-mask
+  layer in section 0.7 consumes the color map and paints waveform color. No
+  browser code may recompute frequency features during zoom, pan, playback,
+  or marker interaction.
+- The payload contract and ownership boundary are defined in
+  `2-core-spec.md` §2.3.1. This preserves browser memory and keeps zoom
+  performance predictable.
+
+### 0.7 CSS-mask waveform color renderer (authoritative)
+
+Native Canvas/Konva gradients and Peaks.js segments are prohibited for
+waveform colorization: they caused unacceptable rendering and performance
+behavior. The player instead uses the following layered CSS-mask composition:
+
+1. A waveform-color container sits **behind** the Peaks canvas and receives
+   `trackCssGradient`, a CSS `linear-gradient` generated reactively from the
+   current `color_map`.
+2. Peaks.js paints the waveform itself in `#ffffff` and its canvas background
+   in Zinc-950 `#09090b`. Its canvas has `mix-blend-mode: darken`.
+3. Under darken blending, the white waveform acts as the mask/reveal for the
+   colored layer, while the near-black canvas background hides that layer.
+   Peaks is therefore responsible only for the silhouette; CSS owns all
+   waveform color.
+4. Grid and cue markers remain in the higher Konva layer. They must not be
+   descendants of, or painted into, the blended Peaks canvas, so their
+   established HEX colors remain completely unaffected.
+
+`trackCssGradient` maps chronological HPSS buckets without static
+classification thresholds or `if`/`else` color bands. It defines one harmony /
+silence endpoint (`HEX_START`) and one percussion endpoint (`HEX_END`) and
+performs pure linear RGB interpolation between them. For bucket `i`, let
+`totalEnergy = p_i + h_i` and `rhythmRatio = p_i / totalEnergy` when the
+denominator is non-zero. The interpolation factor is `rhythmRatio`; the stop
+position is `i / (bucketCount - 1)`. This preserves a continuous musical
+transition rather than inventing a discrete palette.
+
+Noise is excluded before interpolation with a dynamic track-relative floor:
+`noiseFloor = 0.05 * max(totalEnergy across color_map)`. A bucket at or below
+that floor renders the neutral background rather than a spectral color. The
+fallback for zero total energy is also the neutral background. The gradient is
+therefore deterministic for one `color_map`, preserves chronological bucket
+order, and adapts to quiet and loud tracks without fixed absolute thresholds.
+
+The colored layer is synchronized with the visible Peaks zoom window by a
+single `requestAnimationFrame` loop while the player is mounted. On every
+frame (target 60 FPS), it reads the current `startTime`, `endTime`, and
+`duration_ms`, then adjusts the gradient container's `width` and `left` so its
+stops remain aligned with the waveform during zoom and pan. The loop is
+cancelled during teardown; event handlers must not start duplicate loops.
+
+### 0.8 Dynamic grid LOD and marker lifecycle
+
+`syncZoomGradientLoop()` is also the authoritative grid level-of-detail (LOD)
+controller. On each animation frame it derives `visibleBeats` from the current
+zoomview duration and `60 / bpm`, then selects a fractal visibility multiplier
+from `1`, `4`, `16`, `32`, and `64` beats. A grid marker is visible only when
+its beat offset is divisible by the selected multiplier. The choice is updated
+only when the multiplier changes; the Konva layer then performs one batched
+redraw. This keeps close zooms musically precise and broad overview zooms free
+of unusable line density.
+
+Each Konva grid/cue marker is created with its correct initial visibility and
+stores a reference in the player's internal marker arrays only for as long as
+it exists. Its `destroy()` implementation must remove that reference before
+the Konva node is discarded. This explicit garbage collection is required to
+avoid stale nodes, visual Z-fighting, and disagreement with Peaks.js's own
+viewport culling while panning.
+
+Zoomview markers use the documented tuned `strokeWidth` and opacity values for
+legibility. Overview/minimap cues use a solid opaque HEX stroke—never an
+alpha-bearing color—because overview opacity composition is otherwise handled
+inconsistently by the rendering layers. Grid and cue markers remain outside
+the CSS blend layer described in §0.7.
+
 ## 0. Scope
 
 In scope:
-1. A new standalone core CLI flag, `--get-track-metadata`, that returns
-   pre-analysis metadata (tempo, grid anchor, existing cues) as a single
-   JSON object without running any audio analysis (section 1).
+1. A standalone core CLI flag, `--get-track-metadata`, that returns a
+   Stage 1 Super JSON: pre-analysis metadata plus Python-generated waveform
+   peaks and HPSS color-map data (section 1).
 2. The Tauri "asset bridge" data flow required for `wavesurfer.js`,
    running inside the webview, to decode a local audio file selected via
    an absolute filesystem path (section 2).
@@ -69,12 +412,10 @@ In scope:
    boundary clamping and no-op safety (section 3.12).
 
 Out of scope (deferred to a future spec revision):
-- Manual hotcue creation or drag-and-drop repositioning on the waveform
-  canvas. The canvas remains **read-only** for editing; the explicitly
-  permitted Delete Cue context-menu action is specified in §3.13 and is
-  not a canvas-drag or creation interaction. (Momentary cue
-  *auditioning* via pads/keyboard in §3.9–§3.12 is a playback transport
-  action, not a canvas edit.)
+- Manual hotcue creation remains out of scope. Valid existing Hotcues may be
+  repositioned by the constrained drag-and-snap interaction in the Phase 1
+  amendment (§0.3–§0.5); off-grid cues remain locked. The explicitly
+  permitted Delete Cue context-menu action is specified in §3.13.
 - Zooming/scrubbing UX polish, or playback transport beyond the
   explicitly specified pads/keyboard contract in sections 3.9–3.12
   (left fully to implementation time as long as section 3's contract
@@ -83,9 +424,10 @@ Out of scope (deferred to a future spec revision):
   the player only ever displays the single track currently selected in
   `TargetSelector.vue`'s `"track"` mode (see section 4's scoping note).
 - Any change to `core.pipeline`, audio analysis, or the existing
-  `CUE_V2` analysis-write contract (`2-core-spec.md` sections 3–8).
-  Delete Cue is the separately specified single-cue mutation in
-  `2-core-spec.md` section 13.
+  `CUE_V2` analysis-write contract (`2-core-spec.md` sections 3–8), except
+  for the Phase 1 frequency-visualization export defined in
+  `2-core-spec.md` §2.3.1. Delete Cue is the separately specified
+  single-cue mutation in `2-core-spec.md` section 13.
 
 ---
 
@@ -93,10 +435,11 @@ Out of scope (deferred to a future spec revision):
 
 ### 1.1 `--get-track-metadata <TRACK_PATH>` CLI flag
 
-A new standalone, top-level `cli.py` flag, architecturally identical in
-spirit to `--list-playlists` (`2-core-spec.md` section 12): a
-lightweight, read-only metadata query that bypasses the entire audio
-pipeline. Added to `build_parser()` **outside** the mutually-exclusive
+A standalone, top-level `cli.py` flag, architecturally identical in spirit to
+`--list-playlists` (`2-core-spec.md` section 12) in its one-shot JSON framing,
+but not in its work: it is a read-only metadata-and-preview query. It resolves
+the NML entry and then performs the low-rate preview decode/peak/HPSS work
+defined in `2-core-spec.md` section 15. Added to `build_parser()` **outside** the mutually-exclusive
 track-selection group (section 8.4), since it is not itself a
 processing-target selector:
 
@@ -108,11 +451,9 @@ parser.add_argument(
     dest="get_track_metadata",
     metavar="TRACK_PATH",
     help=(
-        "Skip audio analysis and Librosa entirely: parse the NML, "
-        "locate the entry matching TRACK_PATH, and print a single JSON "
-        "object with its artist/title/bpm/grid anchor and existing "
-        "HotCues, then exit. Intended for the GUI's waveform player to "
-        "sync markers before any analysis runs."
+        "Parse the NML, locate TRACK_PATH, generate low-rate preview "
+        "peaks and HPSS colors, and print one Super JSON object for the "
+        "GUI waveform player."
     ),
 )
 ```
@@ -148,8 +489,10 @@ selector group:
    **stdout** (not stderr — see the rationale below), then
    `sys.exit(1)`.
 
-No `AppConfig`, `core.pipeline`, `audio.*`, or `nml.writer` code runs in
-this path, matching `--list-playlists`'s own non-goals (section 12.4).
+No `AppConfig`, `core.pipeline`, cue detector, or `nml.writer` code runs in
+this path. The only audio work is the dedicated Stage 1 preview decode and
+HPSS generation defined in `2-core-spec.md` section 15; it is not part of
+analysis or any NML mutation path.
 
 **Why stdout for the error case, not stderr:** every other consumer of
 this flag (section 4's `useTrackMetadata.ts`) already buffers stdout
@@ -176,11 +519,14 @@ section 12.3, step 4 — not section 11's message-type framing):
   "title": "Central Plains",
   "bpm": 128.0,
   "grid_anchor_ms": 356.0,
+  "duration_ms": 240123.0,
   "existing_cues": [
     {"hotcue": 1, "name": "Intro End", "start_ms": 16106.0, "type": "CUE"},
     {"hotcue": 2, "name": "Drop", "start_ms": 47950.0, "type": "CUE"},
     {"hotcue": 3, "name": "Outro", "start_ms": 210375.0, "type": "CUE"}
-  ]
+  ],
+  "waveform_peaks": [-15, 23, -28, 35],
+  "color_map": [{"p": 0.81, "h": 0.24}, {"p": 0.36, "h": 0.68}]
 }
 ```
 
@@ -190,7 +536,10 @@ section 12.3, step 4 — not section 11's message-type framing):
 | `title` | `TrackEntry.title` | verbatim |
 | `bpm` | `TrackEntry.tempo.bpm` | verbatim, float |
 | `grid_anchor_ms` | `TrackEntry.grid_anchor_ms` | verbatim; the `START` of the `TYPE=4` (`GRID`) cue, section 3 |
+| `duration_ms` | Core preview metadata, when available | Optional finite total duration in milliseconds; Peaks.js decoded duration is the required fallback (§3.6). |
 | `existing_cues` | `TrackEntry.cues` | filtered + shaped, see below |
+| `waveform_peaks` | Python preview decoder | Interleaved signed 8-bit min/max values from 128-sample `reshape(-1, 128)` windows at `sr=11025`; see `2-core-spec.md` section 15. |
+| `color_map` | Python HPSS preview analysis | Chronological 500 ms normalized RMS buckets `{p, h}` from `n_fft=512`; `p` is percussive and `h` is harmonic. |
 
 **`existing_cues` shaping rules:**
 - Excludes any `CuePoint` with `type == CueType.GRID` (`4`). The grid
@@ -237,10 +586,10 @@ consumer can distinguish success from error with a single
 
 - No NDJSON, no progress messages — this is always exactly one line on
   stdout, exactly like `--list-playlists`.
-- No new `AppConfig` field, no change to `find_entry`'s signature or
-  matching behavior (section 7.3) — this flag only adds a new
-  `cli.py`-side rendering of already-existing `TrackEntry`/`CuePoint`
-  data.
+- No new `AppConfig` field and no change to `find_entry`'s signature or
+  matching behavior (section 7.3). The only new audio work is the dedicated
+  Stage 1 preview decode/peak/HPSS contract in `2-core-spec.md` section 15;
+  it does not enter the cue-analysis pipeline.
 - No batch form (no `--get-track-metadata` equivalent for
   `--playlist`/`--track-title`) — Phase 3's player only ever previews
   one track at a time (section 0), so a batch variant has no consumer
@@ -313,9 +662,9 @@ by the `app.security.assetProtocol` config block above, not by the
 
 ### 2.4 Non-goals
 
-- No change to how the sidecar (`Command.sidecar`) is invoked — the
-  asset bridge is unrelated to, and does not replace, the NDJSON
-  stdout pipe described in `3-gui-spec.md` section 6.
+- The asset bridge is unrelated to Core invocation. All Core operations use
+  the Rust resource bridge in `3-gui-spec.md` §6; it does not expose a
+  `Command.sidecar` process to Vue.
 - No thumbnail/waveform pre-rendering on the Rust side. Decoding is
   entirely client-side, inside `wavesurfer.js`, from the bytes streamed
   through the asset protocol.
@@ -394,6 +743,23 @@ marker list) is private to the component's own composable
 the player's internal state in this phase.
 
 ### 3.4 Lifecycle rules
+
+**Stage 1 preview-data lifecycle amendment (authoritative):**
+`usePlayerState.ts` owns a module-scoped, in-memory
+`Map<string, SuperJSON>` named `previewCache`, keyed by the exact
+absolute `trackPath`. It caches only complete successful Super JSON values;
+it has no disk persistence and is cleared when the application process ends.
+The cache is deliberately RAM-only so a previously previewed track reloads in
+about **0.05 seconds** without another sidecar spawn, audio decode, or HPSS
+pass, while a new application session always reflects the current files.
+
+Before a new track is rendered, the lifecycle must obtain a Super JSON using
+the cache-first sequence in section 4.1. `resetPlayerState()` still tears down
+the prior visual instance and invalidates stale callbacks, but it must not
+clear `previewCache`: a track reload is precisely the operation that should
+benefit from the cached preview data. Any successful NML mutation or explicit
+force read that makes cue metadata stale must replace that path's cache entry
+with the freshly returned complete Super JSON.
 
 `AudioPlayer.vue` must implement a `resetPlayerState()` utility as the
 single teardown/sanitization entry point for track reloads and analysis
@@ -480,15 +846,14 @@ text-xs text-muted font-mono` cluster.
 - Format: `-MM:SS`, always prefixed with a literal `-` (e.g. `-02:14`
   for 2 minutes 14 seconds remaining). No hours segment — tracks in
   scope for this tool are well under an hour.
-- Computed as `duration - currentTime`, both sourced from
-  `wavesurfer`'s own playback state (`wavesurfer.getDuration()` and the
-  `"timeupdate"`/`"ready"` events, or the currently-tracked
-  `currentTime` ref if one already exists at implementation time) —
-  **not** derived from any NML/`TrackMetadata` field. This is local,
-  transient playback UI state, not part of the shared `usePlayerState`
-  singleton (section 6): it resets naturally whenever the loaded track
-  changes, exactly like the existing `isPlaying`/`isDecoding` local
-  refs.
+- Computed as `duration - currentTime`. `currentTime` is updated from the
+  native Peaks.js `player.timeupdate` event; this event is the authoritative
+  playback-clock source. `duration` first uses `metadata.duration_ms` when it
+  is finite and positive. If the Core omits duration or supplies zero, the
+  player must immediately fall back to `peaks.player.getDuration() * 1000`
+  after audio decoding. This fallback is mandatory for the countdown and for
+  §0.7's gradient/viewport math: neither may divide by zero or collapse while
+  a valid decoded duration exists.
 - Hidden entirely (rendered as nothing, not as `-00:00`) whenever
   `!hasTrack` — i.e. before a waveform has finished decoding — mirroring
   how `bpmLabel`'s own `v-if="bpmLabel"` guard already behaves.
@@ -696,6 +1061,15 @@ playback — the cue is *not* a "jump and continue playing" action.
 
 ### 3.11 Global Keyboard Shortcuts Mapping
 
+#### Current handler details
+
+The current handler checks `isFocusedOnInput()` from `document.activeElement`
+before any shortcut logic and returns for `event.repeat` on keydown. It maps
+Space to `togglePlay`, Enter to `stop`, and top-row digit keys `1`-`8` to
+`startCuePreview`/`endCuePreview`. The current implementation does not use
+the obsolete `targetType` fields; the loaded track comes from the selected
+library path or the optional `trackPath` prop.
+
 A **global keyboard shortcut layer** is registered on `window` (not
 on the pad elements themselves), so the §3.9 pads are operable without
 focus, matching native Traktor hardware's always-on pad behavior.
@@ -753,6 +1127,15 @@ focus, matching native Traktor hardware's always-on pad behavior.
   `wavesurfer` calls against a null/unready instance.
 
 ### 3.13 Delete Cue Context-Menu Action
+
+The implemented menu boundary is `gui/src/components/CueContextMenu.vue`.
+It renders only while `visible` is true, positions itself from `x`/`y`, adds
+a full-screen close backdrop, closes on Escape, and emits `close` or `delete`
+without owning cue state. `AudioPlayer.vue` owns the selected cue and the
+delete handler. This separation is mandatory because playback mouse events
+must remain left-button-only (`.left`) and must use `.prevent` where the
+player starts a momentary preview; context-menu handling must not share that
+playback path or create an `AbortError` race.
 
 The player exposes a custom context menu for an existing cue marker. The
 menu contains **Delete Cue** only when the marker represents a deletable
@@ -907,7 +1290,51 @@ step.)*
 
 ### 4.1 Stage 1: On Selection
 
-Triggered by the lifecycle rules in section 3.4. Steps, in order:
+The following Stage 1 flow supersedes the older Wavesurfer/Web-Audio loading
+steps in this section:
+
+1. Increment a selection token and set `isLoadingTrack` before teardown.
+   Responses belonging to an earlier token are stale and must be discarded.
+2. Look up `trackPath` in `usePlayerState().previewCache`.
+   - **Cache hit:** use that complete `SuperJSON` immediately. No sidecar
+     process, browser audio decode, peak extraction, or HPSS work runs.
+   - **Cache miss:** call Tauri's native resource bridge with
+     `invoke("call_cuegrid_core", { args: ["--get-track-metadata", trackPath] })`.
+     Rust resolves and runs the packaged Core resource, collects stdout once,
+     and returns the complete string to `useTrackMetadata.ts`. The composable
+     trims and parses that single JSON value, applies the modeled
+     `TrackMetadataError` handling, and stores a successful complete
+     `SuperJSON` in `previewCache` before rendering. Failed, malformed, or
+     stale responses must never be cached. Vue never owns a process handle or
+     a manual stdout-line buffer.
+3. Create Peaks.js with `webAudio: false`. Provide its waveform data from
+   `superJson.waveform_peaks`; Peaks.js must not decode the audio or derive
+   waveform peaks in the webview. Configure its waveform paint as pure white
+   (`#ffffff`) and its canvas background as Zinc-950 (`#09090b`). The
+   sidecar-generated int8 peaks are the sole waveform source for both the
+   zoomview and overview.
+4. Render color through the CSS-mask architecture in section 0.7, not through
+   Canvas/Konva gradients, Peaks.js segments, or `waveformColor` gradients.
+   Vue creates the reactive CSS gradient from `superJson.color_map` and places
+   it behind the Peaks canvas. The canvas uses `mix-blend-mode: darken`: white
+   waveform pixels reveal the gradient and the Zinc-950 background hides it.
+   Vue performs only presentation mapping; it must not calculate HPSS, RMS,
+   FFTs, or any replacement audio feature.
+5. Paint the grid and cue markers from the same Super JSON, including the
+   existing session-stage resolution rules in section 4.3, then clear
+   `isLoadingTrack` when the Peaks views are ready.
+
+**Rationale:** browser Web Audio decoding is the CPU-spike bottleneck this
+architecture removes. Python performs low-rate decode, peak grouping, and
+HPSS once per cache miss; Vue retains the returned Super JSON in RAM, making
+repeat previews effectively instantaneous (target: ~0.05 s) while keeping
+Peaks.js a renderer rather than an audio-analysis engine.
+
+The legacy Wavesurfer/`Command.sidecar` sequence below is retained only as
+historical context and is superseded by the cache-first Peaks.js/resource-bridge
+flow above and by `3-gui-spec.md` §6. It is not an implementation contract.
+
+Triggered by the lifecycle rules in section 3.4. Historical steps were:
 
 1. `useTrackMetadata.ts` spawns the sidecar with
    `Command.sidecar(SIDECAR_NAME, ["--get-track-metadata", trackPath])`
@@ -1252,8 +1679,19 @@ export interface TrackMetadata {
   title: string;
   bpm: number;
   grid_anchor_ms: number;
+  duration_ms?: number; // optional Core duration; Peaks.js decoded duration is the §3.6 fallback
   existing_cues: ExistingCue[];
+  waveform_peaks: number[]; // signed int8 min/max, Python-generated in 128-sample windows at sr=11025
+  color_map: ColorMapBucket[];
 }
+
+export interface ColorMapBucket {
+  p: number; // normalized percussive HPSS RMS, 500 ms bucket
+  h: number; // normalized harmonic HPSS RMS, 500 ms bucket
+}
+
+// The complete success object is cached and rendered as an indivisible value.
+export type SuperJSON = TrackMetadata;
 
 export interface TrackMetadataError {
   error: "not_found" | "ambiguous";
@@ -1288,8 +1726,15 @@ interface PlayerState {
   markers: PlayerMarker[];
   markerStage: MarkerStage | null;
   isLoadingTrack: boolean; // §3.7 — shared concurrency lock, read by LibraryBrowser.vue too
+  previewCache: Map<string, SuperJSON>; // exact absolute trackPath -> complete Stage 1 response
 }
 ```
+
+`previewCache` is module-scoped RAM state, not reactive persisted storage and
+not a disk waveform cache. A cache entry is inserted only after a complete,
+successful `--get-track-metadata` response has passed the success-schema
+check. A cache hit is permitted to bypass the sidecar entirely; explicit
+post-mutation force reads replace the entry for the current `trackPath`.
 
 ```ts
 // composables/useAnalysisSession.ts (shape, not implementation) — §4.3.
@@ -1302,6 +1747,34 @@ export interface AnalysisSessionState {
 }
 ```
 
+The implementation-specific local player contract is:
+
+```ts
+interface PlayerCue {
+  id: number;          // NML HOTCUE, 0-7
+  position_ms: number;
+  is_valid: boolean;  // nearest beat-grid position within the player tolerance
+}
+
+interface TrackData {
+  track_path: string;
+  bpm: number;
+  grid_anchor_ms: number;
+  duration_ms: number;
+  cues: PlayerCue[];
+}
+
+const padSlots = computed(() =>
+  Array.from({ length: 8 }, (_, index) =>
+    cueState.value.find(cue => cue.id === index) ?? null,
+  ),
+);
+```
+
+`padSlots` is the only pad projection used by the template. It intentionally
+retains `null` holes so visual pad `N` always addresses NML id `N - 1` even
+when an earlier slot is empty.
+
 ---
 
 ## 7. Non-Goals (this document)
@@ -1313,9 +1786,10 @@ export interface AnalysisSessionState {
   `2-core-spec.md` section 11.7's own stance on NDJSON messages) — a
   future breaking change adds a version field then, not speculatively
   now.
-- No offline/cached waveform storage. Every track selection re-decodes
-  audio via `wavesurfer.load()`; no waveform peak-cache file is written
-  to disk in this phase.
+- No offline/cached waveform storage. `previewCache` is RAM-only and is lost
+  when the application process ends; no waveform peak-cache file is written
+  to disk in this phase. Repeated selections in one running session instead
+  reuse the sidecar's complete Super JSON without browser-side decoding.
 - No visual-only cue hiding: Delete Cue is not complete unless the
   sidecar returns exit code `0` after physically updating `collection.nml`.
 - No accessibility (screen-reader) treatment of the canvas beyond

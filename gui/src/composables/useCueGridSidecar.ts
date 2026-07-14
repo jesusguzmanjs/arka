@@ -1,16 +1,13 @@
 // composables/useCueGridSidecar.ts
 // See .openspec/3-gui-spec.md §6.4, §6.6, §6.7 and .openspec/4-library-spec.md §2.5.
 //
-// Spawns the packaged Python core as a Tauri sidecar process
-// (binaries/cuegrid-core), streams its NDJSON stdout into useRunState in
-// real-time, and exposes cancellation via the spawned Child handle.
-//
-// Process boundary: UI -> Command.sidecar -> OS process -> NDJSON on
-// stdout -> parsed SidecarMessage -> useRunState -> UI (§6.1).
+// Spawns the packaged Python core via Rust Resource architecture,
+// streams its NDJSON stdout into useRunState in real-time via Tauri Events,
+// and exposes cancellation via Rust process tracking.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { Command, type Child } from "@tauri-apps/plugin-shell";
 import { useConfigState } from "./useConfigState";
 import { useRunState, type RunSummary } from "./useRunState";
 import { useAnalysisSession } from "./useAnalysisSession";
@@ -18,13 +15,8 @@ import { preparePlayerForAnalysis } from "./useTrackMetadata";
 import type { CueGridConfig } from "../types/config";
 import type { SidecarMessage } from "../types/sidecar";
 
-const SIDECAR_NAME = "binaries/cuegrid-core";
-
 /**
  * Builds the argv array for the sidecar directly from CueGridConfig.
- *
- * The target selector is intentionally explicit: a single-track run passes
- * one absolute path directly, while the main-panel run passes a playlist.
  */
 function buildArgs(cfg: CueGridConfig, target: "track" | "playlist"): string[] {
   const args: string[] = [];
@@ -42,10 +34,13 @@ function buildArgs(cfg: CueGridConfig, target: "track" | "playlist"): string[] {
   return args;
 }
 
-// Holds the in-flight sidecar's Child handle so cancel() can kill it.
-// Module-scoped (not component-scoped) to match useRunState's singleton
-// pattern — only one run is ever in flight at a time.
-let currentChild: Child | null = null;
+// Almacena los des-registradores de eventos para limpiarlos al cerrar el proceso
+let unlistens: UnlistenFn[] = [];
+
+function cleanupListeners() {
+  unlistens.forEach((u) => u());
+  unlistens = [];
+}
 
 export function useCueGridSidecar() {
   const {
@@ -61,7 +56,6 @@ export function useCueGridSidecar() {
     startRun,
     pushLog,
     finishRun,
-    reset,
     currentPid,
     setAnalysisStatus,
   } = useRunState();
@@ -95,56 +89,12 @@ export function useCueGridSidecar() {
       nmlPathOverride: nmlPathOverride.value,
     };
 
-    startRun();
-
-    const command = Command.sidecar(SIDECAR_NAME, buildArgs(cfg, target));
-
-    // NDJSON line buffering (§6.6): `data` events deliver arbitrary
-    // chunks, not lines, so we must buffer and split on "\n", carrying
-    // over any partial trailing line to the next chunk.
-    let buffer = "";
+    cleanupListeners();
     let lastSummary: RunSummary | null = null;
 
-    command.stdout.on("data", (chunk: string) => {
-      buffer += chunk;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        handleLine(line);
-      }
-    });
-
-    command.stderr.on("data", (chunk: string) => {
-      // stderr is not NDJSON — Python tracebacks and low-level warnings
-      // land here regardless of --json mode, so it is always routed as
-      // an error log rather than parsed.
-      const text = chunk.trim();
-      if (!text) return;
-      pushLog({ type: "log", level: "error", message: text });
-    });
-
-    command.on("error", (error: string) => {
-      pushLog({ type: "log", level: "error", message: String(error) });
-    });
-
-    command.on("close", (data: { code: number | null }) => {
-      currentChild = null;
-      const succeeded = data.code === 0;
-      // §4.3 — capture the run's cue_written entries into the session map
-      // only on success (never on error/cancelled, matching §4.2's "nothing
-      // new was actually written to disk" gating). captureRun reads the full
-      // log snapshot from useRunState, so it must run before any reset.
-      if (succeeded) {
-        captureRun(logSnapshot());
-      }
-      if (succeeded) {
-        setAnalysisStatus(`${successLabel} analyzed successfully`);
-      }
-      finishRun(succeeded ? "success" : "error", lastSummary ?? undefined);
-    });
-
-    function handleLine(rawLine: string) {
-      const line = rawLine.trim();
+    // 1. Escuchar el STDOUT de Rust en tiempo real
+    const unlistenStdout = await listen<string>("analysis-stdout", (event) => {
+      const line = event.payload.trim();
       if (!line) return;
       try {
         const msg = JSON.parse(line) as SidecarMessage;
@@ -153,32 +103,71 @@ export function useCueGridSidecar() {
         }
         pushLog(msg);
       } catch {
-        // Non-JSON stdout (stray print(), a traceback that bypassed
-        // --json mode, a third-party warning) is not fatal — surface it
-        // as an error-level log rather than crashing the parser or
-        // silently dropping it (§6.6).
         pushLog({ type: "log", level: "error", message: line });
       }
-    }
+    });
+    unlistens.push(unlistenStdout);
 
+    // 2. Escuchar el STDERR de Rust
+    const unlistenStderr = await listen<string>("analysis-stderr", (event) => {
+      const text = event.payload.trim();
+      if (!text) return;
+      pushLog({ type: "log", level: "error", message: text });
+    });
+    unlistens.push(unlistenStderr);
+
+    // 3. Escuchar el evento de cierre del proceso
+    const unlistenClose = await listen<number | null>("analysis-close", (event) => {
+      cleanupListeners();
+      const code = event.payload;
+      const succeeded = code === 0;
+
+      if (succeeded) {
+        captureRun(logSnapshot());
+        setAnalysisStatus(`${successLabel} analyzed successfully`);
+      }
+      finishRun(succeeded ? "success" : "error", lastSummary ?? undefined);
+    });
+    unlistens.push(unlistenClose);
+
+    // 4. Arrancar el motor en Rust
     try {
-      currentChild = await command.spawn();
-      currentPid.value = currentChild.pid;
+      startRun();
+      currentPid.value = 99999; // Mock PID (la cancelación ahora va por backend)
+      await invoke("start_analysis_stream", { args: buildArgs(cfg, target) });
     } catch (err) {
-      currentChild = null;
-      pushLog({ type: "log", level: "error", message: `Failed to spawn sidecar: ${String(err)}` });
+      cleanupListeners();
+      pushLog({ type: "log", level: "error", message: `Failed to start stream: ${String(err)}` });
       finishRun("error");
     }
   }
 
   /** Snapshot of the current run's full NDJSON log, for captureRun(). */
   function logSnapshot(): SidecarMessage[] {
-    // Read from useRunState's reactive logs array. We re-invoke useRunState
-    // here (it's a module singleton, so this returns the same state) to
-    // avoid threading the logs ref through the closure above.
     return useRunState().logs.value.map((l) => l.msg);
   }
 
+  /**
+   * Actualiza los cues en lote usando el puente genérico call_cuegrid_core (one-shot).
+   */
+  async function updateTrackCues(
+    trackPath: string,
+    cues: Array<{ hotcue: number; start_ms: number }>
+  ): Promise<{ ok: boolean; error?: string }> {
+    const args = [trackPath, "--update-cues", JSON.stringify(cues)];
+    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
+
+    try {
+      await invoke("call_cuegrid_core", { args });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  /**
+   * Elimina un cue específico usando el puente genérico call_cuegrid_core (one-shot).
+   */
   async function deleteCue(
     trackPath: string,
     hotcueIndex: number,
@@ -190,50 +179,44 @@ export function useCueGridSidecar() {
     if (title) args.push("--title", title);
     if (artist) args.push("--artist", artist);
 
-    const command = Command.sidecar(SIDECAR_NAME, args);
-    let stderrText = "";
-    let settled = false;
-
-    return new Promise((resolve) => {
-      const finish = (result: { ok: boolean; error?: string }) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-
-      command.stderr.on("data", (chunk: string) => {
-        stderrText += chunk;
-      });
-      command.on("error", (error: string) => {
-        finish({ ok: false, error: `Failed to run delete sidecar: ${String(error)}` });
-      });
-      command.on("close", (data: { code: number | null }) => {
-        if (data.code === 0) {
-          finish({ ok: true });
-        } else {
-          finish({
-            ok: false,
-            error:
-              stderrText.trim() ||
-              `Delete sidecar exited with code ${data.code ?? "null"}.`,
-          });
-        }
-      });
-
-      command.spawn().catch((error: unknown) => {
-        finish({ ok: false, error: `Failed to spawn delete sidecar: ${String(error)}` });
-      });
-    });
+    try {
+      await invoke("call_cuegrid_core", { args });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
   }
 
-  async function cancel(): Promise<void> {
-    if (!currentChild) return;
+  /**
+   * Auto-descubre el NML por defecto usando el puente genérico call_cuegrid_core (one-shot).
+   */
+  async function discoverAndSetDefaultNml(): Promise<void> {
+    if (nmlPathOverride.value) return;
+
     try {
-      await currentChild.kill();
+      const stdoutText = await invoke<string>("call_cuegrid_core", { args: ["--discover-nml"] });
+      if (stdoutText.trim()) {
+        const result = JSON.parse(stdoutText);
+        if (result.path) {
+          nmlPathOverride.value = result.path;
+          console.log("[Boot] Auto-descubierto NML por defecto:", result.path);
+        }
+      }
+    } catch (e) {
+      console.error("Error parseando el path del NML:", e);
+    }
+  }
+
+  /**
+   * Cancela el análisis matando de raíz el proceso en Rust.
+   */
+  async function cancel(): Promise<void> {
+    try {
+      await invoke("cancel_analysis");
     } catch {
-      // Process may have already exited; nothing further to do.
+      // Ignorar fallos si el proceso ya había muerto solo
     } finally {
-      currentChild = null;
+      cleanupListeners();
       finishRun("cancelled");
     }
   }
@@ -249,8 +232,8 @@ export function useCueGridSidecar() {
   }
 
   function resetRun(): void {
-    reset();
+    useRunState().reset();
   }
 
-  return { run, runSingleTrack, deleteCue, cancel, exportTelemetry, resetRun };
+  return { run, runSingleTrack, deleteCue, cancel, exportTelemetry, resetRun, updateTrackCues, discoverAndSetDefaultNml, nmlPathOverride };
 }

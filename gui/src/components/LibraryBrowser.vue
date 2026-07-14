@@ -16,7 +16,7 @@
 // directly, accepts a single `disabled` prop matching every other top-level
 // panel.
 
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { useLibraryState } from "../composables/useLibraryState";
 import { useConfigState } from "../composables/useConfigState";
 import { usePlayerState } from "../composables/useTrackMetadata";
@@ -37,19 +37,58 @@ const {
   selectTrackForPreview,
 } = useLibraryState();
 
-const { selectedPlaylist, selectedTrackPath } = useConfigState();
+// Extremos 'isValid' para controlar cuándo se puede ejecutar el análisis
+const { selectedPlaylist, selectedTrackPath, isValid } = useConfigState();
 
 // §4.4 — read the shared isLoadingTrack concurrency lock directly from the
 // player's singleton state. While true, every row-level interaction is
 // inert so a second click can never race the first.
 const { isLoadingTrack } = usePlayerState();
-const { setAnalysisStatus } = useRunState();
-const { runSingleTrack } = useCueGridSidecar();
+
+// Extraemos los estados reactivos de la ejecución global
+const { status, analysisStatus, setAnalysisStatus } = useRunState();
+
+// Extraemos los métodos de control del proceso por lote e individual de Python
+const { run, runSingleTrack, cancel, resetRun } = useCueGridSidecar();
 
 const contextMenuVisible = ref(false);
 const contextMenuX = ref(0);
 const contextMenuY = ref(0);
 const contextMenuTrack = ref<LibraryTrack | null>(null);
+
+// Condiciones de validación para activar o desactivar los botones
+const canRunPlaylist = computed(
+  () => isValid.value && status.value !== "running" && selectedPlaylist.value,
+);
+
+const canRunCurrentTrack = computed(
+  () => status.value !== "running" && selectedTrackPath.value,
+);
+
+// Buscamos los metadatos de la canción actual para mandárselos a la CLI de Python
+const currentTrackRecord = computed(() => {
+  if (!selectedTrackPath.value) return null;
+  return tracks.value.find(t => t.location_path === selectedTrackPath.value) || null;
+});
+
+const currentTrackTitle = computed(() => currentTrackRecord.value?.title || "Current Track");
+
+// Gestores de clics para los botones integrados
+function onAnalyzePlaylist() {
+  if (status.value === "running") return;
+  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
+    resetRun();
+  }
+  run();
+}
+
+function onAnalyzeCurrentTrack() {
+  if (status.value === "running" || !selectedTrackPath.value) return;
+  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
+    resetRun();
+  }
+  void runSingleTrack(selectedTrackPath.value, currentTrackTitle.value);
+}
 
 function selectTrackForPreviewAndClearStatus(track: LibraryTrack): void {
   setAnalysisStatus(null);
@@ -72,6 +111,12 @@ function openTrackContextMenu(event: MouseEvent, track: LibraryTrack): void {
 async function analyzeContextTrack(): Promise<void> {
   const track = contextMenuTrack.value;
   closeContextMenu();
+
+  // Let Vue remove the menu overlay before the analysis updates shared state.
+  // This keeps the menu's VNodes out of the same patch cycle as the sidecar
+  // status changes triggered by runSingleTrack().
+  await nextTick();
+
   if (!track || props.disabled || isLoadingTrack.value) return;
   await runSingleTrack(track.location_path, track.title);
 }
@@ -91,109 +136,150 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
 </script>
 
 <template>
-  <!-- §5.2 (v1.1 fix): the root element must NOT set overflow-y-auto — only
-       the two inner columns do. A second overflow-y-auto on an ancestor
-       intercepts the scroll gesture before it reaches the intended inner
-       column, which was the root cause of the "tracklist doesn't scroll" bug.
-       v1.2 fix: root carries flex-1 min-h-0 so it absorbs Block 1's height
-       and constrains its children — without flex-1 the section collapses to
-       its content height and the inner overflow-y-auto never engages. -->
   <section
-    class="flex flex-col flex-1 min-h-0"
+    class="flex h-full min-h-0 flex-1 flex-col overflow-hidden"
     :class="{ 'opacity-60 pointer-events-none': props.disabled }"
   >
     <div
-      class="flex items-center gap-2 px-4 py-2 border-b border-zinc-800/80 border-l-2 border-l-teal-500/30"
+      class="flex items-center gap-2 px-4 py-2 border-b border-zinc-800/80 border-l-2 border-l-secondary/30"
     >
       <span class="text-xs uppercase tracking-widest text-muted">Library</span>
+      <span class="text-xs text-dim">{{ playlists.length }} playlists</span>
     </div>
 
-    <!-- §5.2: shared flex row supplies min-h-0 so both children's
-         overflow-y-auto actually take effect inside the flex container. -->
     <div class="flex-1 min-h-0 flex">
-      <!-- ── Left column: Playlists (~1/3 width) ───────────────────── -->
-      <!-- §4.4: the playlist list is NOT locked by isLoadingTrack —
-           switching playlists never touches the player. -->
       <div
-        class="w-1/3 shrink-0 border-r border-zinc-800/80 min-h-0 overflow-y-auto"
+        class="flex w-[min(22rem,34%)] min-h-0 shrink-0 flex-col border-r border-zinc-800/80"
       >
-        <div
-          v-if="playlistsLoading && playlists.length === 0"
-          class="px-3 py-2 text-sm text-dim"
-        >
-          Loading playlists…
+        <div class="shrink-0 border-b border-zinc-800/60 px-4 py-2">
+          <span class="text-xs font-semibold uppercase tracking-wide text-muted">Playlists</span>
         </div>
-        <ul v-else>
-          <li
-            v-for="name in playlists"
-            :key="name"
-            class="px-3 py-1.5 text-sm cursor-pointer truncate"
-            :class="
-              name === selectedPlaylist
-                ? 'bg-elevated text-accent'
-                : 'text-muted hover:bg-zinc-800/60 hover:text-primary'
-            "
-            @click="!props.disabled && selectPlaylist(name)"
+        <div class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">
+          <div
+            v-if="playlistsLoading && playlists.length === 0"
+            class="flex h-full items-center justify-center px-4 text-center text-sm text-dim"
           >
-            {{ name }}
-          </li>
-          <li
-            v-if="!playlistsLoading && playlists.length === 0"
-            class="px-3 py-2 text-sm text-dim"
-          >
-            No playlists found in collection.nml.
-          </li>
-        </ul>
-      </div>
+            Loading playlists…
+          </div>
+          <ul v-else class="h-full py-2">
+            <li
+              v-for="name in playlists"
+              :key="name"
+              class="px-3 py-1.5 text-sm cursor-pointer truncate"
+              :class="
+                name === selectedPlaylist
+                  ? 'bg-elevated text-accent'
+                  : 'text-muted hover:bg-zinc-800/60 hover:text-primary'
+              "
+              @click="!props.disabled && selectPlaylist(name)"
+            >
+              {{ name }}
+            </li>
+            <li
+              v-if="!playlistsLoading && playlists.length === 0"
+              class="flex h-full min-h-40 items-center justify-center px-4 text-center text-sm text-dim"
+            >
+              No playlists found in collection.nml.
+            </li>
+          </ul>
+        </div>
 
-      <!-- ── Right column: Tracklist table (~2/3 width) ─────────────
-           v1.2 fix: this wrapper is a flex container (flex-1 min-h-0) that
-           holds the error/loading/empty states AND a separate scroll div for
-           the table. The scroll must NOT live on this wrapper itself — if it
-           does, the sticky thead sticks to a box that also contains the
-           non-table states, and the table grows the column to infinity. -->
-      <div class="w-2/3 min-h-0 flex flex-col flex-1">
-        <!-- Error state (AmbiguousPlaylistError / PlaylistNotFoundError) -->
+        <div class="hidden">
+
+          <div
+            v-if="analysisStatus"
+            class="min-h-4 text-center text-[11px] font-mono text-zinc-400 border border-zinc-800/60 rounded p-1.5 bg-zinc-950 truncate"
+            aria-live="polite"
+            :title="analysisStatus"
+          >
+            {{ analysisStatus }}
+          </div>
+
+          <div class="flex flex-col gap-1.5">
+            <button
+              v-if="status !== 'running'"
+              type="button"
+              :disabled="!canRunPlaylist"
+              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors"
+              :class="
+                canRunPlaylist
+                  ? 'bg-primary text-zinc-950 hover:bg-accent active:bg-primary-pressed font-semibold'
+                  : 'bg-zinc-800/50 text-zinc-600 cursor-not-allowed'
+              "
+              @click="onAnalyzePlaylist"
+            >
+              <span>▶</span>
+              <span>Analyze Playlist</span>
+            </button>
+
+            <button
+              v-if="status !== 'running'"
+              type="button"
+              :disabled="!canRunCurrentTrack"
+              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors border"
+              :class="
+                canRunCurrentTrack
+                  ? 'border-secondary/30 bg-zinc-900 text-accent hover:bg-zinc-800 hover:text-accent'
+                  : 'border-zinc-800/80 bg-transparent text-zinc-600 cursor-not-allowed'
+              "
+              @click="onAnalyzeCurrentTrack"
+            >
+              <span>🎯</span>
+              <span>Analyze Current Track</span>
+            </button>
+
+            <button
+              v-if="status === 'running'"
+              type="button"
+              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium border border-red-500/40 bg-zinc-900 text-red-400 hover:bg-red-950/40 hover:text-red-300 transition-colors animate-pulse"
+              @click="cancel"
+            >
+              <span class="inline-block w-2.5 h-2.5 border-2 border-red-400/30 border-t-red-400 rounded-full animate-spin" />
+              <span>Cancel Analysis…</span>
+            </button>
+          </div>
+        </div>
+        </div>
+
+      <div class="flex min-w-0 flex-1 min-h-0 flex-col">
+        <div class="flex shrink-0 items-center justify-between border-b border-zinc-800/60 px-4 py-2">
+          <span class="text-xs font-semibold uppercase tracking-wide text-muted">Tracks</span>
+          <span v-if="selectedPlaylist" class="max-w-[60%] truncate text-xs text-dim" :title="selectedPlaylist">
+            {{ selectedPlaylist }}
+          </span>
+        </div>
         <div
           v-if="tracksError"
-          class="px-3 py-3 text-sm text-warn font-mono"
+          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-warn font-mono"
         >
           {{ tracksError }}
         </div>
 
-        <!-- Loading state -->
         <div
           v-else-if="tracksLoading"
-          class="px-3 py-3 text-sm text-dim"
+          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
         >
           Loading tracks…
         </div>
 
-        <!-- Empty-state: no playlist selected yet (expected boot state) -->
         <div
           v-else-if="!selectedPlaylist"
-          class="px-3 py-3 text-sm text-dim"
+          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
         >
           Select a playlist to view its tracks.
         </div>
 
-        <!-- Empty playlist: valid, not an error -->
         <div
           v-else-if="tracks.length === 0"
-          class="px-3 py-3 text-sm text-dim"
+          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
         >
           This playlist is empty.
         </div>
 
-        <!-- v1.2 fix: the table lives inside its own flex-1 overflow-y-auto
-             min-h-0 div, NOT directly under the column wrapper. This is the
-             only element that scrolls; the thead sticks to its top. -->
-        <div v-else class="flex-1 overflow-y-auto min-h-0">
-          <!-- Tracklist table: fixed Action and Stem columns keep metadata aligned. -->
+        <div v-else class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">
           <table class="w-full table-fixed text-sm">
             <thead class="sticky top-0 z-10 bg-panel">
               <tr>
-                <!-- Column order: Action -> Stem badge -> Artist -> Title. -->
                 <th class="w-10 px-2 py-1.5"></th>
                 <th class="w-10 px-2 py-1.5"></th>
                 <th class="text-left px-3 py-1.5 text-muted font-normal">
@@ -221,7 +307,6 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
                 @dblclick="!props.disabled && !isLoadingTrack && selectTrackForPreviewAndClearStatus(track)"
                 @contextmenu.prevent="openTrackContextMenu($event, track)"
               >
-                <!-- §3.5 v1.1: leading Action column with a Load icon -->
                 <td class="px-2 py-1 text-center">
                   <button
                     type="button"
@@ -231,7 +316,6 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
                     title="Load for preview"
                     @click.stop="!props.disabled && !isLoadingTrack && selectTrackForPreviewAndClearStatus(track)"
                   >
-                    <!-- play-circle glyph -->
                     <svg
                       xmlns="http://www.w3.org/2000/svg"
                       viewBox="0 0 20 20"
@@ -271,6 +355,61 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+
+    <div class="shrink-0 border-t border-zinc-800/60 bg-zinc-950/40 p-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <div
+          v-if="analysisStatus"
+          class="min-w-0 flex-1 truncate rounded border border-zinc-800/60 bg-zinc-950 px-2 py-1 text-center text-[11px] font-mono text-zinc-400"
+          aria-live="polite"
+          :title="analysisStatus"
+        >
+          {{ analysisStatus }}
+        </div>
+        <div v-else class="flex-1" />
+
+        <button
+          v-if="status !== 'running'"
+          type="button"
+          :disabled="!canRunPlaylist"
+          class="inline-flex min-w-40 items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors"
+          :class="
+            canRunPlaylist
+              ? 'bg-primary text-zinc-950 hover:bg-accent active:bg-primary-pressed'
+              : 'cursor-not-allowed bg-zinc-800/50 text-zinc-600'
+          "
+          @click="onAnalyzePlaylist"
+        >
+          <span aria-hidden="true">▶</span>
+          <span>Analyze Playlist</span>
+        </button>
+
+        <button
+          v-if="status !== 'running'"
+          type="button"
+          :disabled="!canRunCurrentTrack"
+          class="inline-flex min-w-44 items-center justify-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold transition-colors"
+          :class="
+            canRunCurrentTrack
+              ? 'border-secondary/30 bg-zinc-900 text-accent hover:bg-zinc-800'
+              : 'cursor-not-allowed border-zinc-800/80 bg-transparent text-zinc-600'
+          "
+          @click="onAnalyzeCurrentTrack"
+        >
+          <span aria-hidden="true">🎯</span>
+          <span>Analyze Current Track</span>
+        </button>
+
+        <button
+          v-if="status === 'running'"
+          type="button"
+          class="w-full rounded-md border border-red-500/40 bg-zinc-900 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-950/40"
+          @click="cancel"
+        >
+          Cancel Analysis…
+        </button>
       </div>
     </div>
   </section>

@@ -9,14 +9,25 @@ export default {
         panel: "#1c1c1e",
         elevated: "#232326",
         console: "#0d0d0f",
-        // accent
-        accent: {
-          DEFAULT: "#4fd1c5",
-          hover: "#6adfd4",
-          pressed: "#3fb8ad",
+        // semantic amber/ochre brand roles
+        primary: {
+          DEFAULT: "#edb40b",
+          hover: "#BD903B",
+          pressed: "#F7D15F",
         },
+        secondary: {
+          DEFAULT: "#F7D15F",
+          hover: "#F6C73C",
+          muted: "#F9DC83",
+        },
+        accent: {
+          DEFAULT: "#AA8208",
+          hover: "#BD903B",
+          pressed: "#edb40b",
+        },
+        warning: "#f43f5e",
         // text
-        primary: "#f2f2f2",
+        foreground: "#f2f2f2",
         muted: "#8a8a8e",
         dim: "#5a5a5e",
         // status

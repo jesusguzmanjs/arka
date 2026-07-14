@@ -20,10 +20,10 @@ mathematically derived from the grid to begin with.
   never touching your existing cues, grid, or any other track data.
 - **Batch Processing:** Process single tracks, search by title, or
   analyze entire playlists natively through the XML tree.
-- **Smart Stems Processing:** When Traktor's native Stems are present,
-  isolates the drum/rhythm component via FFmpeg for cleaner detection,
-  with automatic fallback to the full Master mix for ambient or
-  drum-light material.
+- **Parallel Signal Fusion (Smart Mode):** When a usable Traktor Drum stem
+  is present, extracts aligned Master and drum onset/energy envelopes and
+  selects peaks from their weighted combination. Without a stem, it falls
+  back to performance-preserving Master-only analysis.
 - **Desktop GUI:** A Tauri + Vue 3 studio-rack interface wraps the engine
   as a sidecar process, giving you waveform playback, virtual HotCue
   pads, a native library browser, and one-click telemetry export — no
@@ -79,34 +79,32 @@ flowchart LR
 
 ## Key Features (v1.8)
 
-### Smart Stems Processing Engine
+### Parallel Signal Fusion Engine (Smart Mode)
 
 CueGrid detects native Traktor Stems by testing the `FLAGS & 0x40`
 bitmask on each `<ENTRY><INFO>` element — a reverse-engineered,
 non-literal comparison that survives whatever other flag bits Traktor
 sets. When a stem is available, it predicts the sidecar `.stem.mp4`
 path (reproducing Traktor's own MD5-derived hashing scheme) and uses
-`ffmpeg` to demux the isolated Drums/Rhythm stream for surgical,
-low-noise analysis.
+`ffmpeg` to demux the isolated Drums/Rhythm stream.
 
-Multi-source validation guards this pipeline at two levels:
+Smart Mode is **not** a post-detection classifier or filter. It extracts
+aligned onset/energy envelopes from both the original Master and Drum
+signals simultaneously, then picks peaks from the fused signal:
 
-- **Empty-stem detection (always on):** a fast, chunked RMS energy
-  probe checks whether the extracted drum stem is practically silent
-  (e.g. Ambient/IDM material with no real drum content). If so, CueGrid
-  transparently falls back to analyzing the original Master audio — no
-  flag required.
-- **Smart cross-validation (`--verify smart`, default):** every
-  confirmed cue is cross-checked against a small window of the Master
-  track and relabeled — `"Drop (Rhythm)"` when both drums and the full
-  mix are energetic, `"Breakdown (Melodic)"` when the drums drop out but
-  the mix stays energetic. These labels appear directly on the HotCue
-  pad in Traktor.
+```text
+combined_energy = (master_energy * master_weight)
+                + (drum_energy * drum_weight)
+```
 
-A global binary override, `--no-stems`, forces standard Master-file
-analysis and bypasses `FLAGS` inspection, stem-path resolution, and
-extraction entirely — useful for A/B comparisons or collections without
-Stems.
+The default weights are `master_weight = 0.6` and `drum_weight = 0.4`.
+If no drum stem is provided, cannot be extracted, or is practically silent,
+CueGrid automatically uses `master_weight = 1.0` and `drum_weight = 0.0` and
+skips stem extraction, decoding, and envelope calculations entirely. This
+strict fallback preserves standard single-track behavior and performance.
+
+The `--no-stems` override forces that same Master-only path. Empty-stem
+handling is source availability logic, not a post-detection rejection pass.
 
 ### 3D Sensitivity Matrix v1.4
 
@@ -158,11 +156,17 @@ Action Bar) — separated by a single resizable splitter with a
 hard anti-clip floor so the primary CTA is never squeezed out of view.
 
 Every execution automatically dumps its evaluation metrics to a local
-session cache, `last_run_telemetry.csv`, with a 9-column schema:
+session cache, `last_run_telemetry.csv`, with a 12-column schema. The binary
+`Smart_Boost` flag is deprecated and is not emitted:
 
 ```text
-track_title,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db
+track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
 ```
+
+`Drum_Weight_Applied` stores the applied drum/master alpha/beta ratio
+(`drum_weight / master_weight`) in fused Smart Mode, or `0.0` in standard
+Master-only mode. `Drum_Score` is the exact drum RMS energy at the frame index
+where the combined signal selected the peak; it is `N/A` in standard mode.
 
 Each run **overwrites** this cache (no stale rows survive across runs).
 A fixed **Export** button lives in the bottom-right status bar, next to
@@ -354,8 +358,8 @@ default, shown in `--help`:
 | `--max-cues` | `8` | Maximum number of cues written per track (1–8). |
 | `--clear-existing` | (flag) | Clear existing standard HotCues (TYPE="0") before writing new ones. Grid/BPM (TYPE="4") and Load (TYPE="3") markers are preserved. **Smart slot reclamation:** when active, the tool calculates slot availability as if those old HotCues are already gone, preventing premature "all slots occupied" warnings and ensuring a perfect sequential fill from slot 0 upward. |
 | `--relative-confidence-threshold` | `0.30` | Keep only candidates whose confidence is at least this fraction of the track's strongest candidate. |
-| `--verify` | `smart` | Multi-Source Validation mode: `fast` or `smart`. See [Smart Stems Processing Engine](#smart-stems-processing-engine). |
-| `--no-stems` | (flag) | Bypass native Stems entirely and force Master-file analysis, regardless of `FLAGS`/`--verify`. |
+
+| `--no-stems` | (flag) | Bypass native Stems and force Master-only analysis with `master_weight=1.0` and `drum_weight=0.0`; stem calculations are skipped. |
 | `--export-csv` | (none) | Write per-candidate telemetry to a CSV file for data-driven tuning (see [Data Export](#data-export)). |
 
 ```bash
@@ -385,11 +389,14 @@ searching everywhere, `cuegrid` only looks *there*.
 ```mermaid
 flowchart TD
     A[Read BPM + grid anchor + duration from collection.nml] --> B[Generate phrase-boundary candidates every 16/32 beats]
-    B --> S{Native Stem available?}
-    S -->|yes, not silent| T[Isolate drum stem via FFmpeg]
-    S -->|no / silent / --no-stems| M[Use original Master audio]
-    T --> C[For each candidate: decode a small before/after window]
-    M --> C
+    B --> S{Usable native Drum stem?}
+    S -->|yes| T[Extract aligned Master + Drum windows]
+    S -->|no / silent / --no-stems| M[Use Master only; skip stem calculations]
+    T --> U[Extract aligned onset/energy envelopes]
+    U --> V[Fuse weighted envelopes: Master 0.6 + Drum 0.4]
+    M --> W[Use Master energy with weight 1.0]
+    V --> C[Select peaks at candidate frames]
+    W --> C
     C --> D[Extract RMS energy + MFCC timbre for each window]
     D --> E[Score energy-delta dB + timbre distance]
     E --> F{Change significant?}
@@ -473,12 +480,21 @@ that was evaluated, with these columns:
 | Column | Description |
 |---|---|
 | `track_title` | `"Artist - Title"` string identifying the track |
+| `Formatted_Time` | Human-readable candidate time in `MM:SS.mmm` format |
 | `beat` | Beat index of the phrase-boundary candidate |
 | `time_ms` | Timestamp of the candidate in milliseconds |
 | `energy_delta_db` | RMS energy change (dB) across the candidate; positive = rising, negative = falling |
 | `timbre_dist` | Euclidean distance between before/after MFCC vectors |
-| `confidence` | Combined confidence score (arbitrary positive scale) |
+| `confidence` | Combined confidence score (arbitrary positive scale) based on the fused signal |
 | `status` | Final disposition: `SELECTED`, `DISCARDED_LIMIT`, `REJECTED_THRESHOLD`, `REJECTED_SILENCE`, or `REJECTED_MISSING_WINDOW` |
+| `track_peak_db` | Master peak loudness at the evaluated candidate |
+| `track_perceived_db` | Master perceived loudness at the evaluated candidate |
+| `Drum_Score` | Exact drum RMS energy at the combined peak frame index; `N/A` in standard Master-only mode |
+| `Drum_Weight_Applied` | Applied drum/master alpha/beta ratio (`drum_weight / master_weight`), or `0.0` in standard mode |
+
+`Smart_Boost` is deprecated and must not be emitted. Smart Mode does not
+classify or filter a completed detection result; the Drum signal contributes
+before peak selection through the weighted fusion formula.
 
 Rows are appended on each run, so you can accumulate data across multiple
 sessions. Open the CSV in any spreadsheet or load it into a database to
@@ -494,11 +510,10 @@ cuegrid --playlist "Techno Set" --export-csv tuning_data.csv -v
 
 Every GUI-triggered run overwrites a fixed internal cache,
 `last_run_telemetry.csv`, in the application's local data directory —
-never appended, always the most recent execution only. Its schema adds
-two loudness columns to the CLI's per-candidate shape:
+never appended, always the most recent execution only. Its schema is:
 
 ```text
-track_title,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db
+track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
 ```
 
 Click **Export** in the status bar to copy this cache to a

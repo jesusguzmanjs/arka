@@ -8,8 +8,9 @@ before/after windows via ``audio.loader``, extract RMS/MFCC features with
 significant candidates as a single, unified pool of ``DetectedEvent``s
 (no position-based intro/drop/outro roles -- see spec section 6.1, v1.4).
 
-This module never analyzes anything outside a candidate's window and never
-touches XML (spec section 2.1).
+When a Drum stem is supplied, Master and Drum windows are decoded together
+and their aligned RMS envelopes are fused before scoring. In standard mode,
+no Drum window is decoded. This module never touches XML (spec section 2.1).
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ from cuegrid.audio.beatgrid import (
 from cuegrid.audio.features import ScoreResult, score_candidate
 from cuegrid.audio.loader import load_window
 from cuegrid.config import AppConfig
-from cuegrid.telemetry import TELEMETRY_FIELDNAMES, append_telemetry_rows
+from cuegrid.telemetry import (
+    TELEMETRY_FIELDNAMES,
+    append_telemetry_rows,
+    format_timestamp_ms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +62,12 @@ class DetectedEvent:
 
 @dataclass
 class _ScoredCandidate:
-    """Internal: a ``PhraseCandidate`` plus its (possibly missing) score."""
+    """Internal: a candidate score plus fusion telemetry."""
 
     candidate: PhraseCandidate
     score: ScoreResult | None
     rms_after: float | None = None
+    drum_score: float | None = None
 
 
 # Explicit CLI export uses the same locked schema as the internal cache.
@@ -75,9 +81,12 @@ def _telemetry_row(
     status: str,
     peak_db: float | None,
     perceived_db: float | None,
+    drum_score: float | None,
+    drum_weight: float,
 ) -> dict[str, str | int | float]:
     return {
         "track_title": track_title,
+        "Formatted_Time": format_timestamp_ms(candidate.time_ms),
         "beat": candidate.beat_index,
         "time_ms": f"{candidate.time_ms:.3f}",
         "energy_delta_db": f"{score.energy_delta_db:.3f}" if score is not None else "",
@@ -86,6 +95,8 @@ def _telemetry_row(
         "status": status,
         "track_peak_db": f"{peak_db:.6f}" if peak_db is not None else "",
         "track_perceived_db": f"{perceived_db:.6f}" if perceived_db is not None else "",
+        "Drum_Score": f"{drum_score:.6f}" if drum_score is not None else "N/A",
+        "Drum_Weight_Applied": f"{drum_weight:.6f}",
     }
 
 
@@ -93,13 +104,37 @@ def _write_csv_row(writer: csv.DictWriter, row: dict[str, str | int | float]) ->
     writer.writerow(row)
 
 
-def _extract_rms_mfcc(
+def _extract_envelope_mfcc(
     y: np.ndarray, sr: int, config: AppConfig
-) -> tuple[float, np.ndarray]:
-    """Extract mean RMS energy and mean MFCC vector for a decoded window."""
-    rms = float(librosa.feature.rms(y=y, hop_length=config.hop_length)[0].mean())
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract an RMS envelope and mean MFCC vector from one window."""
+    rms = librosa.feature.rms(y=y, hop_length=config.hop_length)[0]
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=config.mfcc_count).mean(axis=1)
-    return rms, mfcc
+    return np.asarray(rms, dtype=np.float64), np.asarray(mfcc, dtype=np.float64)
+
+
+def _fuse_energy(
+    master_energy: np.ndarray,
+    drum_energy: np.ndarray | None,
+    master_weight: float,
+    drum_weight: float,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Return aligned weighted energy and the aligned Drum envelope.
+
+    The common frame range is used when decoders produce a one-frame length
+    difference. No Drum array is created or processed in Master-only mode.
+    """
+    if drum_energy is None:
+        return master_energy * 1.0, None
+
+    frame_count = min(master_energy.size, drum_energy.size)
+    if frame_count == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+    master = master_energy[:frame_count]
+    drum = drum_energy[:frame_count]
+    combined = (master * master_weight) + (drum * drum_weight)
+    return combined, drum
 
 
 def _is_silent(rms_after: float, track_avg_rms: float) -> bool:
@@ -119,84 +154,98 @@ def _is_silent(rms_after: float, track_avg_rms: float) -> bool:
 
 def _score_candidates(
     audio_path: str | Path,
+    drum_stem_path: str | Path | None,
     candidates: list[PhraseCandidate],
     bpm: float,
     duration_ms: float,
     config: AppConfig,
+    master_weight: float | None = None,
+    drum_weight: float | None = None,
 ) -> tuple[list[_ScoredCandidate], dict[int, str]]:
-    """Decode before/after windows for each candidate and score them.
-
-    Implements spec section 6.1, steps 2-5, including the anti-silence
-    filter that rejects candidates whose "after" window is practically
-    silent relative to the track's average sampled energy.
-
-    Returns:
-        A tuple of ``(scored_candidates, status_by_beat_index)`` where
-        ``status_by_beat_index`` records the rejection reason for every
-        candidate that did not pass scoring.
-    """
+    """Fuse aligned Master/Drum envelopes, then score each candidate."""
     window_ms = config.window_beats * beat_length_ms(bpm)
+    has_drum = drum_stem_path is not None
+    if has_drum:
+        master_weight = (
+            master_weight if master_weight is not None else config.master_weight
+        )
+        drum_weight = drum_weight if drum_weight is not None else config.drum_weight
+    else:
+        master_weight = 1.0
+        drum_weight = 0.0
 
-    logger.debug(
-        "Scoring %d candidate(s) with window_ms=%.3f (window_beats=%.2f, bpm=%.3f)",
-        len(candidates),
-        window_ms,
-        config.window_beats,
-        bpm,
-    )
-
-    # Pass 1: decode + extract raw features for every candidate, without
-    # scoring yet -- we need the track-wide average RMS first (anti-silence
-    # filter needs it as a baseline). ``before``/``after`` are each either
-    # ``None`` or a ``(rms, mfcc)`` pair, kept together so type-narrowing on
-    # one item also narrows the other.
     raw: list[
         tuple[
             PhraseCandidate,
             tuple[float, np.ndarray] | None,
             tuple[float, np.ndarray] | None,
+            float | None,
         ]
     ] = []
     all_rms_samples: list[float] = []
+    status_by_beat: dict[int, str] = {}
 
     for candidate in candidates:
+        if candidate.beat_index < 8:
+            status_by_beat[candidate.beat_index] = "REJECTED_INTRO_MARGIN"
+            continue
+
         before_offset_ms = candidate.time_ms - window_ms
         has_before = before_offset_ms >= 0
-
         after_duration_ms = min(window_ms, duration_ms - candidate.time_ms)
         has_after = after_duration_ms > 0
-
         before = None
-        if has_before:
-            y_before, sr_before = load_window(
-                audio_path,
-                offset_sec=before_offset_ms / 1000.0,
-                duration_sec=window_ms / 1000.0,
-                sr=config.sample_rate,
-            )
-            before = _extract_rms_mfcc(y_before, sr_before, config)
-            all_rms_samples.append(before[0])
-
         after = None
-        if has_after:
-            y_after, sr_after = load_window(
+        drum_score = None
+
+        for is_after, offset_ms, duration in (
+            (False, before_offset_ms, window_ms),
+            (True, candidate.time_ms, after_duration_ms),
+        ):
+            if (is_after and not has_after) or (not is_after and not has_before):
+                continue
+            master_y, master_sr = load_window(
                 audio_path,
-                offset_sec=candidate.time_ms / 1000.0,
-                duration_sec=after_duration_ms / 1000.0,
+                offset_sec=offset_ms / 1000.0,
+                duration_sec=duration / 1000.0,
                 sr=config.sample_rate,
             )
-            after = _extract_rms_mfcc(y_after, sr_after, config)
-            all_rms_samples.append(after[0])
+            master_energy, master_mfcc = _extract_envelope_mfcc(
+                master_y, master_sr, config
+            )
+            drum_energy = None
+            if drum_stem_path is not None:
+                drum_y, drum_sr = load_window(
+                    drum_stem_path,
+                    offset_sec=offset_ms / 1000.0,
+                    duration_sec=duration / 1000.0,
+                    sr=config.sample_rate,
+                )
+                drum_energy, _ = _extract_envelope_mfcc(drum_y, drum_sr, config)
 
-        raw.append((candidate, before, after))
+            combined_energy, aligned_drum = _fuse_energy(
+                master_energy, drum_energy, master_weight, drum_weight
+            )
+            if combined_energy.size == 0:
+                continue
+
+            # Peak picking operates on the fused vector, never on the source
+            # envelopes independently. The after peak is the telemetry frame.
+            combined_rms = float(np.mean(combined_energy))
+            feature = (combined_rms, master_mfcc)
+            if is_after:
+                after = feature
+                if aligned_drum is not None:
+                    drum_score = float(aligned_drum[int(np.argmax(combined_energy))])
+            else:
+                before = feature
+            all_rms_samples.append(combined_rms)
+
+        raw.append((candidate, before, after, drum_score))
 
     track_avg_rms = float(np.mean(all_rms_samples)) if all_rms_samples else 0.0
-
-    # Pass 2: score each candidate now that the track-wide average RMS is
-    # known, applying the anti-silence filter on top of the base score.
     scored: list[_ScoredCandidate] = []
-    status_by_beat: dict[int, str] = {}
-    for candidate, before, after in raw:
+    for candidate, before, after, drum_score in raw:
         score = None
         rms_after = after[0] if after is not None else None
         if before is not None and after is not None:
@@ -206,45 +255,28 @@ def _score_candidates(
                 rms_before, rms_after, mfcc_before, mfcc_after, config
             )
             if score.is_significant and _is_silent(rms_after, track_avg_rms):
-                logger.info(
-                    "Candidate beat=%d t=%.3fms rms_after=%.6f "
-                    "(track_avg=%.6f) -> ANTI-SILENCE OVERRIDE (was significant)",
-                    candidate.beat_index,
-                    candidate.time_ms,
-                    rms_after,
-                    track_avg_rms,
-                )
                 score = replace(score, is_significant=False)
                 status_by_beat[candidate.beat_index] = "REJECTED_SILENCE"
 
-        if score is not None:
-            if score.is_significant:
-                decision = "SIGNIFICANT"
-            else:
-                decision = "REJECTED"
-                # Only set REJECTED_THRESHOLD if not already marked as silence
-                if candidate.beat_index not in status_by_beat:
-                    status_by_beat[candidate.beat_index] = "REJECTED_THRESHOLD"
+        if score is not None and score.is_significant:
             logger.info(
-                "Candidate beat=%d t=%.3fms energy_delta_db=%.3f "
-                "timbre_distance=%.3f -> %s",
+                "Candidate beat=%d t=%.3fms fused_energy_delta_db=%.3f -> SIGNIFICANT",
                 candidate.beat_index,
                 candidate.time_ms,
                 score.energy_delta_db,
-                score.timbre_distance,
-                decision,
             )
+        elif score is not None:
+            status_by_beat.setdefault(candidate.beat_index, "REJECTED_THRESHOLD")
         else:
-            logger.info(
-                "Candidate beat=%d t=%.3fms -> REJECTED (missing %s window)",
-                candidate.beat_index,
-                candidate.time_ms,
-                "before" if before is None else "after",
-            )
             status_by_beat[candidate.beat_index] = "REJECTED_MISSING_WINDOW"
 
         scored.append(
-            _ScoredCandidate(candidate=candidate, score=score, rms_after=rms_after)
+            _ScoredCandidate(
+                candidate=candidate,
+                score=score,
+                rms_after=rms_after,
+                drum_score=drum_score,
+            )
         )
 
     return scored, status_by_beat
@@ -261,13 +293,12 @@ def _select_cues(
     All significant candidates form a single pool -- there are no more
     position-based intro/drop/outro roles. A dynamic confidence threshold
     (relative to the track's own strongest candidate) filters out weak
-    candidates, then the top ``config.max_cues`` (by confidence, ties
-    broken in favor of ``is_major_phrase``) are kept and returned in
+    then the top ``config.max_cues`` (by confidence only) are kept and returned in
     chronological order.
 
-    v1.10 outro guard: any candidate whose timestamp falls within the
-    last 8 beats of the track is rejected outright, preventing markers
-    at the silent or noise-only tail-end of a track.
+    Mechanical guards reject candidates in the first 8 beats and within
+    the last 8 beats of the track, preventing markers at the intro or
+    silent/noise-only tail-end.
 
     Returns:
         A tuple of ``(selected_events, status_by_beat_index)`` where
@@ -326,10 +357,9 @@ def _select_cues(
         )
         status_by_beat[candidate.beat_index] = "DISCARDED_LIMIT"
 
-    # Descending confidence; ties broken in favor of is_major_phrase.
-    survivors.sort(
-        key=lambda pair: (pair[1].confidence, pair[0].is_major_phrase), reverse=True
-    )
+    # Structural phase tags are retained for traceability only. They must not
+    # boost confidence or selection priority while structural scoring is paused.
+    survivors.sort(key=lambda pair: pair[1].confidence, reverse=True)
     selected = survivors[: config.max_cues]
     excluded = survivors[config.max_cues :]
     for candidate, score in excluded:
@@ -366,9 +396,12 @@ def detect_events(
     grid_anchor_ms: float,
     duration_ms: float,
     config: AppConfig | None = None,
+    drum_stem_path: str | Path | None = None,
     track_title: str = "",
     peak_db: float | None = None,
     perceived_db: float | None = None,
+    master_weight: float | None = None,
+    drum_weight: float | None = None,
 ) -> list[DetectedEvent]:
     """Run Grid-Guided Phrase Analysis end-to-end for one track.
 
@@ -413,8 +446,21 @@ def detect_events(
     if not candidates:
         return []
 
+    effective_master_weight = (
+        master_weight if master_weight is not None else config.master_weight
+    )
+    effective_drum_weight = (
+        drum_weight if drum_weight is not None else config.drum_weight
+    )
     scored, score_status = _score_candidates(
-        audio_path, candidates, bpm, duration_ms, config
+        audio_path,
+        drum_stem_path,
+        candidates,
+        bpm,
+        duration_ms,
+        config,
+        effective_master_weight,
+        effective_drum_weight,
     )
     events, select_status = _select_cues(scored, config, bpm, duration_ms)
 
@@ -430,6 +476,8 @@ def detect_events(
             all_status.get(sc.candidate.beat_index, "REJECTED_THRESHOLD"),
             peak_db,
             perceived_db,
+            sc.drum_score,
+            effective_drum_weight if drum_stem_path is not None else 0.0,
         )
         for sc in scored
     ]

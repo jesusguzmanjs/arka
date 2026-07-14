@@ -4,6 +4,7 @@ Tests for batch processing (spec section 8.3), including error isolation
 and per-track immediate writes.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,9 +13,12 @@ from cuegrid.audio.detector import DetectedEvent
 from cuegrid.core.pipeline import (
     BatchResult,
     BatchTrackResult,
+    PipelineResult,
     run_batch_pipeline,
+    serialize_gui_payload,
 )
-from cuegrid.nml.models import TempoInfo, TrackEntry
+from cuegrid.nml.constants import CueType
+from cuegrid.nml.models import CuePoint, TempoInfo, TrackEntry
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
     PlaylistNotFoundError,
@@ -23,6 +27,48 @@ from cuegrid.nml.parser import (
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 SAMPLE_COLLECTION = FIXTURES_DIR / "sample_collection.nml"
+
+
+class TestGuiPayload:
+    def test_serializes_numpy_scalars_as_native_json_values(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        entry = TrackEntry(
+            title="GUI Track",
+            artist="Test Artist",
+            location_path=str(tmp_path / "track.wav"),
+            tempo=TempoInfo(bpm=np.float32(120.0)),
+            cues=[],
+            grid_anchor_ms=np.float32(250.0),
+            duration_ms=np.float32(60_000.0),
+        )
+        result = PipelineResult(
+            entry=entry,
+            detected_events=[],
+            written_cues=[
+                CuePoint(
+                    name="Cue",
+                    type=CueType.CUE,
+                    start_ms=np.float32(250.0),
+                    hotcue=np.int64(2),
+                ),
+                CuePoint(
+                    name="Off Grid",
+                    type=CueType.CUE,
+                    start_ms=np.float32(300.0),
+                    hotcue=np.int64(3),
+                ),
+            ],
+        )
+
+        payload = json.loads(serialize_gui_payload(result, tmp_path / "track.wav"))
+
+        assert payload["bpm"] == 120.0
+        assert payload["grid_anchor_ms"] == 250.0
+        assert payload["duration_ms"] == 60_000.0
+        assert payload["cues"] == [
+            {"id": 2, "position_ms": 250.0, "is_valid": True},
+            {"id": 3, "position_ms": 300.0, "is_valid": False},
+        ]
 
 
 class TestBatchResult:
