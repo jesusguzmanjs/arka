@@ -4,11 +4,14 @@
 `AudioPlayer.vue`; the historical proposal status immediately below is no
 longer authoritative.
 
-Status: Proposed v1.5 — architecture only, not yet implemented
-(v1.5 adds the mandatory post-operation synchronization loop and
+Status: Current implementation contract, synchronized 2026-07-16.
+(v1.7 adds manual snapped HotCue creation and local deletion through §3.9,
+§3.11, and §3.13; v1.6 adds §0.5.1/§3.14's explicit Grid Edit Mode, safe grid-anchor
+editing, linked cue-shift option, playhead action, and required tooltips;
+v1.5 adds the mandatory post-operation synchronization loop and
 `resetPlayerState()` sanitization contract for every asynchronous NML
-mutation; v1.3 adds §3.13's Delete Cue context-menu action with persistent
-sidecar deletion, optimistic state/UI updates, and rollback; v1.2's
+mutation; v1.3 adds §3.13's Delete Cue context-menu action (whose immediate
+sidecar-deletion behavior is superseded by v1.7); v1.2's
 §3.9's 8 virtual HotCue pads, §3.10's momentary cue behavior for
 pad/keyboard triggers, §3.11's global keyboard shortcut mapping, and
 §3.12's relative beat-jump mechanics; v1.1's
@@ -27,7 +30,7 @@ here in §3.9–§3.12)
 > supersede any conflicting legacy Wavesurfer/Regions-plugin wording in this
 > document. The player library is definitively **Peaks.js**.
 
-## Current implementation synchronization (2026-07-13)
+## Current implementation synchronization (2026-07-15)
 
 The checked-out `AudioPlayer.vue` implementation supersedes legacy wording in
 this document that refers to Wavesurfer, Regions, blue/green stage colors,
@@ -42,8 +45,8 @@ rendering state.
   `call_cuegrid_core` resource bridge. The response supplies BPM, grid anchor,
   optional duration, existing cues, int8 waveform peaks, and HPSS color data.
   After a successful analysis run, the player reconciles cue-written log
-  entries for the current track; manual drag changes remain local until **Save
-  Changes** calls `--update-cues`.
+  entries for the current track; manual drag and BPM changes remain local until
+  **Save Changes** calls `--update-cues`.
 - The CSS-mask color layer is synchronized by `syncZoomGradientLoop()` while
   Peaks.js supplies the white waveform silhouette. The same loop performs
   fractal grid LOD; Konva marker destruction removes retained line references
@@ -54,23 +57,25 @@ rendering state.
   amber/ochre hex values for Peaks/Konva drawing.
 - The eight virtual pads are derived by `padSlots`, a computed array of
   exactly eight positions. Array index `N - 1` is always NML `HOTCUE` id
-  `N - 1`; an empty NML slot remains an explicit disabled pad and never causes
-  later cues to shift left.
+  `N - 1`; an empty slot remains an explicit `null` hole and never causes
+  later cues to shift left. Empty slots are create targets; populated slots
+  are momentary-preview targets.
 - `activePad` is reactive hardware-feedback state. Pressing a valid pad sets
   it, the active class uses a bright accent, scale/inner-shadow treatment,
   and release clears it. `endCuePreview` returns early unless the releasing
   pad is the currently active pad, preventing mouse-leave panic behavior.
 - Global keyboard handlers bail out through `isFocusedOnInput()` before
   handling Space, Enter, or digit keys `1`-`8`; digit keydown also ignores
-  `event.repeat`. This prevents search and text fields from triggering player
-  shortcuts.
+  `event.repeat`. An unmodified digit previews a populated slot or creates
+  its empty slot, while `Shift + digit` deletes a populated slot. This prevents
+  search and text fields from triggering player shortcuts.
 - The cue deletion menu is a separate `CueContextMenu.vue` component with
   `x`, `y`, and `visible` props and `close`/`delete` emits. Pad mouse events
   use `.left` and `.prevent` modifiers, while the context-menu event uses
   `@contextmenu.prevent`, keeping playback and menu event paths separate.
   The current handler removes the selected cue from local `cueState`, marks
-  the player dirty, and closes the menu; the sidecar composable also exposes
-  the authoritative `--delete-cue` operation for physical NML deletion.
+  the player dirty, re-renders the Konva markers, and closes the menu. The
+  complete edited cue list is persisted only through **Save Changes**.
 
 ### Modular player architecture contract (2026-07-14, authoritative)
 
@@ -89,6 +94,7 @@ gui/src/
     AudioPlayer.vue          # orchestration and persistence boundary
     PlayerHeader.vue         # metadata/countdown/cue counters
     PlayerTransport.vue      # transport controls and eight cue pads
+    PlayerGridControls.vue   # grid-edit mode, shift-mode, anchor controls
     PlayerWaveform.vue       # Peaks DOM shell, mask, resize ownership
   composables/
     useGridMath.ts           # pure, framework-free beat-grid math
@@ -136,9 +142,15 @@ second RAF loop is prohibited. The gradient consumes only precomputed
 `color_map`; browser frequency analysis remains prohibited by §0.6.
 
 `usePlayerKeyboard.ts` exports `isFocusedOnInput()` and accepts transport
-callbacks (`togglePlay`, `stop`, `hasPad`, `previewStart`, `previewEnd`). It
-binds `window` `keydown`/`keyup` in `onMounted` and unbinds the same functions
-in `onBeforeUnmount`, retaining the input-safe behavior in §3.11.
+callbacks (`togglePlay`, `stop`, `getPad`, `previewStart`, `previewEnd`,
+`createCue`, `deleteCue`). `getPad(N)` returns the current `PlayerCue | null`
+for the 1-indexed pad. On a non-repeating digit keydown, the composable must
+dispatch `deleteCue(N - 1)` for `Shift + N` when populated, `previewStart(N)`
+for an unmodified populated pad, or `createCue(N)` for an unmodified empty
+pad; it must retain preview-start state so keyup calls `previewEnd(N)` only
+for a preview it started. It binds `window` `keydown`/`keyup` in `onMounted`
+and unbinds the same functions in `onBeforeUnmount`, retaining the input-safe
+behavior in §3.11.
 
 #### Presentational component contracts
 
@@ -161,6 +173,7 @@ interface PlayerTransportProps {
 type PlayerTransportEmits = {
   play: []; stop: []; jump: [padIndex: number];
   previewStart: [padIndex: number]; previewEnd: [padIndex: number];
+  create: [padIndex: number];
   // Required only to preserve the local delete UI in §3.13.
   contextMenu: [event: MouseEvent, cue: PlayerCue];
 };
@@ -173,17 +186,37 @@ interface PlayerWaveformProps {
 type PlayerWaveformEmits = {
   resize: []; wheel: [event: WheelEvent]; zoomIn: []; zoomOut: [];
 };
+
+// PlayerGridControls.vue
+type GridEditShiftMode = "grid-only" | "grid-and-cues";
+interface PlayerGridControlsProps {
+  hasTrack: boolean; isGridEditMode: boolean;
+  shiftMode: GridEditShiftMode;
+}
+type PlayerGridControlsEmits = {
+  toggleGridEdit: []; setShiftMode: [mode: GridEditShiftMode];
+  nudge: [deltaMs: number]; setToPlayhead: [];
+};
 ```
 
 `PlayerHeader.vue` renders only the already-derived metadata, BPM, remaining
 time, and counters from §3.6. `PlayerTransport.vue` emits `play`, `stop`,
-`jump`, `preview-start`, and `preview-end` to the orchestrator and owns no
-playback state. Its narrowly scoped `context-menu` emit is the sole exception
-needed for the existing §3.13 local cue-delete command. `PlayerWaveform.vue`
+`jump`, `preview-start`, `preview-end`, and `create` to the orchestrator and
+owns no playback state. It emits `create` only for a primary activation of an
+empty slot; populated slots retain the preview emits. Its narrowly scoped
+`context-menu` emit is the sole exception needed for the existing §3.13 local
+cue-delete command. `PlayerWaveform.vue`
 contains the raw overview/zoomview divs and absolute clipping-mask/gradient
 shell. It owns its `ResizeObserver` and window `resize` binding, debounces the
 `resize` emit by 100 ms, and exposes only the four element handles needed to
 initialize Peaks and the §0.7 synchronizer; it must not create Peaks itself.
+
+`PlayerGridControls.vue` is the sole presentational owner of the Grid Edit
+controls specified in §3.14. It emits intent only; `AudioPlayer.vue` owns the
+grid-anchor/cue mutation, clamping, dirty-state transition, and marker
+repaint. It must use native `<button>` controls for the mode toggle, both
+shift-mode choices, each nudge, and **Set Grid to Playhead**. Each of those
+buttons/toggles must have the descriptive `title` text required by §3.14.5.
 
 The shared `usePlayerState().isLoadingTrack` concurrency lock remains the
 single source of truth required by §3.7. Refactoring may not replace it with a
@@ -213,9 +246,9 @@ This document is the binding technical specification for the GUI Audio Player:
 waveform player and beatgrid visualizer embedded in the existing CueGrid
 GUI, giving the user a visual preview of a track's existing HotCues
 *before* running analysis, a live repaint of the newly injected HotCues
-immediately *after* a successful "Analyze & Inject" run, and a
-persistent Delete Cue action for removing one existing HotCue from the
-underlying NML. Per `CLAUDE.md`, no implementation should begin until this
+immediately *after* a successful "Analyze & Inject" run, and local manual
+HotCue creation/deletion that is persisted only through **Save Changes**.
+Per `CLAUDE.md`, no implementation should begin until this
 contract is reviewed and this Status line is updated to "Resolved".
 
 This spec **extends, but does not modify**, `2-core-spec.md` and
@@ -267,6 +300,10 @@ field, `CueGridConfig` field, or NML read/write behavior changes.
   with `editable: false`; it must not be made draggable by a UI affordance.
 - Marker editability is determined from the cue's grid validity, not from
   whether the cue happens to have a Hotcue pad number.
+- A manually created HotCue is always bound to one of the eight fixed NML
+  `HOTCUE` ids (`0`–`7`) and is represented in `cueState` as a valid `PlayerCue`.
+  It is rendered through the same Konva marker path as an existing cue; no
+  second marker collection is permitted for manually created cues.
 
 ### 0.4 Snap-to-grid drag logic
 
@@ -283,13 +320,38 @@ field, `CueGridConfig` field, or NML read/write behavior changes.
   position before this quantization step.
 - Off-grid cues are locked and therefore have no drag or snap path.
 
+### 0.4.1 Snap-to-grid manual cue creation
+
+Manual cue creation uses the exact same beat-grid math as a valid cue drag;
+it must never use the unsnapped playhead position as a stored cue position.
+
+- Let `playhead_ms` be the current playhead time in milliseconds, `bpm` the
+  loaded track BPM, and `grid_anchor_ms` the loaded track grid anchor. The
+  player must calculate:
+
+  `beat_ms = 60_000 / bpm`
+
+  `snapped_ms = grid_anchor_ms + round((playhead_ms - grid_anchor_ms) / beat_ms) * beat_ms`
+
+- `snapToGrid(playhead_ms, bpm, grid_anchor_ms)` from `useGridMath.ts` is the
+  required shared implementation of this equation. Creation is rejected when
+  BPM, grid anchor, playhead, or the calculated value is non-finite, when BPM
+  is not greater than zero, or when `snapped_ms` falls outside the loaded
+  track duration. The implementation must not repair an out-of-range result
+  by clamping it to an arbitrary non-grid millisecond value.
+- On success, the created cue's `position_ms` is exactly `snapped_ms` and its
+  `is_valid` value is `true`. The cue is therefore mathematically on the
+  current beat grid from the instant it enters state.
+
 ### 0.5 Dirty state and persistence boundary
 
-- Repositioning a Hotcue updates GUI state only. It must **not** trigger a
-  live disk write to Traktor's `collection.nml` through the Rust backend.
+- Repositioning, creating, or deleting a Hotcue updates GUI state only. None
+  of these actions may trigger a live disk write to Traktor's
+  `collection.nml` through the Rust backend.
 - The player state must expose a boolean `hasUnsavedChanges`. It becomes
-  `true` after a successful local cue reposition and remains true until an
-  explicit save succeeds or the user discards/reloads the edits.
+  `true` after a successful local cue reposition, creation, or deletion and
+  remains true until an explicit save succeeds or the user discards/reloads
+  the edits.
 - While `hasUnsavedChanges` is true, the GUI must show a prominent
   **Save Changes** button. Save is an explicit user action and is the only
   path in this phase that may request persistence through the Rust/Tauri
@@ -297,6 +359,107 @@ field, `CueGridConfig` field, or NML read/write behavior changes.
 - A failed save must preserve the dirty state and the locally edited cue
   positions so the user can retry; a successful save clears the flag only
   after the backend confirms completion.
+- The save payload always contains the current local HotCue positions. If the
+  editing session changed `grid_anchor_ms`, it must also pass that finite,
+  non-negative value as the optional `gridAnchorMs` argument to
+  `useCueGridSidecar().updateTrackCues()`. The bridge serializes it as
+  `--grid-anchor <ms>` alongside `--update-cues`; the core persists the cues
+  and the single NML Grid marker in one atomic operation. A cue-only session
+  omits `gridAnchorMs` and must not alter the stored Grid marker.
+
+### 0.5.2 BPM adjustment and persistence boundary
+
+`AudioPlayer.vue` exposes two local BPM actions for the loaded track: halve
+the BPM (`/2`) and double the BPM (`x2`). Let `current_bpm` be the local BPM
+and let `MIN_BPM = 50` and `MAX_BPM = 200`. An action is permitted only when
+its result satisfies the inclusive constraint:
+
+```text
+MIN_BPM <= next_bpm <= MAX_BPM
+```
+
+The frontend state must reject an action whose result is outside `[50, 200]`
+before mutating `TrackData.bpm`, setting dirty state, or invoking the Tauri
+bridge. The state must also reject non-finite BPM values. A blocked action is
+a no-op and must not repaint the waveform.
+
+On every successful track load or force-read, `AudioPlayer.vue` sets
+`savedBpm` to the BPM returned by the metadata response and initializes the
+local current BPM from the same value. `hasBpmChanges` is computed from the
+local current BPM and `savedBpm`; it is `false` immediately after load and
+after a successful save. Changing the local BPM sets `hasBpmChanges = true`
+and contributes to `hasUnsavedChanges = true`. Reverting to `savedBpm` clears
+only the BPM portion of the dirty state; `hasUnsavedChanges` remains true when
+cue or grid edits are still pending.
+
+After an accepted `/2` or `x2` action, the player must repaint the Peaks.js
+grid projection immediately. The repaint must rebuild the beat and bar lines
+from the new local BPM and existing grid anchor so the visible spacing and
+grid-line positions reflect the edited tempo. The audio file and cue
+timestamps are not rewritten by the local action; persistence occurs only on
+explicit **Save Changes**.
+
+When saving, `AudioPlayer.vue` passes the current BPM as the optional
+`newBpm` argument to `useCueGridSidecar().updateTrackCues()` only when
+`hasBpmChanges` is true. A failed save preserves `savedBpm`, the edited local
+BPM, `hasBpmChanges`, and `hasUnsavedChanges` for retry. After the successful
+post-save force read, the returned BPM becomes the new `savedBpm`.
+
+The component-local state has this minimum shape:
+
+```ts
+const savedBpm = ref<number | null>(null)
+const hasBpmChanges = computed(
+  () => savedBpm.value !== null && trackData.value.bpm !== savedBpm.value,
+)
+```
+
+The track-load handler assigns `savedBpm.value = metadata.bpm` before the
+first grid paint. `hasUnsavedChanges` must include `hasBpmChanges` together
+with pending cue and grid edits; it must not be derived from the metadata
+object after that object has been loaded.
+
+### 0.5.1 Grid Edit Mode, linked shifting, and safety boundary
+
+Grid correction is a deliberate editing workflow, separate from normal cue
+editing. Its state belongs to the local player editing session and is never
+inferred from a drag gesture.
+
+- `isGridEditMode: boolean` defaults to `false` when a track is loaded,
+  reloaded, or player state is reset (§3.4/§4.1). The UI provides an explicit
+  toggle for this state.
+- When `isGridEditMode === false`, the beat-grid projection remains
+  non-draggable (§0.2), the normal grid-anchor line remains non-draggable,
+  and standard HotCue rendering/editability follows §0.3–§0.4 unchanged.
+- When `isGridEditMode === true`, the player renders one distinct **Grid
+  Anchor** marker at the current `grid_anchor_ms`. This marker is draggable;
+  it is not a HotCue, has no HotCue id/label, and must never be passed to a
+  HotCue create/delete path (§1.3, §3.13, §5.2). Standard HotCue markers are
+  visually subdued to exactly **30% opacity**. Their data and physical
+  locations are otherwise unchanged by entering or leaving the mode.
+- The Grid Edit UI has one explicit, mutually exclusive shift-mode choice.
+  `"grid-only"` is the required default on every entry into Grid Edit Mode;
+  `"grid-and-cues"` is selected only by a direct user toggle. The selected
+  state must be visually unambiguous; it must not be hidden behind a modifier
+  key or chosen automatically from the size/direction of an edit.
+- A Grid Anchor drag, a nudge control, and **Set Grid to Playhead** (§3.14)
+  all call the same anchor-shift operation. That operation uses the resulting
+  requested anchor time to calculate one millisecond delta, applies the
+  §3.14.3 clamp, then repaints the grid/anchor and affected cue markers from
+  the resulting state. It must not accumulate independently rounded deltas.
+- **Grid Only:** the applied delta changes only `grid_anchor_ms`; every
+  existing cue retains its exact `position_ms`. This is the default and is
+  intended for macro/downbeat correction.
+- **Grid + Cues:** the applied delta changes `grid_anchor_ms` and every
+  existing cue's `position_ms` by that same exact millisecond delta. This
+  linked behavior is intended for micro/phase correction. It applies to all
+  existing cues, including unbound and currently non-draggable cues (§0.3),
+  because it is a coordinate translation rather than a HotCue drag.
+- A successful local grid-anchor adjustment, including an adjustment that
+  also translates cues, sets `hasUnsavedChanges = true` and follows the same
+  explicit Save Changes, failure-retention, discard/reload rules in §0.5.
+  Entering Grid Edit Mode, changing its shift-mode selection, or issuing an
+  action whose clamped applied delta is `0` must not mark the player dirty.
 
 ### 0.6 Cross-boundary spectrum rendering (“God Mode”)
 
@@ -412,10 +575,13 @@ In scope:
    boundary clamping and no-op safety (section 3.12).
 
 Out of scope (deferred to a future spec revision):
-- Manual hotcue creation remains out of scope. Valid existing Hotcues may be
-  repositioned by the constrained drag-and-snap interaction in the Phase 1
-  amendment (§0.3–§0.5); off-grid cues remain locked. The explicitly
-  permitted Delete Cue context-menu action is specified in §3.13.
+- Arbitrary waveform-surface cue creation remains out of scope. Manual
+  HotCue creation is limited to empty pads and their `1`–`8` keyboard
+  equivalents (§3.10.1/§3.11), and must use the grid snap in §0.4.1.
+  Valid existing HotCues may be repositioned by the constrained drag-and-snap
+  interaction in the Phase 1 amendment (§0.3–§0.5); off-grid cues remain
+  locked. The permitted context-menu and keyboard delete actions are specified
+  in §3.13/§3.11.
 - Zooming/scrubbing UX polish, or playback transport beyond the
   explicitly specified pads/keyboard contract in sections 3.9–3.12
   (left fully to implementation time as long as section 3's contract
@@ -426,8 +592,9 @@ Out of scope (deferred to a future spec revision):
 - Any change to `core.pipeline`, audio analysis, or the existing
   `CUE_V2` analysis-write contract (`2-core-spec.md` sections 3–8), except
   for the Phase 1 frequency-visualization export defined in
-  `2-core-spec.md` §2.3.1. Delete Cue is the separately specified
-  single-cue mutation in `2-core-spec.md` section 13.
+  `2-core-spec.md` §2.3.1. The core may expose its separately specified
+  single-cue deletion capability, but this player's manual edit path persists
+  its complete cue set through `--update-cues` on explicit Save Changes.
 
 ---
 
@@ -830,10 +997,12 @@ configured **read-only**:
   (`start === end`) created with `drag: false` and `resize: false`.
 - No `region-updated`/`region-created`/click-to-add-region handlers are
   ever wired up. The canvas is purely a visualization surface.
-- No double-click-to-add-cue, no keyboard shortcut for inserting a
-  marker, and no drag/resize editing. A custom context menu is permitted
-  only for the explicitly specified **Delete Cue** action in §3.13; it
-  must not turn the waveform canvas into a generally editable surface.
+- No double-click-to-add-cue, no waveform-canvas keyboard shortcut for
+  inserting a marker, and no drag/resize editing. The pad/keyboard creation
+  commands specified in §3.10.1/§3.11 are the sole exception. A custom
+  context menu is permitted only for the explicitly specified **Delete Cue**
+  action in §3.13; it must not turn the waveform canvas into a generally
+  editable surface.
 
 ### 3.6 Header time indicators
 
@@ -967,24 +1136,18 @@ momentary cue-audition behavior.
   `N = hotcue + 1` convention already used for point-region labels in
   §5.2. This is the same mapping native Traktor hardware uses: pressing
   physical pad 1 fires the cue stored at `HOTCUE="0"`.
-- **Per-pad enabled state — strict contract:** a pad button is **active
-  and clickable if and only if** the loaded track has a valid, bound
-  HotCue for that pad index in `usePlayerState().metadata.existing_cues`
-  (§6) — i.e. there exists an `ExistingCue` whose `hotcue === padIndex -
-  1` (where `padIndex` is the 1-indexed pad number). Unmapped pads must
-  render in a **disabled, translucent, non-clickable** state (`disabled`
-  attribute, reduced opacity, `cursor-not-allowed`, no pointer event
-  handlers firing). This is a hard contract, not a styling suggestion:
-  an unmapped pad must never trigger §3.10's momentary behavior under
-  any mouse or keyboard input.
-- **Source of truth for the bound-cue lookup:** the same
-  `usePlayerState().metadata.existing_cues` array that §4.1/§4.2 already
-  build the canvas markers from. The pad row is therefore a second
-  projection of the *same* cue data — it never carries its own
-  independent copy of the cue list, and it re-renders automatically
-  whenever the Stage 1 → Stage 2 transition (§4.2) replaces the cue
-  array. No new state slice is introduced for pad enabled/disabled
-  state; it is always derived.
+- **Per-pad state — strict contract:** a pad button is enabled whenever a
+  track is loaded and `isLoadingTrack` is false. Its state is derived only
+  from `padSlots`: a populated slot (`PlayerCue` at `padSlots[N - 1]`) is a
+  momentary-preview target; an empty slot (`null`) is a create target. Empty
+  pads must remain visibly distinguishable from populated pads, but they are
+  not disabled and must accept the primary-click creation action in §3.10.1.
+- **Source of truth for the bound-cue lookup:** `cueState`, projected through
+  `padSlots`, is the only source for pad state and Konva cue markers during an
+  editing session. Metadata is used to initialize/rebuild `cueState` on a
+  fresh track load (§4.1/§4.2), but the template must not derive pad state
+  directly from `metadata.existing_cues`, because local create/delete edits
+  must appear before Save Changes. No independent per-pad state is permitted.
 - **Visual mapping to canvas markers:** when a pad is enabled, its
   number visually corresponds to the same-numbered point-region label
   on the waveform canvas (§5.2's bare-`N` label). This is intentional:
@@ -993,16 +1156,15 @@ momentary cue-audition behavior.
   them as the same hotcue. The pad does **not** render the cue's
   `name` (e.g. `"Drop"`) on its face — only its number — matching the
   canvas's own bare-number minimalism.
-- **Interaction with `isLoadingTrack` (§3.7):** while
-  `isLoadingTrack` is `true`, **all 8 pads** render disabled regardless
-  of bound-cue state, since no track is reliably loaded to seek within.
-  This is consistent with the broader concurrency lock: the transport
-  row as a whole is non-interactive during a load.
+- **Interaction with `isLoadingTrack` (§3.7):** while `isLoadingTrack` is
+  `true`, or when no track is loaded, **all 8 pads** render disabled. This is
+  the only disabled-pad state; once a track is ready, empty and populated slots
+  are both actionable according to their respective contracts.
 
 ### 3.10 Momentary Cue Behavior (Pads Interaction)
 
 **Traktor-style momentary cueing** is the mandated interaction model
-for both mouse and keyboard triggers of the §3.9 pads. This is the
+for mouse and keyboard triggers of populated §3.9 pads. This is the
 same ergonomics native Traktor hardware uses: holding a pad down
 auditions the cue's position in real time, and releasing it stops
 playback — the cue is *not* a "jump and continue playing" action.
@@ -1052,12 +1214,29 @@ playback — the cue is *not* a "jump and continue playing" action.
   mandates only that the *observable behavior* is identical, not the
   internal factoring.
 - **Disabled-pad safety:** if a pad is disabled per §3.9's contract
-  (no bound cue, or `isLoadingTrack` is true), neither the mouse nor
+  (no loaded track or `isLoadingTrack` is true), neither the mouse nor
   the keyboard trigger may fire §3.10's seek/play logic. The keyboard
-  handler must re-check the pad's enabled state at `keydown` time
-  (not assume the listener was only bound when enabled), since the
-  global keyboard layer (§3.11) is registered once and dispatches by
-  key, not per-pad.
+  handler must re-check the pad state at `keydown` time (not assume the
+  listener was only bound when enabled), since the global keyboard layer
+  (§3.11) is registered once and dispatches by key, not per-pad.
+
+### 3.10.1 Empty-pad creation interaction
+
+Primary-clicking an empty pad creates its cue; it does not start momentary
+playback. A populated pad retains the §3.10 press/release behavior unchanged.
+
+1. Resolve the clicked 1-indexed pad `N` to `id = N - 1`. If `padSlots[N - 1]`
+   is populated, route the event exclusively to §3.10's preview path.
+2. If the slot is empty, read the current playhead, calculate `snapped_ms`
+   with §0.4.1, and append exactly `{ id, position_ms: snapped_ms,
+   is_valid: true }` to `cueState`. A slot that became populated between event
+   dispatch and commit must not be overwritten; treat that race as a no-op.
+3. After a successful append, set `hasUnsavedChanges = true` and invoke the
+   canonical Konva marker rebuild/render path. The `padSlots` computed
+   projection must then show the newly populated pad immediately.
+4. A failed validation or snap is a no-op: it must not add a cue, dirty the
+   player, or render a marker. The UI may report the reason, but must not
+   create an off-grid fallback cue.
 
 ### 3.11 Global Keyboard Shortcuts Mapping
 
@@ -1065,10 +1244,11 @@ playback — the cue is *not* a "jump and continue playing" action.
 
 The current handler checks `isFocusedOnInput()` from `document.activeElement`
 before any shortcut logic and returns for `event.repeat` on keydown. It maps
-Space to `togglePlay`, Enter to `stop`, and top-row digit keys `1`-`8` to
-`startCuePreview`/`endCuePreview`. The current implementation does not use
-the obsolete `targetType` fields; the loaded track comes from the selected
-library path or the optional `trackPath` prop.
+Space to `togglePlay`, Enter to `stop`, and top-row digit keys `1`-`8` by
+slot state: preview a populated slot, create an empty slot, or (with Shift)
+delete a populated slot. The current implementation does not use the obsolete
+`targetType` fields; the loaded track comes from the selected library path or
+the optional `trackPath` prop.
 
 A **global keyboard shortcut layer** is registered on `window` (not
 on the pad elements themselves), so the §3.9 pads are operable without
@@ -1087,14 +1267,23 @@ focus, matching native Traktor hardware's always-on pad behavior.
   the `event.repeat` check (§3.10) and before any pad-enabled-state
   lookup, so input typing never even reaches pad logic.
 - **Mappings (exact contract):**
-  - **Keys `1` through `8`** → map to HotCue Pads 1 to 8, with the
-    **exact same momentary press/release playback behavior** defined in
-    §3.10. `keydown` fires `pressPad(N)` (guarded by `event.repeat`);
-    `keyup` fires `releasePad(N)`. The `event.key` string is matched
-    against `"1"`..`"8"` (not `event.code`'s `Digit1`..`Digit8`), so
-    the mapping is layout-agnostic for top-row digit keys on common
-    layouts; numpad digits are intentionally *not* mapped (they would
-    collide with existing accessibility/numeric-entry expectations).
+  - **Keys `1` through `8`** → map to HotCue Pads 1 to 8. On an
+    unmodified, non-repeating `keydown`, resolve `N` through `padSlots`:
+    populated means `pressPad(N)` and the §3.10 momentary preview; empty means
+    `createCue(N)` and the §3.10.1 snapped creation flow. On `keyup`, call
+    `releasePad(N)` only if that keydown started a preview; creating a cue has
+    no release action and must not pause playback.
+  - **`Shift + [1–8]`** → delete the cue bound to the corresponding slot. On
+    the non-repeating `keydown`, resolve `N` through `padSlots`; populated
+    means `deleteCue(N - 1)`, empty means no-op. This path must not seek, play,
+    or pause, and `keyup` has no action. It uses the same local deletion
+    operation as the context menu (§3.13), so it updates `cueState`, marks the
+    player dirty, and re-renders Konva markers identically.
+  - The `event.key` string is matched against `"1"`..`"8"` (not
+    `event.code`'s `Digit1`..`Digit8`), so the mapping is layout-agnostic for
+    top-row digit keys on common layouts; numpad digits are intentionally not
+    mapped (they would collide with existing accessibility/numeric-entry
+    expectations).
   - **Key `Space`** → toggles standard Play/Pause playback state
     (i.e. `wavesurfer.isPlaying() ? wavesurfer.pause() :
     wavesurfer.play()`). This is a **toggle**, not momentary: pressing
@@ -1137,54 +1326,32 @@ must remain left-button-only (`.left`) and must use `.prevent` where the
 player starts a momentary preview; context-menu handling must not share that
 playback path or create an `AbortError` race.
 
-The player exposes a custom context menu for an existing cue marker. The
-menu contains **Delete Cue** only when the marker represents a deletable
-standard HotCue (`ExistingCue.hotcue >= 0`, corresponding to an NML
-`TYPE="0"` cue). Grid anchors and other non-standard cue types have no
-Delete Cue action.
+The player exposes a custom context menu for a cue marker. The menu contains
+**Delete Cue** only when the marker represents a bound standard HotCue
+(`PlayerCue.id` in `0`–`7`, corresponding to an NML `TYPE="0"` cue). This
+includes manually created cues. Grid anchors and other non-standard cue types
+have no Delete Cue action.
 
-When the user clicks **Delete Cue**, the frontend must:
+Both the context-menu action and `Shift + [1–8]` (§3.11) invoke the same
+local `deleteCue(id)` operation. It is an editing action, not an immediate
+NML mutation.
 
-1. Capture the complete `ExistingCue` object and its Wavesurfer region
-   reference before changing anything. The cue's `hotcue` value is the
-   NML zero-based index and is passed unchanged.
-2. Immediately remove that cue from `metadata.value.existing_cues` and
-   remove the corresponding point region from Wavesurfer. The pad
-   enabled/disabled projection must update from that same array, so the
-   deleted pad becomes disabled immediately.
-3. Invoke `useCueGridSidecar` (or a dedicated delete-sidecar composable)
-   with the deletion operation and the loaded track identifier, using
-   the core contract exactly:
-   ```ts
-   Command.sidecar(SIDECAR_NAME, [
-     trackPath,
-     "--delete-cue",
-     String(cue.hotcue),
-     ...(nmlPath ? ["--nml", nmlPath] : []),
-     ...(artist ? ["--artist", artist] : []),
-     ...(title ? ["--title", title] : []),
-   ])
-   ```
-   The implementation may use an equivalent argument order, but it must
-   pass `TRACK_PATH` and `--delete-cue HOTCUE_INDEX`; it must not invoke a
-   visual-only hide or mutate only a local marker collection.
-4. Treat process exit code `0` as committed. On success, keep the cue
-   removed and update the shared metadata/state and marker list as the
-   current NML truth.
-5. If the sidecar exits with any non-zero code, rejects, or cannot be
-   spawned, restore the captured cue at its original array position and
-   restore/recreate its Wavesurfer region with its original stage color,
-   label, and metadata. The rollback must also restore the pad's enabled
-   state.
-6. On failure, show a user-visible error notification and append an
-   actionable error to the existing run/telemetry log. The error must
-   identify that NML deletion failed; a silent rollback is not compliant.
+1. Resolve the selected cue's zero-based `id`. If `cueState` does not contain
+   that id, the request is a no-op.
+2. Remove the cue from `cueState`, set `hasUnsavedChanges = true`, and invoke
+   the canonical Konva marker rebuild/render path. `padSlots` must
+   immediately expose `null` at that id, so the pad becomes an empty creation
+   target rather than a disabled control.
+3. Do not invoke `--delete-cue` or any other sidecar write from deletion.
+   The user must explicitly choose **Save Changes**; that operation persists
+   the full current `cueState` through `updateTrackCues` (§0.5).
+4. If the action is invoked from the context menu, close the menu after the
+   local state transition. The menu remains available for mouse users; the
+   keyboard shortcut is an additional path, not a replacement.
 
-The delete request is single-flight per cue: disable its menu action while
-pending, ignore duplicate clicks, and associate the response with the
-captured track/token so a late response cannot restore a cue on a
-subsequently loaded track. A successful deletion must not trigger a full
-waveform reload; the marker overlay and shared metadata are sufficient.
+The operation is idempotent within an editing session. Track reload, discard,
+or failed Save Changes follows §0.5's existing state-retention/rebuild rules;
+a local deletion is not rolled back merely because it has not yet been saved.
 
 ### 3.12 Relative Beat-Jump Mechanics
 
@@ -1247,6 +1414,96 @@ beat-relative seek native Traktor hardware exposes on its jog wheel.
   The input-focus guard from §3.11 still applies: arrow keys pressed
   while focused on an input element must not trigger a jump (they
   should move the text cursor as normal).
+
+### 3.14 Grid Edit Controls and Anchor-Shift Algorithm
+
+This section implements the Grid Edit behavior defined by §0.5.1. It is a
+local editing interaction; it does not perform a disk write as part of drag,
+nudge, or playhead actions (§0.5).
+
+#### 3.14.1 Required controls and availability
+
+For a loaded track, the player must expose:
+
+1. A clearly labeled **Grid Edit Mode** toggle for `isGridEditMode`.
+2. While Grid Edit Mode is active, a clearly visible, explicit two-choice
+   toggle: **Grid Only** and **Grid + Cues**. **Grid Only** is selected by
+   default each time Grid Edit Mode is entered (§0.5.1).
+3. Grid-anchor nudge controls, if nudging is provided by the player UI.
+4. A **Set Grid to Playhead** action that requests the current playback time
+   as the new anchor time. It is available only when a track is loaded and
+   Grid Edit Mode is active; it must not silently move the grid from an
+   ordinary playback/transport action.
+
+The Grid Anchor marker is draggable only while Grid Edit Mode is active.
+Dragging it when inactive is prohibited rather than treated as an implicit
+mode switch.
+
+#### 3.14.2 Single anchor-shift operation
+
+Let `A` be the current `grid_anchor_ms`, `R` the requested anchor time, and
+`requestedDelta = R - A`. For a drag, `R` is the drag-end time; for a nudge,
+`R = A + nudgeDelta`; for **Set Grid to Playhead**, `R` is the current
+playhead time in milliseconds. The operation computes `appliedDelta` using
+§3.14.3, then commits exactly:
+
+```ts
+nextAnchorMs = A + appliedDelta;
+nextCueMs = cue.position_ms + appliedDelta; // only in "grid-and-cues" mode
+```
+
+The player must use `appliedDelta`, not `requestedDelta`, for both the anchor
+and linked cue translation. Thus a safety clamp never separates a cue from
+the grid by applying a different delta to each. Normal cue drag snapping
+remains governed by §0.4 and is not repurposed for grid-anchor correction.
+
+#### 3.14.3 Non-negative-time clamp
+
+`grid_anchor_ms` must never be less than `0`. In `"grid-only"` mode, the
+minimum permitted delta is `-A`. In `"grid-and-cues"` mode, it is the more
+restrictive lower bound needed to preserve the anchor and every cue:
+
+```ts
+const minimumDelta = Math.max(
+  -A,
+  ...cues.map((cue) => -cue.position_ms),
+);
+const appliedDelta = Math.max(requestedDelta, minimumDelta);
+```
+
+For an empty cue set, `minimumDelta` is simply `-A`. This clamp is applied
+before any reactive state or marker update. It ensures `nextAnchorMs >= 0`
+and, in `"grid-and-cues"` mode, `nextCueMs >= 0` for every existing cue. A
+request that is clamped to the existing state is a no-op and does not set
+`hasUnsavedChanges` (§0.5.1). The clamp applies equally to leftward drags,
+negative nudges, and playhead actions.
+
+#### 3.14.4 Set Grid to Playhead semantics
+
+**Set Grid to Playhead** uses the exact current playback position at action
+time, converted to milliseconds, as `R` in §3.14.2. It is not a beat snap and
+must not quantize the playhead before the shift operation. Consequently,
+**Grid Only** moves only the anchor to the safely clamped playhead request,
+whereas **Grid + Cues** translates the anchor and every existing cue by the
+same safely clamped delta.
+
+#### 3.14.5 Tooltip/accessibility contract
+
+Every grid-related button or toggle implements a descriptive native `title`
+attribute. At minimum, the title text must communicate these semantics:
+
+| Control | Required `title` meaning |
+|---|---|
+| Grid Edit Mode | Enables or disables editing the Grid Anchor. |
+| Grid Only | Moves only the Grid Anchor; existing cues stay in place. |
+| Grid + Cues | Moves the Grid Anchor and every existing cue together. |
+| Nudge earlier/later | Moves the Grid Anchor by the displayed nudge amount and states whether cues move according to the selected shift mode. |
+| Set Grid to Playhead | Sets the Grid Anchor to the current playhead using the selected shift mode. |
+
+Titles may be localized, but they must preserve the stated behavioral
+distinction; generic text such as `"Grid"`, `"Edit"`, or `"Nudge"` alone is
+insufficient. Tooltips do not replace the visible labels and selected-state
+indication required by §3.14.1.
 
 ---
 
@@ -1373,7 +1630,7 @@ completed run may have modified the NML for the currently loaded track.
 The synchronization source is always the disk-backed metadata query, not
 `useRunState().logs` or an optimistic Vue collection. Any asynchronous
 backend operation that modifies the `.nml` — including analysis completion
-and a successful manual deletion sidecar call — **MUST** execute the
+and a successful explicit manual-cue save — **MUST** execute the
 following three steps sequentially, with the next step starting only after
 the previous step completes:
 
@@ -1490,48 +1747,37 @@ subsequently reloaded into the player, until the *next* run starts and
 
 ---
 
-### 4.4 Delete Cue Synchronization and Rollback
+### 4.4 Manual Cue Edit Synchronization
 
-Delete Cue is a third, user-initiated synchronization path in addition to
-Stage 1 metadata loading and Stage 2 post-analysis repaint. It applies
-only to the currently loaded single track (`targetType === "track"`).
-The canonical flow is:
+Manual cue creation, deletion, and BPM adjustment are local editing paths, not
+a third immediate sidecar-mutation path. The canonical flow is:
 
 ```mermaid
 sequenceDiagram
     participant User
     participant AudioPlayer
+    participant Konva
     participant Sidecar as cuegrid sidecar
     participant NML as collection.nml
-    participant Wavesurfer
 
-    User->>AudioPlayer: chooses Delete Cue from marker context menu
-    AudioPlayer->>AudioPlayer: snapshot cue, optimistically remove state/region
-    AudioPlayer->>Sidecar: spawn TRACK_PATH --delete-cue HOTCUE_INDEX [--nml ...]
-    Sidecar->>NML: atomically remove matching CUE_V2 from track ENTRY
-    Sidecar-->>AudioPlayer: exit 0
-    AudioPlayer->>AudioPlayer: resetPlayerState() / clearRegions() / unmap pads
-    AudioPlayer->>Sidecar: force --get-track-metadata from updated NML
-    Sidecar-->>AudioPlayer: fresh disk metadata
-    AudioPlayer->>AudioPlayer: rebuild reactive state and Wavesurfer regions
-
-    Sidecar-->>AudioPlayer: non-zero exit / spawn error
-    AudioPlayer->>AudioPlayer: restore cue state/region and notify/log error
+    User->>AudioPlayer: create/delete cue or adjust BPM
+    AudioPlayer->>AudioPlayer: update local state and set hasUnsavedChanges = true
+    AudioPlayer->>Konva: repaint cue and grid markers
+    User->>AudioPlayer: Save Changes
+    AudioPlayer->>Sidecar: updateTrackCues(current cueState, optional grid anchor, optional newBpm)
+    Sidecar->>NML: atomically persist full current cue set, grid anchor, and BPM
+    Sidecar-->>AudioPlayer: success or failure
+    AudioPlayer->>AudioPlayer: clear dirty state only after success; retain local edits on failure
 ```
 
-The sidecar's non-zero exit code is authoritative. The frontend must not
-interpret the absence of a thrown process error, a partial stdout line, or
-the optimistic visual state as proof of persistence. On a zero exit code,
-the frontend must not simply keep the optimistic removal: it must execute
-the mandatory three-step post-operation synchronization loop in §4.2
-(TEARDOWN → FORCE READ from disk → REBUILD). The freshly reread metadata is
-the authority, and the deleted cue must then be absent from the reactive
-metadata, Wavesurfer Regions overlay, and enabled-pad projection. If a
-track switch occurs while deletion is pending, the response is stale and
-must be ignored for the new track; the new track's Stage 1 metadata load is
-authoritative. A failed deletion may use the existing snapshot rollback,
-but that rollback is never a substitute for the successful-mutation
-synchronization loop.
+Until Save Changes succeeds, `cueState`, the local BPM, and the local grid
+anchor are the authoritative editing-session view and the disk-backed metadata
+remains the last saved view. A successful
+save follows §0.5's normal completion handling; a failed save must preserve
+the complete local cue set, the edited BPM, and the edited anchor, and retain
+`hasUnsavedChanges = true` for retry or discard. Track reload/discard remains
+the only path that may intentionally replace those local edits with metadata
+from disk.
 
 ---
 
@@ -1548,7 +1794,8 @@ than introducing an unrelated color system:
 |---|---|---|---|
 | Stage 1 marker — pre-existing cue, any `CueType`, no session match | `player.pre` | `blue-400` (`#60a5fa`) | §4.1/§4.3, `existing_cues` |
 | Stage 2 marker — newly injected cue (live repaint or session-matched preview) | `player.post` | matches existing `--success` (`#4caf50`) | §4.2/§4.3, `cue_written` |
-| Grid anchor line | `player.grid` | `border-strong` (`#3a3a3e`) | section 4.1/4.2, drawn once, never re-colored |
+| Grid anchor line (normal mode) | `player.grid` | `border-strong` (`#3a3a3e`) | §4.1/§4.2, drawn once, never re-colored |
+| Grid Anchor marker (Grid Edit Mode) | `player.grid` | `border-strong` (`#3a3a3e`) | §0.5.1/§3.14; distinct draggable anchor at `grid_anchor_ms` |
 
 **Two fixed stage colors, not a hotcue-keyed cycle (revised in v1.1):**
 the prior revision of this table cycled the *active* (Stage 2) palette
@@ -1597,7 +1844,12 @@ punctuation, no cue names, no ruler text:
   line using `player.grid`, exactly as before, but it **no longer
   carries the `"grid"` text label** — its `content` is empty. It is a
   purely visual line with no caption, distinguishable from hotcue
-  markers by color and by having no text at all.
+  markers by color and by having no text at all. In Grid Edit Mode, this
+  becomes the distinct draggable Grid Anchor marker defined in §0.5.1 and
+  §3.14; it remains unlabeled as a HotCue and is still not a cue object.
+- While Grid Edit Mode is active, every standard HotCue marker is rendered at
+  exactly 30% opacity (§0.5.1). The Grid Anchor remains fully legible and
+  draggable so the edit target is unambiguous.
 
 ### 5.3 Design constraints
 
@@ -1679,6 +1931,7 @@ export interface TrackMetadata {
   title: string;
   bpm: number;
   grid_anchor_ms: number;
+  is_flex_grid: boolean; // true when the core found more than one TYPE=4 marker
   duration_ms?: number; // optional Core duration; Peaks.js decoded duration is the §3.6 fallback
   existing_cues: ExistingCue[];
   waveform_peaks: number[]; // signed int8 min/max, Python-generated in 128-sample windows at sr=11025
@@ -1686,8 +1939,9 @@ export interface TrackMetadata {
 }
 
 export interface ColorMapBucket {
-  p: number; // normalized percussive HPSS RMS, 500 ms bucket
-  h: number; // normalized harmonic HPSS RMS, 500 ms bucket
+    l: number; // normalized Low frequency RMS, 500 ms bucket
+    m: number; // normalized Mid frequency RMS, 500 ms bucket
+    h: number; // normalized High frequency RMS, 500 ms bucket
 }
 
 // The complete success object is cached and rendered as an indivisible value.
@@ -1711,6 +1965,7 @@ export function isTrackMetadataError(
 // composables/usePlayerState.ts (shape, not implementation) — mirrors
 // useRunState.ts's module-scoped-singleton pattern (§5.1 of 3-gui-spec.md).
 export type MarkerStage = "pre-analysis" | "post-analysis";
+export type GridEditShiftMode = "grid-only" | "grid-and-cues";
 
 interface PlayerMarker {
   hotcueLabel: string | null; // "[N]" or null (unbound cue, name-only label)
@@ -1727,6 +1982,8 @@ interface PlayerState {
   markerStage: MarkerStage | null;
   isLoadingTrack: boolean; // §3.7 — shared concurrency lock, read by LibraryBrowser.vue too
   previewCache: Map<string, SuperJSON>; // exact absolute trackPath -> complete Stage 1 response
+  savedBpm: number | null; // BPM from the last successful metadata read/save
+  hasBpmChanges: boolean; // local current BPM differs from savedBpm
 }
 ```
 
@@ -1753,7 +2010,7 @@ The implementation-specific local player contract is:
 interface PlayerCue {
   id: number;          // NML HOTCUE, 0-7
   position_ms: number;
-  is_valid: boolean;  // nearest beat-grid position within the player tolerance
+  is_valid: boolean;  // on the current beat grid; all manually created cues are true
 }
 
 interface TrackData {
@@ -1762,6 +2019,11 @@ interface TrackData {
   grid_anchor_ms: number;
   duration_ms: number;
   cues: PlayerCue[];
+}
+
+interface GridEditState {
+  isGridEditMode: boolean; // false after load/reload/reset; §0.5.1
+  shiftMode: GridEditShiftMode; // "grid-only" on each Grid Edit entry; §0.5.1
 }
 
 const padSlots = computed(() =>
@@ -1773,7 +2035,8 @@ const padSlots = computed(() =>
 
 `padSlots` is the only pad projection used by the template. It intentionally
 retains `null` holes so visual pad `N` always addresses NML id `N - 1` even
-when an earlier slot is empty.
+when an earlier slot is empty. A `null` hole is an empty creation target;
+it is not a disabled pad while a track is ready.
 
 ---
 
@@ -1790,8 +2053,9 @@ when an earlier slot is empty.
   when the application process ends; no waveform peak-cache file is written
   to disk in this phase. Repeated selections in one running session instead
   reuse the sidecar's complete Super JSON without browser-side decoding.
-- No visual-only cue hiding: Delete Cue is not complete unless the
-  sidecar returns exit code `0` after physically updating `collection.nml`.
+- No implicit persistence: creating or deleting a cue is not complete on disk
+  until the user explicitly saves the current `cueState` through the existing
+  Save Changes boundary.
 - No accessibility (screen-reader) treatment of the canvas beyond
   whatever `wavesurfer.js`/`RegionsPlugin` provide out of the box —
   flagged here as a known gap, not silently ignored, but out of scope

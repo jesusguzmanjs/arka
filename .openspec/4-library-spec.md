@@ -4,7 +4,7 @@
 `LibraryBrowser.vue`; the historical proposal status immediately below is no
 longer authoritative.
 
-Status: Proposed v1.1 — architecture only, not yet implemented (v1.1
+Status: Current implementation contract, synchronized 2026-07-16. Historical revision notes follow; they do not indicate pending implementation. (v1.1
 adds a tracklist Action/Load column, fixes the right-column
 internal-scroll bug, adds the cross-component `isLoadingTrack`
 concurrency lock in a new §4.4, and revises this document's own §4.3
@@ -33,9 +33,11 @@ overflow-y-auto scrollbar-amber`; the browser root and document do not become
 scroll containers. The browser footer owns playlist/current-track analysis
 buttons and status text.
 
-All one-shot library calls use the packaged `binaries/cuegrid-core` sidecar:
-`--list-playlists` at boot and `--get-playlist-tracks NAME` after selection.
-The frontend maintains the discovered NML path in the module-scoped
+The Global Collection revision in section 9 supersedes the former two-call
+library-loading path (`--list-playlists` at boot and
+`--get-playlist-tracks NAME` per selection). The frontend instead loads one
+relational `--get-library` payload and resolves playlist references against its
+in-memory collection map. The frontend maintains the discovered NML path in the module-scoped
 `nmlPathOverride` state and passes it to query/mutation calls where the current
 implementation includes it. A selection token discards late playlist
 responses so an older request cannot overwrite a newer selection.
@@ -215,6 +217,7 @@ if args.get_playlist_tracks is not None:
             "artist": ref.entry.artist,
             "title": ref.entry.title,
             "location_path": ref.entry.location_path,
+            "is_flex_grid": ref.entry.is_flex_grid,
         }
         for ref in refs
     ]
@@ -233,7 +236,8 @@ A single line, no NDJSON envelope — identical framing choice to
   {
     "artist": "Carbon Based Lifeforms",
     "title": "Central Plains",
-    "location_path": "C:/Users/dj/Music/Tidal/Central Plains.flac"
+    "location_path": "C:/Users/dj/Music/Tidal/Central Plains.flac",
+    "is_flex_grid": false
   },
   {
     "artist": "Solar Fields",
@@ -259,6 +263,10 @@ A single line, no NDJSON envelope — identical framing choice to
 | `artist` | `BatchTrackRef.entry.artist` (`TrackEntry.artist`) | verbatim |
 | `title` | `BatchTrackRef.entry.title` (`TrackEntry.title`) | verbatim |
 | `location_path` | `BatchTrackRef.entry.location_path` | the same normalized, resolved path string documented in `2-core-spec.md` section 7.2 — **not** a Tauri asset URL; the frontend must still run it through `convertFileSrc` (`3-player-spec.md` section 2.2) before it ever reaches `wavesurfer.js` |
+
+- `is_flex_grid` is a required boolean sourced from
+  `BatchTrackRef.entry.is_flex_grid`. `true` means the entry has more than
+  one `CUE_V2 TYPE="4"` marker and is unsupported for CueGrid analysis.
 
 - **Stale playlist references and ambiguous per-track matches**
   (`2-core-spec.md` section 8.1.3, steps 4–5) are silently omitted from
@@ -546,6 +554,7 @@ export interface LibraryTrack {
   artist: string;
   title: string;
   location_path: string;
+  is_flex_grid: boolean;
 }
 
 export interface PlaylistTracksError {
@@ -672,6 +681,23 @@ auto-re-fetch that playlist's tracks; the left column still requires an
 explicit click to populate the right column each session, keeping the
 mount sequence simple and side-effect-free beyond the playlist-name
 listing itself.
+
+### 3.3.1 Flex Grid Protection presentation and interaction
+
+For every `LibraryTrack` where `is_flex_grid === true`, `LibraryBrowser.vue`
+must render the complete row in a visually disabled state. The title remains
+legible, but muted/disabled styling and a visible lock or warning icon are
+required. The icon or row must expose an accessible tooltip with this meaning:
+**Variable BPM (Flex Grid) is unsupported; analysis is disabled.**
+
+A Flex Grid row is not selectable for preview or per-track analysis:
+double-click, keyboard activation, and the **Analyze track** context-menu
+action must not enqueue it. A playlist-wide batch request may still include
+the entry because the core reports it as a protected skip. Its context menu
+may be omitted; if a menu shell is retained for layout consistency, its only
+analysis action must be disabled and repeat the same tooltip. This client-side
+guard improves UX but never replaces the core pipeline's mandatory skip guard in
+`2-core-spec.md` sections 2.3 and 8.3.
 
 ### 3.4 Placement in `App.vue`
 
@@ -1311,3 +1337,104 @@ those sections, not in isolation.
 6. **`isLoadingTrack`'s small race window** (§4.4's "known limitation")
    is accepted as-is for this revision rather than closed at the input
    level — flagged here as a candidate follow-up, not a blocking gap.
+
+---
+
+## 9. Global Collection Relational State Contract (v1.2, proposed)
+
+This section supersedes sections 1, 3.3, and 3.5 wherever they prescribe
+separate `--list-playlists` / `--get-playlist-tracks` calls, `LibraryTrack[]`
+responses, or playlist-embedded track metadata. The detailed interaction,
+selection, and Flex Grid rules in those sections remain in force after their
+track source is replaced by this contract.
+
+### 9.1 One-shot load boundary
+
+On browser mount, `useLibraryState()` must invoke the packaged sidecar once:
+
+```ts
+Command.sidecar(SIDECAR_NAME, ["--get-library", ...nmlArgs])
+```
+
+It parses the single JSON success object specified by `2-core-spec.md`
+section 17 and installs it atomically into module-scoped or Pinia-backed
+state. The browser must not issue a per-playlist sidecar call after this load.
+The old query flags may remain available for CLI compatibility, but they are
+not part of the Library Browser data path.
+
+```ts
+export interface CollectionTrack {
+  artist: string;
+  title: string;
+  location_path: string;
+  bpm: number | null;
+  grid_anchor_ms: number | null;
+  duration_ms: number | null;
+  is_flex_grid: boolean;
+  existing_cues: ExistingCue[];
+  collection_index: number;
+}
+
+export interface PlaylistFolder {
+  kind: "folder";
+  name: string;
+  children: PlaylistNode[];
+}
+
+export interface PlaylistLeaf {
+  kind: "playlist";
+  name: string;
+  track_paths: string[];
+}
+
+export type PlaylistNode = PlaylistFolder | PlaylistLeaf;
+
+export interface LibraryPayload {
+  collection: Record<string, CollectionTrack>;
+  playlists: PlaylistNode[];
+}
+```
+
+`ExistingCue` has the same shape already used by the track-metadata contract;
+this declaration does not create a second cue representation. Runtime payload
+validation must reject a malformed payload or a `track_paths` reference that
+does not exist in `collection` rather than rendering partial, inconsistent
+library state.
+
+### 9.2 Lookup-only view derivation
+
+The state owner retains the received `collection` dictionary as the sole
+in-memory owner of track metadata. A selected playlist stores its leaf node
+(or its tree-local selection identity) and derives rows by O(1) lookup:
+
+```ts
+const playlistTracks = computed(() =>
+  selectedPlaylist.value?.track_paths
+    .map((path) => library.collection[path])
+    .filter((track): track is CollectionTrack => track !== undefined) ?? [],
+);
+
+const globalCollectionTracks = computed(() =>
+  Object.values(library.collection)
+    .sort((a, b) => a.collection_index - b.collection_index),
+);
+```
+
+The Global Collection view renders `globalCollectionTracks`; therefore orphan
+tracks require no synthetic playlist and appear naturally beside playlisted
+tracks. Playlist views render `playlistTracks` in `track_paths` order. Neither
+computed result may be written back into state, cloned into each playlist, or
+serialized across the Tauri bridge as embedded track objects.
+
+### 9.3 Refresh and selection behavior
+
+A refresh replaces both `collection` and `playlists` together. Before the
+replacement becomes visible, the state owner must clear a selected playlist or
+selected track whose path/node is no longer present. A stale-response token
+still guards concurrent refreshes; only the newest successful `--get-library`
+response may update the store.
+
+When a user selects a resolved track for preview, `selectedTrackPath` remains
+the normalized `location_path`. `AudioPlayer.vue` and mutation actions look up
+the authoritative metadata from `collection[selectedTrackPath]`; no change is
+made to their path-based bridge contract.

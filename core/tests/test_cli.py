@@ -174,6 +174,7 @@ class TestExportGui:
             "track_path": str(Path("track.mp3").resolve()),
             "bpm": 140.0,
             "grid_anchor_ms": 0.0,
+            "is_flex_grid": False,
             "duration_ms": 10_000.0,
             "cues": [],
         }
@@ -185,6 +186,22 @@ class TestExportGui:
 
 
 class TestMainArgumentPassthrough:
+    def test_emits_flex_grid_skip_event_in_json_mode(self, tmp_path, monkeypatch, capsys):
+        def fake_run_pipeline(**kwargs):
+            result = _fake_result()
+            result.skipped_reason = "flex_grid"
+            return result
+
+        monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+
+        assert cli.main(["track.mp3", "--nml", str(nml_path), "--json"]) == 0
+
+        messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert {"type": "skipped", "reason": "flex_grid"} in messages
+        assert messages[-1] == {"type": "summary", "total": 1, "succeeded": 0, "skipped": 1}
+
     def test_passes_title_and_artist_to_pipeline(self, tmp_path, monkeypatch, capsys):
         captured_kwargs = {}
 
@@ -320,7 +337,7 @@ class TestGetPlaylistTracks:
         assert isinstance(tracks, list)
         assert len(tracks) == 2
         for track in tracks:
-            assert set(track.keys()) == {"artist", "title", "location_path", "flags"}
+            assert set(track.keys()) == {"artist", "title", "location_path", "flags", "is_flex_grid"}
         titles = {t["title"] for t in tracks}
         assert "NO 1 KNEW" in titles
         assert "Doesn't Just Happen" in titles
@@ -695,3 +712,32 @@ class TestBuildConfigFromArgs:
         assert captured_kwargs["config"].energy_change_threshold_db == 7.5
         # Unspecified fields still default.
         assert captured_kwargs["config"].max_cues == AppConfig().max_cues
+
+
+class TestGetLibrary:
+    def test_prints_compact_relational_json_and_exits_zero(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--nml", str(SAMPLE_COLLECTION), "--get-library"])
+
+        assert exc_info.value.code == 0
+        stdout = capsys.readouterr().out.strip()
+        payload = json.loads(stdout)
+        assert set(payload) == {"collection", "playlists"}
+        assert len(payload["collection"]) == 2
+        assert payload["playlists"][0]["kind"] == "folder"
+        assert "\n" not in stdout
+
+    def test_reports_duplicate_location_error_schema(self, tmp_path, capsys):
+        nml_path = tmp_path / "duplicate.nml"
+        nml_path.write_text(
+            """<NML><COLLECTION>
+<ENTRY TITLE="A" ARTIST="Artist"><LOCATION VOLUME="C:" DIR="/:Music/:" FILE="same.flac" /></ENTRY>
+<ENTRY TITLE="B" ARTIST="Artist"><LOCATION VOLUME="C:" DIR="/:Music/:" FILE="same.flac" /></ENTRY>
+</COLLECTION></NML>""",
+            encoding="utf-8",
+        )
+
+        assert cli.main(["--nml", str(nml_path), "--get-library"]) == 1
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["error"] == "duplicate_location"
+        assert "same.flac" in payload["message"]

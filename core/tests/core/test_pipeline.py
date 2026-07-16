@@ -15,6 +15,7 @@ from cuegrid.core.pipeline import (
     BatchTrackResult,
     PipelineResult,
     run_batch_pipeline,
+    run_pipeline,
     serialize_gui_payload,
 )
 from cuegrid.nml.constants import CueType
@@ -65,6 +66,7 @@ class TestGuiPayload:
         assert payload["bpm"] == 120.0
         assert payload["grid_anchor_ms"] == 250.0
         assert payload["duration_ms"] == 60_000.0
+        assert payload["is_flex_grid"] is False
         assert payload["cues"] == [
             {"id": 2, "position_ms": 250.0, "is_valid": True},
             {"id": 3, "position_ms": 300.0, "is_valid": False},
@@ -221,6 +223,39 @@ class TestRunBatchPipeline:
             assert result.succeeded_count == 0
             assert result.results[0].error == "missing or invalid BPM"
             assert result.results[0].detected_events is None
+
+    def test_skips_flex_grid_before_audio_analysis(self):
+        flex_entry = TrackEntry(
+            title="Flex",
+            artist="Test",
+            location_path="/path/to/flex.flac",
+            tempo=TempoInfo(bpm=120.0),
+            is_flex_grid=True,
+        )
+        with patch("cuegrid.core.pipeline.NmlParser.find_entries_by_playlist") as mock_find:
+            mock_find.return_value = [MagicMock(entry=flex_entry, element=MagicMock())]
+            with patch("cuegrid.core.pipeline.detect_events") as mock_detect:
+                result = run_batch_pipeline(SAMPLE_COLLECTION, playlist="test")
+
+        assert result.skipped_count == 1
+        assert result.results[0].error == "flex_grid"
+        mock_detect.assert_not_called()
+
+    def test_single_track_flex_grid_skips_before_audio_analysis(self):
+        flex_entry = TrackEntry(
+            title="Flex",
+            artist="Test",
+            location_path="/path/to/flex.flac",
+            tempo=TempoInfo(bpm=120.0),
+            is_flex_grid=True,
+        )
+        with patch("cuegrid.core.pipeline.NmlParser.find_entry", return_value=flex_entry):
+            with patch("cuegrid.core.pipeline.detect_events") as mock_detect:
+                result = run_pipeline(SAMPLE_COLLECTION, "/path/to/flex.flac")
+
+        assert result.skipped_reason == "flex_grid"
+        assert result.written_cues == []
+        mock_detect.assert_not_called()
 
     def test_skips_tracks_that_fail_audio_analysis(self):
         """Spec section 8.3, step 2: catch all exceptions during detection."""

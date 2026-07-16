@@ -44,6 +44,7 @@ class TrackEntry:
     tempo: TempoInfo
     cues: list[CuePoint] = field(default_factory=list)
     grid_anchor_ms: float = 0.0  # convenience: START of the TYPE=GRID cue
+    is_flex_grid: bool = False  # more than one CUE_V2 TYPE="4" marker
     duration_ms: float = (
         0.0  # from <INFO PLAYTIME_FLOAT="..."> * 1000; bounds candidate generation
     )

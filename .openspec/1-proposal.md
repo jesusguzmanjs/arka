@@ -1,43 +1,30 @@
-# Proposal: CueGrid (formerly Traktor Auto-Cue)
+# Proposal: CueGrid
 
-## Current implementation baseline (2026-07-13)
+Status: implemented baseline, synchronized 2026-07-16.
 
-The checked-out implementation is the source of truth for the current
-architecture. The Python package lives under `core/src/cuegrid/` and the
-Vue/Tauri application lives under `gui/`. The GUI is a dark, single-window
-application with a strictly bounded `h-screen w-screen overflow-hidden` root;
-scrolling is delegated to bounded internal panels.
+CueGrid is a desktop-assisted Python application that injects grid-aligned HotCues into Native Instruments Traktor collections. The checked-out code is the product baseline; detailed implementation contracts live in [2-core-spec.md](2-core-spec.md), [3-gui-spec.md](3-gui-spec.md), [3-player-spec.md](3-player-spec.md), and [4-library-spec.md](4-library-spec.md).
 
-The visual language uses the semantic Amber/Ochre roles declared in
-`gui/tailwind.config.js`: `primary`, `secondary`, `accent`, and `warning`.
-The player is implemented with Peaks.js and supports eight fixed virtual pad
-slots, momentary pad preview, guarded global keyboard shortcuts, custom wheel
-zoom/pan, and cue context-menu deletion. Manual cue changes are held locally
-until an explicit save request crosses the Tauri sidecar boundary.
+## Product goal
 
-The packaged Python core is invoked as `binaries/cuegrid-core`. It can discover
-and retain the selected `collection.nml` path, serve read-only metadata and
-playlist queries, stream analysis results as NDJSON, update manual cue
-positions through `--update-cues`, and delete a standard HotCue through
-`--delete-cue`. The parser owns the loaded XML tree and path; the pipeline and
-writer reuse that in-memory document and atomically persist mutations.
+Help DJs identify structural transitions without inventing a second beat grid. CueGrid takes Traktor's BPM and Grid marker as authoritative, evaluates phrase-boundary candidates against the master audio, and writes only safe standard HotCue changes back to the matching `collection.nml` entry.
 
-## Phase 1: Core Engine & CLI
-**Objective:** Automatically detect structural changes in audio tracks and map them onto Traktor Pro 4's grid as HotCues by safely modifying `collection.nml`, utilizing grid-guided phrase analysis and automated stem extraction.
+## Current core behavior
 
-**Requirements:**
-- Read Traktor's `collection.nml` to fetch the BPM, Grid Marker, and evaluate STEM flags.
-- Resolve and isolate drum stems using FFmpeg for surgical audio precision.
-- Analyze the track using `librosa` (RMS/MFCC) and cross-reference stems with the master track (Smart Validation).
-- Snap the detected points perfectly to the mathematical beatgrid.
-- Safely append `<CUE_V2>` tags without overwriting existing grids or load markers.
+- Grid-Guided Phrase Analysis calculates all candidate timestamps from Traktor BPM, grid anchor, duration, and the selected phrase interval.
+- The detector performs one local full-track `librosa.load` per analysis run, slices each before/after window in RAM, releases the waveform, and calls garbage collection. It uses no global audio cache.
+- Each candidate uses HPSS harmonic/percussive RMS and MFCC timbre evidence. Events that survive edge, silence, threshold, spatial, relative-confidence, and capacity guards all use the label `cue`.
+- The active pipeline is master-track-only. FFmpeg Stem extraction and master/drum fusion are retired from the analysis path; reference-only helpers live in PyInstaller-excluded legacy modules and are not dependencies of CueGrid.
+- Single-track, playlist, and title-selected batch processing are implemented. Batch execution is sequential and isolates individual track failures.
+- The CLI supplies NDJSON analysis progress, Super JSON track-preview data, playlist/library queries, discovery, manual cue/grid/BPM updates, and standard HotCue deletion.
+- NML writes are atomic and create retained daily backups. Flex Grid tracks are protected from automatic analysis.
 
-## Phase 2: Graphical User Interface (GUI)
-**Objective:** Build a lightweight, high-performance desktop interface for CueGrid using Tauri and Vue 3, completely decoupled from the Python core.
+## Current desktop behavior
 
-**Requirements:**
-- A single-page, dark-mode UI with a professional DJ software aesthetic.
-- **Configuration and Library UI:** Playlist selection, Stems inclusion, Sensitivity (`soft`/`medium`/`hard`), Max Cues, Clear Existing, and playlist/track analysis actions. The old free-text Target Selector and GUI Verify Mode control are no longer the current UI contract.
-- **Action Area:** A prominent "Analyze & Inject" button with clear loading/processing states.
-- **Telemetry Console:** A real-time log viewer displaying the core's output.
-- **Architecture:** The Python engine runs as a Tauri Sidecar, communicating with the frontend through one-shot JSON queries, NDJSON analysis output, and explicit cue mutation commands over the sidecar process boundary.
+The Vue + Tauri application invokes the packaged core as a sidecar. It uses one-shot JSON for metadata/library operations and NDJSON for analysis. The player presents Peaks.js waveforms, eight fixed HotCue pads, local manual edits, and explicit save/delete flows. The library browser uses the relational `--get-library` response as its primary source.
+
+## Delivery constraints
+
+- Preserve Traktor's grid and non-HotCue markers.
+- Never overwrite an occupied standard HotCue slot unless the user chose Clear Existing.
+- Keep the core and GUI process boundary explicit: filesystem mutation remains in the Python sidecar.
+- Treat the checked-out code as authoritative whenever historical documentation disagrees with it; synchronize the specifications in the same change.

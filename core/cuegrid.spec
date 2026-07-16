@@ -21,16 +21,12 @@ from PyInstaller.utils.hooks import collect_submodules
 # librosa and audioread both perform environment-dependent conditional
 # imports (audio backend probing at runtime, optional accelerated code
 # paths) that PyInstaller's static import-graph analysis of cli.py alone
-# cannot always see. Pulling in every submodule of these packages -- plus
-# our own `cuegrid` package, defensively, in case any internal module ever
-# imports another one dynamically -- avoids "ModuleNotFoundError" surprises
-# inside the frozen executable that would otherwise only surface at
-# runtime, on an end user's machine, long after the build succeeded.
+# cannot always see. CueGrid's own modules are left to that static graph: a
+# broad ``collect_submodules("cuegrid")`` would package dormant legacy code.
 hiddenimports = (
     collect_submodules("librosa")
     + collect_submodules("audioread")
     + collect_submodules("soundfile")
-    + collect_submodules("cuegrid")
 )
 
 a = Analysis(
@@ -42,7 +38,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Legacy Stem helpers intentionally remain in source control but must
+    # never be frozen into the production sidecar or pull in ffmpeg-python.
+    excludes=[
+        "cuegrid.audio.legacy_stems",
+        "cuegrid.nml.stems",
+        "ffmpeg",
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=None,

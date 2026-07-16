@@ -1,73 +1,33 @@
-"""Targeted, seek-based audio window decoding.
+"""Audio utilities used by the active application.
 
-Implements the ``audio.loader`` responsibility from ``.openspec/2-spec.md``
-section 2.1: decode only a small requested window of audio (via
-``offset``/``duration``), never a whole track. Track duration comes from
-the NML's ``<INFO>`` element (see section 2.3), not from this module, so
-there is intentionally no whole-file ``load_audio()`` function here.
-
-v2.0 Stems Integration (spec section 9) additionally allows the pipeline
-to analyze a single isolated stem *stream* inside a native Traktor
-``.stem.mp4`` sidecar instead of the original mixed-down audio file.
-``extract_drum_stem`` demuxes that one stream (via ``ffmpeg``) to a
-temporary mono WAV file once per track; the resulting path is then handed
-to the exact same ``load_window`` seek path used for ordinary files, so
-``audio.detector``/``audio.features`` are completely unaware of where the
-samples came from -- no core detection math changes at all.
-
-v2.2 Multi-Source Validation (spec section 10) adds ``measure_audio_energy``
-and ``is_drum_stem_empty``: a handful of short, evenly-spaced seek-based
-reads (via ``soundfile``) used to cheaply estimate a whole file's overall
-RMS energy without ever decoding it in full -- specifically so
-``core.pipeline`` can detect a practically-silent/ambient drum stem (e.g.
-Ambient/IDM tracks with no real drum content) and fall back to the
-original Master audio instead of analyzing silence.
+The detector owns its one full-track decode and RAM slicing. This module is
+limited to the independent GUI preview payload and a general seek-window
+utility. Legacy Stem and FFmpeg helpers live in :mod:`cuegrid.audio.legacy_stems`
+and are deliberately not imported here.
 """
 
 from __future__ import annotations
 
-import logging
-import tempfile
 from pathlib import Path
 
-import ffmpeg
 import librosa
 import numpy as np
-import soundfile as sf
 
-logger = logging.getLogger(__name__)
-
-if not hasattr(ffmpeg, "Error"):
-    class _FfmpegCompatibilityError(Exception):
-        def __init__(self, *args: object) -> None:
-            super().__init__(*args)
-            self.stderr = args[-1] if args and isinstance(args[-1], bytes) else None
-
-    ffmpeg.Error = _FfmpegCompatibilityError  # type: ignore[attr-defined]
-
-# NI's native stem format multiplexes 5 audio streams into one .stem.mp4:
-# stream 0 is the original full mix, and streams 1-4 are the four isolated
-# stems (Drums, Bass, Vocals, Melody/Other, per NI's own stem template).
-# Stream index 1 ("0:1" in ffmpeg's stream-specifier syntax) is the
-# Drums/Rhythm stem -- what this project wants to feed the phrase
-# detector instead of the full mix.
-DRUMS_STEM_STREAM_INDEX = 1
-
-PREVIEW_SAMPLE_RATE = 11025
-PREVIEW_PEAK_WINDOW = 128
+PREVIEW_SAMPLE_RATE = 11_025
+PREVIEW_PEAK_WINDOW = 64
 PREVIEW_HOP_LENGTH = 512
 PREVIEW_BUCKET_MS = 500
 
 
-def generate_preview_payload(path: str | Path) -> tuple[list[int], list[dict[str, float]]]:
-    """Generate the renderer-ready Stage 1 waveform and HPSS color map.
+def generate_preview_payload(
+    path: str | Path,
+) -> tuple[list[int], list[dict[str, float]]]:
+    """Generate the renderer-ready waveform and three-band colour map.
 
-    This intentionally uses one complete low-rate decode. The normal analysis
-    path continues to use :func:`load_window` and is not affected.
+    Preview generation is intentionally independent of detection and uses one
+    low-rate full decode. It is used only by ``--get-track-metadata``.
     """
     import warnings
-    import numpy as np
-    import librosa
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="soundfile")
@@ -76,85 +36,52 @@ def generate_preview_payload(path: str | Path) -> tuple[list[int], list[dict[str
     if y.size == 0:
         return [], []
 
-    # --- 1. Waveform Peaks (Optimized Vectorized Extraction) ---
     full_length = (y.size // PREVIEW_PEAK_WINDOW) * PREVIEW_PEAK_WINDOW
     peak_chunks = y[:full_length].reshape(-1, PREVIEW_PEAK_WINDOW)
-
     if peak_chunks.size:
         wave_min = peak_chunks.min(axis=1)
         wave_max = peak_chunks.max(axis=1)
-
-        # Interleave [min, max, min, max...] efficiently
         peaks = np.empty(wave_min.size + wave_max.size, dtype=np.float32)
         peaks[0::2] = wave_min
         peaks[1::2] = wave_max
-
-        # ---------------------------------------------------------
-        # EL FILTRO TRAKTOR: Expansión de rango dinámico visual
-        # Elevamos a una potencia (1.5 o 2.0) para afilar los picos.
-        # Usamos np.sign y np.abs para mantener la polaridad negativa intacta.
-        # ---------------------------------------------------------
-        exaggeration_factor = 1.8  # Juega con este número (1.0 es lineal, 2.0 es muy exagerado)
-        peaks = np.sign(peaks) * (np.abs(peaks) ** exaggeration_factor)
-
-        # Peaks.js audiowaveform format REQUIRES 8-bit integers [-128, 127]
-        # It DOES NOT support 16-bit or floats.
-        peaks_int8 = (peaks * 127).astype(np.int8)
-        waveform_peaks = peaks_int8.tolist()
+        peaks = np.sign(peaks) * (np.abs(peaks) ** 1.8)
+        waveform_peaks = (peaks * 127).astype(np.int8).tolist()
     else:
         waveform_peaks = []
 
-    # --- 2. 3-Band EQ Color Map (Frecuencias Puras - Ultrarrápido) ---
-    S = np.abs(librosa.stft(y, n_fft=512, hop_length=PREVIEW_HOP_LENGTH))
-    
-    # Obtenemos a cuántos Hz equivale cada fila del espectrograma
-    freqs = librosa.fft_frequencies(sr=PREVIEW_SAMPLE_RATE, n_fft=512)
-    
-    # Buscamos los índices de corte (Ajustables a tu gusto)
-    # Graves (Kick/Sub): de 0 a 250 Hz
-    # Medios (Voces/Sintes): de 250 a 2500 Hz
-    # Agudos (Platillos/Aire): más de 2500 Hz
-    idx_low = np.where(freqs < 250)[0][-1]
-    idx_mid = np.where(freqs < 2500)[0][-1]
-    
-    # Sumamos la energía de cada banda por columna (tiempo)
-    low_energy = S[:idx_low, :].sum(axis=0)
-    mid_energy = S[idx_low:idx_mid, :].sum(axis=0)
-    high_energy = S[idx_mid:, :].sum(axis=0)
+    spectrum = np.abs(librosa.stft(y, n_fft=512, hop_length=PREVIEW_HOP_LENGTH))
+    frequencies = librosa.fft_frequencies(sr=PREVIEW_SAMPLE_RATE, n_fft=512)
+    low_end = np.where(frequencies < 250)[0][-1]
+    mid_end = np.where(frequencies < 2500)[0][-1]
+    low_energy = spectrum[:low_end, :].sum(axis=0)
+    mid_energy = spectrum[low_end:mid_end, :].sum(axis=0)
+    high_energy = spectrum[mid_end:, :].sum(axis=0)
 
-    # Agrupamos en los buckets de tiempo
     frames_per_bucket = max(
-        1, round(PREVIEW_BUCKET_MS / 1000 * PREVIEW_SAMPLE_RATE / PREVIEW_HOP_LENGTH)
+        1,
+        round(
+            PREVIEW_BUCKET_MS / 1000 * PREVIEW_SAMPLE_RATE / PREVIEW_HOP_LENGTH
+        ),
     )
-
     trim_frames = len(low_energy) - (len(low_energy) % frames_per_bucket)
+    if trim_frames == 0:
+        return waveform_peaks, []
 
-    if trim_frames > 0:
-        # Hacemos la media de cada bucket
-        l_buckets = low_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
-        m_buckets = mid_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
-        h_buckets = high_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+    low_buckets = low_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+    mid_buckets = mid_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+    high_buckets = high_energy[:trim_frames].reshape(-1, frames_per_bucket).mean(axis=1)
+    maximum = max(low_buckets.max(), mid_buckets.max(), high_buckets.max())
+    if maximum > 0:
+        low_buckets = low_buckets / maximum
+        mid_buckets = mid_buckets / maximum
+        high_buckets = high_buckets / maximum
 
-        # Normalizamos usando el valor más alto absoluto de cualquier banda
-        max_val = max(l_buckets.max(), m_buckets.max(), h_buckets.max())
-        if max_val > 0:
-            l_buckets = l_buckets / max_val
-            m_buckets = m_buckets / max_val
-            h_buckets = h_buckets / max_val
-
-        # Devolvemos l (low), m (mid) y h (high)
-        color_map = [
-            {
-                "l": round(float(l), 4),
-                "m": round(float(m), 4),
-                "h": round(float(h), 4)
-            }
-            for l, m, h in zip(l_buckets, m_buckets, h_buckets)
-        ]
-    else:
-        color_map = []
-
+    color_map = [
+        {"l": round(float(low), 4), "m": round(float(mid), 4), "h": round(float(high), 4)}
+        for low, mid, high in zip(low_buckets, mid_buckets, high_buckets)
+    ]
     return waveform_peaks, color_map
+
 
 def load_window(
     path: str | Path,
@@ -162,43 +89,13 @@ def load_window(
     duration_sec: float,
     sr: int | None = None,
 ) -> tuple[np.ndarray, int]:
-    """Decode a short window of audio via ``librosa.load(offset=, duration=)``.
+    """Decode one requested mono window with ``librosa.load``.
 
-    For seekable formats, ``librosa`` (via ``soundfile``) seeks directly to
-    ``offset_sec`` rather than decoding the whole file up to that point --
-    this is what keeps Grid-Guided Phrase Analysis (spec section 6) cheap
-    even on long tracks.
-
-    Args:
-        path: Path to the audio file. May be an original track file, or a
-            temporary drum-stem WAV produced by ``extract_drum_stem``
-            (spec section 9) -- this function treats both identically.
-        offset_sec: Start of the window, in seconds. Must be ``>= 0``.
-            Callers (``audio.detector``) are responsible for skipping
-            windows that would start before the track begins rather than
-            clamping the offset to ``0`` (spec section 6.1, step 3) --
-            this function deliberately does not clamp, so a negative
-            offset is a caller bug, not a valid edge case.
-        duration_sec: Length of the window, in seconds. Must be ``> 0``.
-            If the window would run past the end of the file, ``librosa``
-            simply returns fewer samples; callers should pre-truncate
-            ``duration_sec`` to what remains in the track when they know
-            that bound (spec section 6.1, step 3), but this function does
-            not require it.
-        sr: Target sample rate, or ``None`` to keep the file's native rate.
-
-    Returns:
-        ``(y, sr)`` -- the decoded mono waveform and its sample rate.
-
-    Raises:
-        ValueError: if ``offset_sec < 0`` or ``duration_sec <= 0``.
+    This compatibility utility is not used by the active detector, which
+    slices its single full-track decode in memory.
     """
     if offset_sec < 0:
-        raise ValueError(
-            f"offset_sec must be >= 0, got {offset_sec!r}; callers must skip "
-            "windows that would start before the track begins rather than "
-            "clamping the offset (spec section 6.1, step 3)"
-        )
+        raise ValueError(f"offset_sec must be >= 0, got {offset_sec!r}")
     if duration_sec <= 0:
         raise ValueError(f"duration_sec must be > 0, got {duration_sec!r}")
 
@@ -206,151 +103,3 @@ def load_window(
         str(path), sr=sr, mono=True, offset=offset_sec, duration=duration_sec
     )
     return y, int(actual_sr)
-
-
-def extract_drum_stem(
-    stem_path: str | Path,
-    stream_index: int = DRUMS_STEM_STREAM_INDEX,
-) -> Path:
-    """Demux one isolated stem stream out of a native ``.stem.mp4`` sidecar.
-
-    Implements the "Audio Extraction" step of the v2.0 Stems Integration
-    architecture (spec section 9.2): runs ``ffmpeg`` (via the
-    ``ffmpeg-python`` bindings) to extract stream ``0:<stream_index>``
-    (the Drums/Rhythm stem by default) into a temporary mono PCM WAV
-    file. The caller owns the returned path and is responsible for
-    deleting it once analysis of the track is complete (``core.pipeline``
-    does this in a ``finally`` block).
-
-    Args:
-        stem_path: Path to the native ``.stem.mp4`` sidecar on disk.
-        stream_index: Which audio stream to extract, as the ``N`` in
-            ffmpeg's ``0:N`` stream specifier. Defaults to
-            ``DRUMS_STEM_STREAM_INDEX`` (the Drums/Rhythm stem).
-
-    Returns:
-        Path to a newly created temporary ``.wav`` file containing only
-        the requested stem's audio.
-
-    Raises:
-        ffmpeg.Error: if ``ffmpeg`` fails to decode/demux the requested
-            stream (e.g. corrupt sidecar, unexpected stream layout).
-    """
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp_path = Path(tmp_file.name)
-    tmp_file.close()
-
-    try:
-        (
-            ffmpeg.input(str(stem_path))
-            .output(
-                str(tmp_path),
-                map=f"0:{stream_index}",
-                acodec="pcm_s16le",
-                loglevel="error",
-            )
-            .overwrite_output()
-            .run(capture_stdout=True, capture_stderr=True)
-        )
-    except Exception as exc:
-        tmp_path.unlink(missing_ok=True)
-        # Extraemos el stderr de forma segura por si es un error de Subprocess
-        stderr_bytes = getattr(exc, "stderr", None)
-        stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else str(exc)
-
-        logger.warning(
-            "ffmpeg failed to extract stream 0:%d from %s: %s",
-            stream_index,
-            stem_path,
-            stderr,
-        )
-        raise
-
-    logger.debug(
-        "Extracted stream 0:%d from %s to temporary file %s",
-        stream_index,
-        stem_path,
-        tmp_path,
-    )
-    return tmp_path
-
-
-# v2.2 Multi-Source Validation (spec section 10.1): how many short chunks to
-# sample when estimating a file's overall energy, and how long each chunk
-# is. Kept small and fixed so this check stays "lightning-fast" even on a
-# long track -- it is a handful of tiny seek-based reads, never a full
-# decode.
-_ENERGY_PROBE_CHUNK_COUNT = 8
-_ENERGY_PROBE_CHUNK_SEC = 0.5
-
-
-def measure_audio_energy(
-    path: str | Path,
-    chunk_count: int = _ENERGY_PROBE_CHUNK_COUNT,
-    chunk_sec: float = _ENERGY_PROBE_CHUNK_SEC,
-) -> float:
-    """Cheaply estimate a whole file's overall RMS energy.
-
-    Implements the "Empty Stem Detection" probe of v2.2 Multi-Source
-    Validation (spec section 10.1): reads ``chunk_count`` short,
-    evenly-spaced chunks (``chunk_sec`` seconds each) via ``soundfile``,
-    seeking directly to each chunk rather than decoding anything in
-    between -- this is what keeps the check "lightning-fast" even on a
-    long track.
-
-    Args:
-        path: Path to the audio file (or temporary drum-stem WAV) to probe.
-        chunk_count: How many evenly-spaced chunks to sample.
-        chunk_sec: Length of each sampled chunk, in seconds.
-
-    Returns:
-        The mean RMS energy across all sampled chunks. ``0.0`` if the
-        file has no frames at all (rather than raising).
-    """
-    with sf.SoundFile(str(path)) as f:
-        total_frames = len(f)
-        sr = f.samplerate
-        if total_frames == 0 or sr == 0:
-            return 0.0
-
-        chunk_frames = max(1, int(chunk_sec * sr))
-        # Evenly-spaced start offsets across the file, each far enough from
-        # the end to read a full chunk where possible.
-        usable_span = max(total_frames - chunk_frames, 0)
-        starts = [
-            int(usable_span * i / max(chunk_count - 1, 1)) if chunk_count > 1 else 0
-            for i in range(chunk_count)
-        ]
-
-        rms_samples: list[float] = []
-        for start in starts:
-            f.seek(start)
-            data = f.read(frames=chunk_frames, dtype="float32", always_2d=True)
-            if data.size == 0:
-                continue
-            # Collapse to mono if multi-channel, matching load_window's
-            # mono=True behavior, before computing RMS.
-            mono = data.mean(axis=1)
-            rms_samples.append(float(np.sqrt(np.mean(np.square(mono)))))
-
-    return float(np.mean(rms_samples)) if rms_samples else 0.0
-
-
-# v2.2 (spec section 10.1): below this mean RMS, a drum stem is considered
-# "empty" (practically silent/ambient) and analysis should fall back to the
-# original Master audio rather than risk analyzing silence.
-DRUM_STEM_SILENCE_RMS_THRESHOLD = 0.01
-
-
-def is_drum_stem_empty(
-    path: str | Path, threshold: float = DRUM_STEM_SILENCE_RMS_THRESHOLD
-) -> bool:
-    """Return ``True`` if a drum stem's overall energy is below the silence threshold.
-
-    Implements the v2.2 "Empty Stem Detection" guard (spec section 10.1):
-    used by ``core.pipeline`` right after ``extract_drum_stem`` to protect
-    fast mode from analyzing a practically drumless stem (e.g. Ambient or
-    IDM tracks), falling back to the original Master audio instead.
-    """
-    energy = measure_audio_energy(path)
-    return energy < threshold

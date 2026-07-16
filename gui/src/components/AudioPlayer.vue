@@ -6,7 +6,7 @@ import { useConfigState } from "../composables/useConfigState";
 import { useLibraryState } from "../composables/useLibraryState";
 import { fetchTrackMetadata, usePlayerState } from "../composables/useTrackMetadata";
 import { useRunState } from "../composables/useRunState";
-import { useCueGridSidecar } from "../composables/useCueGridSidecar";
+import { useCueGridSidecar, type CuePointPayload } from "../composables/useCueGridSidecar";
 import { beatMs, snapToGrid, type GridTrackData } from "../composables/useGridMath";
 import { usePeaksMarkers, type PlayerCue } from "../composables/usePeaksMarkers";
 import { useWaveformSync } from "../composables/useWaveformSync";
@@ -16,27 +16,32 @@ import CueContextMenu from "./CueContextMenu.vue";
 import PlayerHeader from "./PlayerHeader.vue";
 import PlayerTransport from "./PlayerTransport.vue";
 import PlayerWaveform from "./PlayerWaveform.vue";
+import PlayerGridControls from "./PlayerGridControls.vue";
 
 interface TrackData extends GridTrackData { track_path: string; cues: PlayerCue[]; }
-interface LibraryTrackRecord { artist?: unknown; title?: unknown; location_path?: unknown; }
 interface WaveformShell { zoomviewElement: HTMLDivElement | null; overviewElement: HTMLDivElement | null; zoomGradientElement: HTMLDivElement | null; gradientMaskElement: HTMLDivElement | null; }
 
 const props = defineProps<{ trackPath?: string | null; disabled?: boolean }>();
-const { selectedTrackPath, selectedPlaylist } = useConfigState();
-const { tracks: libraryTracks } = useLibraryState();
+const { selectedTrackPath, clearExisting } = useConfigState();
+const { collection, patchTrackInCollection } = useLibraryState();
 const { status, logs } = useRunState();
 const { updateTrackCues } = useCueGridSidecar();
 const { previewCache, isLoadingTrack, setLoadingTrack } = usePlayerState();
-const { createPointMarker, paintAllMarkers, getGridLines } = usePeaksMarkers();
+const { createPointMarker, paintAllMarkers, notifyGridAnchorDrag, getGridLines } = usePeaksMarkers(handleGridAnchorDrag);
 
 const EMPTY_TRACK: TrackData = { track_path: "", bpm: 0, grid_anchor_ms: 0, duration_ms: 0, cues: [] };
-const ZOOM_LEVELS = [128, 256, 512, 1024, 2048, 4096];
+const MIN_BPM = 50;
+const MAX_BPM = 200;
+const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096];
 const HEX_PRIMARY = "#eaa900";
 const HEX_SECONDARY = "#d27b00";
 const HEX_ACCENT = "#facf25";
 const HEX_GRAY = "#52525b";
+const PAD_COUNT = 8;
 
 const trackData = ref<TrackData>({ ...EMPTY_TRACK });
+const savedBpm = ref(EMPTY_TRACK.bpm);
+const savedGridAnchorMs = ref(EMPTY_TRACK.grid_anchor_ms);
 const currentPreview = shallowRef<SuperJSON | null>(null);
 const cueState = ref<PlayerCue[]>([]);
 const peaks = shallowRef<any>(null);
@@ -47,8 +52,13 @@ const isPlaying = ref(false);
 const isSaving = ref(false);
 const loadError = ref<string | null>(null);
 const hasUnsavedChanges = ref(false);
+const isGridEditMode = ref(false);
+const activeZoomLevelIndex = ref(0);
 const activeCue = ref<PlayerCue | null>(null);
 const activePad = ref<number | null>(null);
+const isAnalysisRunning = computed(() => status.value === "running");
+const hasBpmChanges = computed(() => trackData.value.bpm !== savedBpm.value);
+const hasGridAnchorChanges = computed(() => trackData.value.grid_anchor_ms !== savedGridAnchorMs.value);
 const contextMenu = ref({ visible: false, x: 0, y: 0, cue: null as PlayerCue | null });
 let loadToken = 0;
 let peaksInitToken = 0;
@@ -64,14 +74,20 @@ const { trackCssGradient, startSyncLoop, stopSyncLoop } = useWaveformSync({
 });
 
 function finiteNumber(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
-function createPeaksWaveformData(data: number[]) { return { json: { version: 2, channels: 1, sample_rate: 11025, samples_per_pixel: 128, bits: 8, length: Math.floor(data.length / 2), data } }; }
+function isPadIndex(value: number): boolean { return Number.isInteger(value) && value >= 0 && value < PAD_COUNT; }
+function createPeaksWaveformData(data: number[]) { return { json: { version: 2, channels: 1, sample_rate: 11025, samples_per_pixel: 64, bits: 8, length: Math.floor(data.length / 2), data } }; }
 function toCueId(value: unknown): number | null { if (value === null || value === undefined || value === "") return null; const numberValue = Number(value); return Number.isFinite(numberValue) && Number.isInteger(numberValue) ? numberValue : null; }
-function normalizeTrackPath(path: string): string { return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase(); }
+watch(isAnalysisRunning, (running) => {
+  if (running && isPlaying.value) {
+    peaks.value?.player.pause();
+    isPlaying.value = false;
+  }
+});
 
 function mergeCues(...sources: ReadonlyArray<PlayerCue>[]): PlayerCue[] {
   const byId = new Map<number, PlayerCue>();
   for (const source of sources) for (const cue of source) {
-    if (!Number.isInteger(cue.id) || !finiteNumber(cue.position_ms)) continue;
+    if (!isPadIndex(cue.id) || !finiteNumber(cue.position_ms)) continue;
     byId.set(cue.id, { id: cue.id, position_ms: cue.position_ms, is_valid: cue.is_valid === true });
   }
   return [...byId.values()].sort((a, b) => a.position_ms - b.position_ms);
@@ -88,14 +104,31 @@ function metadataCuesForTrack(metadata: Awaited<ReturnType<typeof fetchTrackMeta
     return [{ id, position_ms: positionMs, is_valid: Math.abs(positionMs - nearest) <= 1 }];
   });
 }
+function toCuePointPayload(cues: readonly PlayerCue[]): CuePointPayload[] {
+  return cues
+    .filter((cue) => isPadIndex(cue.id) && finiteNumber(cue.position_ms))
+    .map((cue) => {
+      const padNumber = cue.id + 1;
+      return {
+        name: `Cue ${padNumber}`,
+        type: 0,
+        start_ms: Number(cue.position_ms),
+        len_ms: 0.0,
+        repeats: -1,
+        hotcue: padNumber - 1,
+        displ_order: 0,
+      };
+    });
+}
 
 const currentLibraryTrack = computed(() => {
-  const target = normalizeTrackPath(trackData.value.track_path);
-  return target ? (libraryTracks.value as unknown as LibraryTrackRecord[]).find((track) => typeof track.location_path === "string" && normalizeTrackPath(track.location_path) === target) : undefined;
+  return trackData.value.track_path
+    ? collection.value[trackData.value.track_path]
+    : undefined;
 });
 const trackHeaderLabel = computed(() => {
   const track = currentLibraryTrack.value;
-  return track && typeof track.artist === "string" && typeof track.title === "string" ? `ARTIST: ${track.artist} | TITLE: ${track.title}` : "Track metadata unavailable";
+  return track ? `ARTIST: ${track.artist} | TITLE: ${track.title}` : "Track metadata unavailable";
 });
 const cueCount = computed(() => cueState.value.filter((cue) => cue.id !== undefined && cue.id !== null).length);
 const validCueCount = computed(() => cueState.value.filter((cue) => cue.id !== undefined && cue.id !== null && cue.is_valid).length);
@@ -105,16 +138,138 @@ const remainingLabel = computed(() => {
   const remaining = Math.max(0, trackData.value.duration_ms / 1000 - currentTime.value);
   return `-${String(Math.floor(remaining / 60)).padStart(2, "0")}:${String(Math.floor(remaining % 60)).padStart(2, "0")}`;
 });
-const padSlots = computed(() => Array.from({ length: 8 }, (_, index) => cueState.value.find((cue) => cue.id === index) ?? null));
+const padSlots = computed(() => Array.from({ length: PAD_COUNT }, (_, index) => cueState.value.find((cue) => cue.id === index) ?? null));
 
-function paintMarkers(): void { paintAllMarkers(peaks.value, trackData.value, cueState.value); }
+const nudgeResolution = computed(() => {
+  const resolutions = [
+    { multiplier: 0.03125, label: "1/32 Beat" },
+    { multiplier: 0.0625, label: "1/16 Beat" },
+    { multiplier: 0.25, label: "1/4 Beat" },
+    { multiplier: 0.5, label: "1/2 Beat" },
+    { multiplier: 1, label: "1 Beat" },
+    { multiplier: 2, label: "2 Beats" },
+    { multiplier: 4, label: "4 Beats" },
+  ] as const;
+
+  return resolutions[activeZoomLevelIndex.value] ?? resolutions[0];
+});
+const dynamicNudgeMs = computed(() => nudgeResolution.value.multiplier * beatMs(trackData.value.bpm));
+const isFlexGrid = computed(() => (currentPreview.value?.existing_cues.filter((cue) => cue.type === "GRID").length ?? 0) > 1);
+
+function paintMarkers(): void { paintAllMarkers(peaks.value, trackData.value, cueState.value, isGridEditMode.value); }
+function addCue(padIndex: number): void {
+  if (isAnalysisRunning.value || isLoadingTrack.value || !trackData.value.track_path) return;
+  if (!isPadIndex(padIndex)) return;
+  if (cueState.value.some((cue) => cue.id === padIndex)) return;
+
+  const currentSeconds = peaks.value?.player.getCurrentTime();
+  const playheadMs = typeof currentSeconds === "number" ? currentSeconds * 1000 : Number.NaN;
+  const { bpm, grid_anchor_ms: gridAnchorMs, duration_ms: durationMs } = trackData.value;
+  const snappedMs = snapToGrid(playheadMs, bpm, gridAnchorMs);
+  if (
+    !finiteNumber(playheadMs)
+    || !finiteNumber(bpm)
+    || bpm <= 0
+    || !finiteNumber(gridAnchorMs)
+    || !finiteNumber(snappedMs)
+    || !finiteNumber(durationMs)
+    || durationMs <= 0
+    || snappedMs < 0
+    || snappedMs > durationMs
+  ) return;
+
+  cueState.value = [...cueState.value, { id: padIndex, position_ms: snappedMs, is_valid: true }];
+  hasUnsavedChanges.value = true;
+  paintMarkers();
+}
+function deleteCue(padIndex: number): void {
+  if (!isPadIndex(padIndex)) return;
+  const nextCues = cueState.value.filter((cue) => cue.id !== padIndex);
+  if (nextCues.length === cueState.value.length) return;
+
+  cueState.value = nextCues;
+  hasUnsavedChanges.value = true;
+  paintMarkers();
+}
+function toggleGridEditMode(): void {
+  if (isFlexGrid.value) return;
+  isGridEditMode.value = !isGridEditMode.value;
+  paintMarkers();
+}
+function multiplyBpm(): void {
+  if (!isGridEditMode.value || !trackData.value.track_path) return;
+  const currentBpm = trackData.value.bpm;
+  const nextBpm = currentBpm * 2;
+  if (!finiteNumber(currentBpm) || !finiteNumber(nextBpm) || nextBpm < MIN_BPM || nextBpm > MAX_BPM) return;
+
+  trackData.value.bpm = nextBpm;
+  hasUnsavedChanges.value = true;
+  paintMarkers();
+}
+function divideBpm(): void {
+  if (!isGridEditMode.value || !trackData.value.track_path) return;
+  const currentBpm = trackData.value.bpm;
+  const nextBpm = currentBpm / 2;
+  if (!finiteNumber(currentBpm) || !finiteNumber(nextBpm) || nextBpm < MIN_BPM || nextBpm > MAX_BPM) return;
+
+  trackData.value.bpm = nextBpm;
+  hasUnsavedChanges.value = true;
+  paintMarkers();
+}
+function shiftGrid(deltaMs: number, dragStartAnchorMs: number | undefined = undefined, repaint = true): void {
+  if (!Number.isFinite(deltaMs) || !trackData.value.track_path) return;
+
+  const requestedDelta = dragStartAnchorMs === undefined
+      ? deltaMs
+      : deltaMs - (trackData.value.grid_anchor_ms - dragStartAnchorMs);
+
+  const minimumDelta = Math.max(
+    -trackData.value.grid_anchor_ms,
+    ...cueState.value.map((cue) => -cue.position_ms),
+  );
+
+  const appliedDelta = Math.max(requestedDelta, minimumDelta);
+  if (appliedDelta === 0) {
+    if (repaint) paintMarkers();
+    return;
+  }
+
+  trackData.value.grid_anchor_ms += appliedDelta;
+  cueState.value = cueState.value.map((cue) => ({ ...cue, position_ms: cue.position_ms + appliedDelta }));
+  hasUnsavedChanges.value = true;
+  if (repaint) paintMarkers();
+}
+function updateActiveZoomLevelIndex(currentZoom: number): void {
+  if (!Number.isFinite(currentZoom)) return;
+
+  const exactIndex = ZOOM_LEVELS.indexOf(currentZoom);
+  if (exactIndex !== -1) {
+    activeZoomLevelIndex.value = exactIndex;
+    return;
+  }
+
+  activeZoomLevelIndex.value = ZOOM_LEVELS.reduce(
+    (nearestIndex, level, index) =>
+      Math.abs(level - currentZoom) < Math.abs(ZOOM_LEVELS[nearestIndex] - currentZoom)
+        ? index
+        : nearestIndex,
+    0,
+  );
+}
+function setGridToPlayhead(): void {
+  const currentSeconds = peaks.value?.player.getCurrentTime();
+  if (!isGridEditMode.value || !Number.isFinite(currentSeconds)) return;
+  shiftGrid(currentSeconds * 1000 - trackData.value.grid_anchor_ms);
+}
+function handleGridAnchorDrag({ deltaMs, startAnchorMs, isFinal }: { deltaMs: number; startAnchorMs: number; isFinal: boolean }): void {
+  // Keep Konva's native drag responsive; rebuild the marker layer only at drag end.
+  shiftGrid(deltaMs, startAnchorMs, isFinal);
+}
 function openContextMenu(event: MouseEvent, cue: PlayerCue): void { contextMenu.value = { visible: true, x: event.clientX, y: event.clientY, cue }; }
 function closeContextMenu(): void { contextMenu.value.visible = false; contextMenu.value.cue = null; }
 function deleteSelectedCue(): void {
   if (!contextMenu.value.cue) return;
-  cueState.value = cueState.value.filter((cue) => cue.id !== contextMenu.value.cue?.id);
-  hasUnsavedChanges.value = true;
-  try { paintMarkers(); } catch (error) { console.warn("Fallo al repintar tras borrar el cue", error); }
+  deleteCue(contextMenu.value.cue.id);
   closeContextMenu();
 }
 
@@ -150,7 +305,7 @@ async function initPeaks(): Promise<void> {
   audio.load();
   const initToken = ++peaksInitToken;
   Peaks.init({
-    zoomview: { container: zoomview, waveformColor: "#ffffff", playedWaveformColor: "#a1a1aa", playheadColor: HEX_ACCENT, showPlayheadTime: false, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
+    zoomview: { container: zoomview, waveformColor: "#ffffff", playedWaveformColor: "#636368", playheadColor: HEX_ACCENT, showPlayheadTime: true, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
     overview: { container: overview, highlightOffset: 0, waveformColor: HEX_GRAY, playedWaveformColor: HEX_SECONDARY, highlightColor: HEX_PRIMARY, highlightStrokeColor: HEX_ACCENT, highlightOpacity: 0.15, playheadColor: HEX_ACCENT, showPlayheadTime: false, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
     mediaElement: audio, waveformData: createPeaksWaveformData(preview.waveform_peaks), webAudio: false as never, zoomLevels: ZOOM_LEVELS, keyboard: false, pointMarkerColor: HEX_ACCENT, createPointMarker,
   }, (error: Error | null, instance: unknown) => {
@@ -159,14 +314,14 @@ async function initPeaks(): Promise<void> {
     peaks.value = instance;
     try {
       const view = peaks.value.views.getView("zoomview");
+      wirePlayerEvents();
       const waveformCanvas = zoomview.querySelector("canvas");
       if (waveformCanvas) { waveformCanvas.style.backgroundColor = "#18181b"; waveformCanvas.style.mixBlendMode = "darken"; }
       if (view) {
         if (!trackData.value.duration_ms) trackData.value.duration_ms = peaks.value.player.getDuration() * 1000;
-        view.setZoom({ seconds: trackData.value.duration_ms / 2000 });
+        view.setZoom({ seconds: trackData.value.duration_ms / 1500 });
       }
       paintMarkers();
-      wirePlayerEvents();
       wireDragEvents();
       startSyncLoop();
     } catch (decorationError) {
@@ -179,6 +334,9 @@ async function initPeaks(): Promise<void> {
 function wirePlayerEvents(): void {
   const instance = peaks.value;
   if (!instance) return;
+  instance.on("zoom.update", (event: { currentZoom: number }) => {
+    updateActiveZoomLevelIndex(event.currentZoom);
+  });
   instance.on("player.playing", () => { isPlaying.value = true; });
   instance.on("player.pause", () => { isPlaying.value = false; });
   instance.on("player.ended", () => { isPlaying.value = false; });
@@ -188,12 +346,25 @@ function wireDragEvents(): void {
   const instance = peaks.value;
   if (!instance) return;
   const snap = (time: number) => Math.max(0, Math.min(snapToGrid(time * 1000, trackData.value.bpm, trackData.value.grid_anchor_ms), trackData.value.duration_ms));
+  let gridAnchorDragStartMs: number | null = null;
   instance.on("points.dragmove", (event: { point: { id: string; time: number } }) => {
+    if (event.point.id === "grid-anchor") {
+      const startAnchorMs = gridAnchorDragStartMs ?? trackData.value.grid_anchor_ms;
+      gridAnchorDragStartMs = startAnchorMs;
+      notifyGridAnchorDrag({ deltaMs: event.point.time * 1000 - startAnchorMs, startAnchorMs, isFinal: false });
+      return;
+    }
     if (!event.point.id.startsWith("cue-")) return;
     const snapped = snap(event.point.time) / 1000;
     if (event.point.time !== snapped) instance.points.getPoint(event.point.id)?.update({ time: snapped });
   });
   instance.on("points.dragend", (event: { point: { id: string; time: number } }) => {
+    if (event.point.id === "grid-anchor") {
+      const startAnchorMs = gridAnchorDragStartMs ?? trackData.value.grid_anchor_ms;
+      notifyGridAnchorDrag({ deltaMs: event.point.time * 1000 - startAnchorMs, startAnchorMs, isFinal: true });
+      gridAnchorDragStartMs = null;
+      return;
+    }
     if (!event.point.id.startsWith("cue-")) return;
     const cue = cueState.value.find((candidate) => candidate.id === Number(event.point.id.slice(4)));
     if (!cue || !cue.is_valid) return;
@@ -203,10 +374,11 @@ function wireDragEvents(): void {
   });
 }
 
-async function togglePlay(): Promise<void> { const instance = peaks.value; if (!instance) return; if (isPlaying.value) { instance.player.pause(); return; } try { await instance.player.play(); } catch (error) { loadError.value = `Playback failed: ${String(error)}`; } }
-function stop(): void { const instance = peaks.value; if (!instance) return; instance.player.pause(); instance.player.seek(0); isPlaying.value = false; }
-function jumpToCue(padIndex: number): void { const cue = padSlots.value[padIndex - 1]; if (peaks.value && cue) peaks.value.player.seek(cue.position_ms / 1000); }
+async function togglePlay(): Promise<void> { if (isAnalysisRunning.value) return; const instance = peaks.value; if (!instance) return; if (isPlaying.value) { instance.player.pause(); return; } try { await instance.player.play(); } catch (error) { loadError.value = `Playback failed: ${String(error)}`; } }
+function stop(): void { if (isAnalysisRunning.value) return; const instance = peaks.value; if (!instance) return; instance.player.pause(); instance.player.seek(0); isPlaying.value = false; }
+function jumpToCue(padIndex: number): void { if (isAnalysisRunning.value) return; const cue = padSlots.value[padIndex - 1]; if (peaks.value && cue) peaks.value.player.seek(cue.position_ms / 1000); }
 async function startCuePreview(padIndex: number): Promise<void> {
+  if (isAnalysisRunning.value) return;
   const cue = padSlots.value[padIndex - 1];
   const instance = peaks.value;
   if (!instance || !cue || activeCue.value) return;
@@ -222,7 +394,33 @@ function endCuePreview(padIndex: number): void {
   if (peaks.value && cue && activeCue.value?.id === cue.id) { peaks.value.player.pause(); peaks.value.player.seek(cue.position_ms / 1000); }
   activeCue.value = null; activePad.value = null; isPlaying.value = false;
 }
-usePlayerKeyboard({ togglePlay, stop, hasPad: (padIndex) => Boolean(padSlots.value[padIndex - 1]), previewStart: startCuePreview, previewEnd: endCuePreview });
+function skipBeats(beatsToSkip: number): void {
+  if (isAnalysisRunning.value) return; // Si está analizando, bloqueamos
+  const instance = peaks.value;
+  if (!instance || trackData.value.bpm <= 0) return;
+
+  // Calculamos cuánto dura un beat en segundos y lo multiplicamos
+  const beatDurationSec = 60 / trackData.value.bpm;
+  const timeShiftSec = beatsToSkip * beatDurationSec;
+
+  const currentSec = instance.player.getCurrentTime();
+  const totalSec = trackData.value.duration_ms / 1000;
+
+  // Calculamos el nuevo tiempo asegurándonos de no salirnos de la pista
+  const newTime = Math.max(0, Math.min(currentSec + timeShiftSec, totalSec));
+
+  instance.player.seek(newTime);
+}
+usePlayerKeyboard({
+  togglePlay,
+  stop,
+  getPad: (padNumber) => padSlots.value[padNumber - 1] ?? null,
+  jump: startCuePreview,
+  previewEnd: endCuePreview,
+  addCue,
+  deleteCue,
+  skipBeats,
+});
 
 function zoomIn(): void { const view = peaks.value?.views.getView("zoomview"); if (view) view.setZoom({ seconds: Math.max(1, (view.getEndTime() - view.getStartTime()) * 0.8) }); }
 function zoomOut(): void { const view = peaks.value?.views.getView("zoomview"); if (view) view.setZoom({ seconds: Math.min(trackData.value.duration_ms / 1000, (view.getEndTime() - view.getStartTime()) * 1.2) }); }
@@ -234,6 +432,10 @@ function handleZoomWheel(event: WheelEvent): void {
   const startTime = view.getStartTime();
   const visibleSeconds = view.getEndTime() - startTime;
   const rect = container.getBoundingClientRect();
+  if (event.altKey && isGridEditMode.value) {
+    shiftGrid(event.deltaY < 0 ? -dynamicNudgeMs.value : dynamicNudgeMs.value);
+    return;
+  }
   if (event.shiftKey) { view.setStartTime(Math.max(0, Math.min(startTime + event.deltaY * (visibleSeconds / rect.width) * 1.5, totalSeconds - visibleSeconds))); return; }
   if (!event.ctrlKey && !event.metaKey) return;
   const ratio = (event.clientX - rect.left) / rect.width;
@@ -249,14 +451,62 @@ async function saveChanges(): Promise<void> {
   if (!trackData.value.track_path) return;
   isSaving.value = true; loadError.value = null;
   try {
-    const result = await updateTrackCues(trackData.value.track_path, cueState.value.map((cue) => ({ hotcue: cue.id, start_ms: cue.position_ms })));
+    const cuePoints = toCuePointPayload(cueState.value);
+    const result = await updateTrackCues(
+      trackData.value.track_path,
+      cuePoints,
+      hasGridAnchorChanges.value ? trackData.value.grid_anchor_ms : undefined,
+      hasBpmChanges.value ? trackData.value.bpm : undefined,
+    );
     if (!result.ok) throw new Error(result.error);
+// 1. Actualizamos el estado actual del reproductor
     trackData.value.cues = JSON.parse(JSON.stringify(cueState.value));
+    savedBpm.value = trackData.value.bpm;
+    savedGridAnchorMs.value = trackData.value.grid_anchor_ms;
     hasUnsavedChanges.value = false;
+
+    patchTrackInCollection(trackData.value.track_path, {
+      bpm: trackData.value.bpm,
+    });
+
+    // 2. ACTUALIZACIÓN DE LA CACHÉ EN CALIENTE
+    const cachedMetadata = previewCache.value.get(trackData.value.track_path);
+    if (cachedMetadata) {
+      // Reutilizamos el 'cuePoints' que ya está perfectamente mapeado para Python (hotcue 0-7)
+      // para reconstruir el formato que espera la caché de Vue
+      const updatedCacheCues = cuePoints.map((cp) => ({
+        name: cp.name,
+        type: "CUE",
+        start_ms: cp.start_ms,
+        hotcue: cp.hotcue,
+      }));
+
+      // Inyectamos también el marcador del Grid actualizado para que no se pierda al recargar
+      updatedCacheCues.push({
+        name: "Grid",
+        type: "GRID",
+        start_ms: trackData.value.grid_anchor_ms,
+        hotcue: -1, // Traktor usa -1 para marcadores no asignados a un Pad
+      });
+
+      // Sobrescribimos el Map con los metadatos frescos
+      previewCache.value.set(trackData.value.track_path, {
+        ...cachedMetadata,
+        bpm: trackData.value.bpm,
+        grid_anchor_ms: trackData.value.grid_anchor_ms,
+        existing_cues: updatedCacheCues as any, // Hacemos cast a any o al tipo exacto si lo tienes tipado estricto
+      });
+    }
   } catch (error) { loadError.value = `Failed to save changes: ${error instanceof Error ? error.message : String(error)}`; }
   finally { isSaving.value = false; }
 }
-function discardChanges(): void { setCueState(trackData.value.cues); hasUnsavedChanges.value = false; try { paintMarkers(); } catch (error) { console.error("[AudioPlayer] marker repaint failed:", error); } }
+function discardChanges(): void {
+  setCueState(trackData.value.cues);
+  trackData.value.bpm = savedBpm.value;
+  trackData.value.grid_anchor_ms = savedGridAnchorMs.value;
+  hasUnsavedChanges.value = false;
+  try { paintMarkers(); } catch (error) { console.error("[AudioPlayer] marker repaint failed:", error); }
+}
 
 async function loadTrack(path: string): Promise<void> {
   const trimmed = path.trim(); if (!trimmed) return;
@@ -269,18 +519,20 @@ async function loadTrack(path: string): Promise<void> {
     if (token !== loadToken) return;
     if (!metadataResult.ok || !metadataResult.metadata) throw new Error(metadataResult.error ? String(metadataResult.error) : "No se pudieron obtener los metadatos de la pista desde el NML.");
     const metadata = metadataResult.metadata;
+    savedBpm.value = metadata.bpm;
     previewCache.value.set(trimmed, metadata);
     currentPreview.value = metadata;
     const metadataCues = metadataCuesForTrack(metadata);
     const metadataDuration = Number((metadata as unknown as { duration_ms?: unknown }).duration_ms) || 0;
     trackData.value = { track_path: trimmed, bpm: metadata.bpm || 0, grid_anchor_ms: metadata.grid_anchor_ms || 0, duration_ms: metadataDuration, cues: metadataCues };
-    setCueState(metadataCues); hasUnsavedChanges.value = false;
+    savedGridAnchorMs.value = trackData.value.grid_anchor_ms;
+    setCueState(metadataCues); hasUnsavedChanges.value = false; isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
     await nextTick(); if (token !== loadToken) return;
     await initPeaks();
   } catch (error) {
     if (token !== loadToken) return;
     loadError.value = error instanceof Error ? error.message : String(error);
-    trackData.value = { ...EMPTY_TRACK }; currentPreview.value = null; cueState.value = []; hasUnsavedChanges.value = false;
+    trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; currentPreview.value = null; cueState.value = []; hasUnsavedChanges.value = false; isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
     await destroyPeaks();
   } finally { if (token === loadToken) setLoadingTrack(false); }
 }
@@ -292,24 +544,47 @@ onBeforeUnmount(() => { loadToken += 1; void destroyPeaks(); });
 watch(status, async (nextStatus, previousStatus) => {
   if (nextStatus !== "success" || previousStatus !== "running" || !trackData.value.track_path) return;
   const currentPath = trackData.value.track_path;
-  if (selectedTrackPath.value === currentPath && !selectedPlaylist.value) {
-    const newCues = logs.value.flatMap((log) => log.msg?.type === "cue_written" ? [{ id: Number(log.msg.hotcue), position_ms: Number(log.msg.start_ms), is_valid: true }] : []);
-    if (newCues.length) { const merged = mergeCues(cueState.value, newCues); trackData.value.cues = merged; setCueState(merged); hasUnsavedChanges.value = false; try { paintMarkers(); } catch { /* no marker layer during teardown */ } }
-    return;
-  }
-  try {
-    const metadataResult = await fetchTrackMetadata(currentPath);
-    if (!metadataResult.ok || !metadataResult.metadata) return;
-    const diskCues = metadataCuesForTrack(metadataResult.metadata);
-    if (JSON.stringify(diskCues.map((cue) => cue.position_ms)) !== JSON.stringify(cueState.value.map((cue) => cue.position_ms))) {
-      trackData.value.cues = diskCues; setCueState(diskCues); hasUnsavedChanges.value = false; try { paintMarkers(); } catch { /* no marker layer during teardown */ }
+
+  // 1. Extraemos los cues del log del último análisis
+  const newCues = logs.value.flatMap((log) =>
+    log.msg?.type === "cue_written"
+      ? [{ id: Number(log.msg.hotcue), position_ms: Number(log.msg.start_ms), is_valid: true }]
+      : []
+  );
+
+  // 2. Si hay más de 8 cues, es un análisis de Playlist masivo.
+  // Lo ignoramos para no inyectar cues de otras canciones en el reproductor actual.
+  if (newCues.length > 8) return;
+
+  // 3. Si la pista seleccionada en la UI es la que tenemos abierta en el reproductor
+  if (selectedTrackPath.value === currentPath) {
+    // EL PURGADOR: Si clearExisting está activo, vaciamos la memoria base
+    const baseCues = clearExisting.value ? [] : cueState.value;
+    const merged = mergeCues(baseCues, newCues);
+
+    trackData.value.cues = merged;
+    setCueState(merged);
+    hasUnsavedChanges.value = false;
+
+    // ACTUALIZACIÓN DE CACHÉ: Sobreescribimos la memoria de Vue en vivo
+    // para que si el usuario redimensiona la ventana no reaparezcan los fantasmas
+    const cachedMeta = previewCache.value.get(currentPath);
+    if (cachedMeta) {
+      cachedMeta.existing_cues = merged.map(c => ({
+        hotcue: c.id,
+        name: "Cue",
+        start_ms: c.position_ms,
+        type: "CUE"
+      }));
     }
-  } catch (error) { console.warn("[AudioPlayer] Error comprobando NML:", error); }
+
+    try { paintMarkers(); } catch { /* ignore */ }
+  }
 });
 watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
   if (next === previous) return;
   if (next) void loadTrack(next);
-  else { trackData.value = { ...EMPTY_TRACK }; cueState.value = []; hasUnsavedChanges.value = false; loadError.value = null; setLoadingTrack(false); void destroyPeaks(); }
+  else { trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; cueState.value = []; hasUnsavedChanges.value = false; loadError.value = null; setLoadingTrack(false); void destroyPeaks(); }
 });
 </script>
 
@@ -318,8 +593,59 @@ watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
     <PlayerHeader :has-track="Boolean(trackData.track_path)" :track-header-label="trackHeaderLabel" :bpm-label="bpmLabel" :remaining-label="remainingLabel" :cue-count="cueCount" :valid-cue-count="validCueCount" />
     <div v-if="loadError" class="text-xs font-mono text-red-500 bg-zinc-950 border border-zinc-800 rounded px-2 py-1">{{ loadError }}</div>
     <audio ref="audioRef" class="hidden" preload="none" aria-hidden="true" />
+    <div
+        class="transition-opacity duration-300 flex-1 min-h-0 flex flex-col"
+        :class="{ 'opacity-50 pointer-events-none grayscale': isAnalysisRunning }"
+        >
     <PlayerWaveform ref="waveformRef" :has-track="Boolean(trackData.track_path)" :is-loading="isLoadingTrack" :is-saving="isSaving" :track-css-gradient="trackCssGradient" @resize="handleWaveformResize" @wheel="handleZoomWheel" @zoom-in="zoomIn" @zoom-out="zoomOut" />
-    <PlayerTransport :has-track="Boolean(trackData.track_path)" :is-playing="isPlaying" :pad-slots="padSlots" :active-pad="activePad" @play="togglePlay" @stop="stop" @jump="jumpToCue" @preview-start="startCuePreview" @preview-end="endCuePreview" @context-menu="openContextMenu" />
+        </div>
+    <div
+        class="transition-opacity duration-300 shrink-0 flex items-center gap-2"
+        :class="{ 'opacity-50 pointer-events-none grayscale': isAnalysisRunning }"
+    >
+      <div class="flex-1 min-w-0">
+        <PlayerTransport
+            :has-track="Boolean(trackData.track_path)"
+            :is-playing="isPlaying"
+            :pad-slots="padSlots"
+            :active-pad="activePad"
+            @play="togglePlay"
+            @stop="stop"
+            @jump="jumpToCue"
+            @add-cue="addCue"
+            @preview-start="startCuePreview"
+            @preview-end="endCuePreview"
+            @context-menu="openContextMenu"
+        />
+      </div>
+
+      <PlayerGridControls
+          :has-track="Boolean(trackData.track_path)"
+          :is-flex-grid="isFlexGrid"
+          :is-grid-edit-mode="isGridEditMode"
+          :dynamic-label="nudgeResolution.label"
+          :dynamic-step-ms="dynamicNudgeMs"
+          :has-unsaved-changes="hasUnsavedChanges"
+          @nudge="shiftGrid"
+          @set-to-playhead="setGridToPlayhead"
+          @multiply-bpm="multiplyBpm"
+          @divide-bpm="divideBpm"
+          @save="saveChanges"
+          @discard="discardChanges"
+      />
+
+      <button
+          v-if="trackData.track_path"
+          type="button"
+          class="text-xs font-semibold uppercase px-4 h-[34px] rounded border transition-colors shrink-0 flex items-center justify-center disabled:cursor-not-allowed disabled:opacity-50"
+          :class="isGridEditMode ? 'bg-accent text-zinc-950 border-accent' : 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700'"
+          :disabled="isFlexGrid"
+          :title="isFlexGrid ? 'Variable BPM (Flex Grid) is unsupported; grid editing is disabled.' : 'Enables or disables editing the Grid Anchor.'"
+          @click="toggleGridEditMode"
+      >
+        {{ isGridEditMode ? 'Exit Grid Edit' : 'Edit Grid' }}
+      </button>
+    </div>
     <div class="flex items-center gap-2 px-1">
       <span class="text-xs font-mono" :class="hasUnsavedChanges ? 'text-warning' : 'text-zinc-500'">{{ hasUnsavedChanges ? "● Unsaved changes" : "Synced" }}</span>
       <div class="flex-1" />

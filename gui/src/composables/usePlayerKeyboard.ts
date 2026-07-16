@@ -1,11 +1,15 @@
 import { onBeforeUnmount, onMounted } from "vue";
+import type { PlayerCue } from "./usePeaksMarkers";
 
 export interface PlayerKeyboardHandlers {
   togglePlay: () => void | Promise<void>;
   stop: () => void;
-  hasPad: (padIndex: number) => boolean;
-  previewStart: (padIndex: number) => void | Promise<void>;
-  previewEnd: (padIndex: number) => void;
+  getPad: (padNumber: number) => PlayerCue | null;
+  jump: (padNumber: number) => void | Promise<void>;
+  previewEnd?: (padNumber: number) => void;
+  addCue: (padIndex: number) => void | Promise<void>;
+  deleteCue: (padIndex: number) => void | Promise<void>;
+  skipBeats?: (beats: number) => void;
 }
 
 export function isFocusedOnInput(): boolean {
@@ -14,22 +18,51 @@ export function isFocusedOnInput(): boolean {
   return ["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName) || element.isContentEditable;
 }
 
+function getPadNumber(event: KeyboardEvent): number | null {
+  const match = /^(?:Digit|Numpad)([1-8])$/.exec(event.code) ?? /^[1-8]$/.exec(event.key);
+  return match ? Number(match[1]) : null;
+}
+
 /** Registers keyboard transport shortcuts exactly for the component lifecycle. */
 export function usePlayerKeyboard(handlers: PlayerKeyboardHandlers): void {
+  const previewingPads = new Set<number>();
   const onKeyDown = (event: KeyboardEvent) => {
     if (isFocusedOnInput() || event.repeat) return;
     if (event.key === " ") { event.preventDefault(); void handlers.togglePlay(); return; }
     if (event.key === "Enter") { event.preventDefault(); handlers.stop(); return; }
-    if (/^[1-8]$/.test(event.key)) {
+    const padNumber = getPadNumber(event);
+    if (padNumber !== null) {
       event.preventDefault();
-      const padIndex = Number(event.key);
-      if (handlers.hasPad(padIndex)) void handlers.previewStart(padIndex);
+      const cue = handlers.getPad(padNumber);
+      if (event.shiftKey) {
+        if (cue) void handlers.deleteCue(padNumber - 1);
+        return;
+      }
+      if (cue) {
+        previewingPads.add(padNumber);
+        void handlers.jump(padNumber);
+      } else {
+        void handlers.addCue(padNumber - 1);
+      }
+      return;
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      handlers.skipBeats?.(8);
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      handlers.skipBeats?.(-8);
+      return;
     }
   };
   const onKeyUp = (event: KeyboardEvent) => {
-    if (isFocusedOnInput() || !/^[1-8]$/.test(event.key)) return;
+    if (isFocusedOnInput()) return;
+    const padNumber = getPadNumber(event);
+    if (padNumber === null || !previewingPads.delete(padNumber)) return;
     event.preventDefault();
-    handlers.previewEnd(Number(event.key));
+    handlers.previewEnd?.(padNumber);
   };
   onMounted(() => { window.addEventListener("keydown", onKeyDown); window.addEventListener("keyup", onKeyUp); });
   onBeforeUnmount(() => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); });

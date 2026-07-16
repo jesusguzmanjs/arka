@@ -53,6 +53,9 @@ class AppConfig:
         0.30  # keep only candidates >= this fraction of the track's max confidence
     )
 
+    # Soft spatial guardrail for otherwise valid structural candidates.
+    spatial_penalty_alpha: float = 0.6
+
     # v1.8 data export: write per-candidate telemetry to a CSV for offline tuning
     export_csv_path: str | None = None
 

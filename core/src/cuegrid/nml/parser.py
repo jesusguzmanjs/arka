@@ -16,6 +16,7 @@ writing cues back to the file.
 
 from __future__ import annotations
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from cuegrid.nml.constants import CueType
 from cuegrid.nml.models import CuePoint, TempoInfo, TrackEntry
 
 _WINDOWS_VOLUME_RE = re.compile(r"^[A-Za-z]:$")
+
+logger = logging.getLogger(__name__)
 
 TRAKTOR_SYSTEM_PLAYLISTS = ["_LOOPS", "_RECORDINGS"]
 
@@ -44,6 +47,14 @@ class PlaylistNotFoundError(Exception):
 
 class AmbiguousPlaylistError(Exception):
     """Raised when more than one ``<NODE TYPE="PLAYLIST">`` matches the requested name."""
+
+
+class DuplicateLocationError(ValueError):
+    """Raised when two collection entries normalize to the same location."""
+
+    def __init__(self, location_path: str) -> None:
+        self.location_path = location_path
+        super().__init__(f"Duplicate collection LOCATION: {location_path!r}")
 
 
 @dataclass
@@ -266,6 +277,128 @@ class NmlParser:
         entry = self.find_entry(track_path, title=title, artist=artist)
         return self._track_entry_to_metadata_dict(entry)
 
+    def get_library(self) -> dict[str, Any]:
+        """Build the relational Global Collection export from the live tree.
+
+        The collection is indexed once by normalized ``LOCATION``. Playlist
+        entries are then reduced to normalized ``PRIMARYKEY`` references, so
+        track metadata is never copied into playlist nodes. Iteration stays on
+        direct children of the relevant XML nodes to avoid broad descendant
+        searches and temporary lists for large libraries.
+
+        Raises:
+            DuplicateLocationError: if two collection entries have the same
+                normalized location and the export would lose one of them.
+        """
+        collection: dict[str, dict[str, Any]] = {}
+        collection_el = self._root.find("COLLECTION")
+
+        if collection_el is not None:
+            collection_index = 0
+            for entry_el in collection_el:
+                if entry_el.tag != "ENTRY":
+                    continue
+
+                track_entry = self._entry_from_element(entry_el)
+                location_path = track_entry.location_path
+                if location_path in collection:
+                    raise DuplicateLocationError(location_path)
+
+                metadata = self._track_entry_to_metadata_dict(track_entry)
+                metadata.update(
+                    {
+                        "location_path": location_path,
+                        "duration_ms": track_entry.duration_ms,
+                        "collection_index": collection_index,
+                    }
+                )
+                collection[location_path] = metadata
+                collection_index += 1
+
+        playlists_el = self._root.find("PLAYLISTS")
+        playlists = (
+            self._playlist_nodes_to_payload(playlists_el, collection)
+            if playlists_el is not None
+            else []
+        )
+        return {"collection": collection, "playlists": playlists}
+
+    def _playlist_nodes_to_payload(
+        self,
+        playlists_el: ET.Element,
+        collection: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert direct ``PLAYLISTS`` children without embedding tracks."""
+        nodes: list[dict[str, Any]] = []
+        for child in playlists_el:
+            if child.tag != "NODE":
+                continue
+            node = self._playlist_node_to_payload(child, collection)
+            if node is not None:
+                nodes.append(node)
+        return nodes
+
+    def _playlist_node_to_payload(
+        self,
+        node_el: ET.Element,
+        collection: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Convert one playlist/folder node and recursively retain its shape."""
+        node_type = node_el.get("TYPE")
+        name = node_el.get("NAME", "")
+
+        if node_type == "FOLDER":
+            children: list[dict[str, Any]] = []
+            for child_container in node_el:
+                if child_container.tag != "SUBNODES":
+                    continue
+                for child_node in child_container:
+                    if child_node.tag != "NODE":
+                        continue
+                    child_payload = self._playlist_node_to_payload(
+                        child_node, collection
+                    )
+                    if child_payload is not None:
+                        children.append(child_payload)
+            return {"kind": "folder", "name": name, "children": children}
+
+        if node_type == "PLAYLIST":
+            playlist_el = node_el.find("PLAYLIST")
+            track_paths: list[str] = []
+            if playlist_el is not None:
+                for playlist_entry_el in playlist_el:
+                    if playlist_entry_el.tag != "ENTRY":
+                        continue
+                    primarykey_el = playlist_entry_el.find("PRIMARYKEY")
+                    if primarykey_el is None or primarykey_el.get("TYPE") != "TRACK":
+                        continue
+
+                    key = primarykey_el.get("KEY", "")
+                    if not key:
+                        continue
+                    try:
+                        normalized_path = primary_key_to_normalized_path(key)
+                    except (ValueError, IndexError):
+                        logger.warning(
+                            "Skipping stale/malformed PRIMARYKEY in playlist %r: KEY=%r",
+                            name,
+                            key,
+                        )
+                        continue
+
+                    if normalized_path not in collection:
+                        logger.warning(
+                            "Skipping unresolved PRIMARYKEY in playlist %r: KEY=%r",
+                            name,
+                            key,
+                        )
+                        continue
+                    track_paths.append(normalized_path)
+
+            return {"kind": "playlist", "name": name, "track_paths": track_paths}
+
+        return None
+
     @staticmethod
     def _track_entry_to_metadata_dict(entry: TrackEntry) -> dict[str, Any]:
         """Shape a ``TrackEntry`` into the section 1.3 success schema dict.
@@ -284,6 +417,7 @@ class NmlParser:
             "title": entry.title,
             "bpm": entry.tempo.bpm,
             "grid_anchor_ms": entry.grid_anchor_ms,
+            "is_flex_grid": entry.is_flex_grid,
             "existing_cues": [
                 {
                     "hotcue": cue.hotcue,
@@ -352,7 +486,10 @@ class NmlParser:
 
         cues: list[CuePoint] = []
         grid_anchor_ms = 0.0
-        for cue_el in entry_el.findall("CUE_V2"):
+        grid_marker_count = 0
+        for cue_el in entry_el:
+            if cue_el.tag != "CUE_V2":
+                continue
             cue_type = CueType(int(cue_el.get("TYPE", "0")))
             start_ms = float(cue_el.get("START", "0.0"))
             cues.append(
@@ -367,6 +504,7 @@ class NmlParser:
                 )
             )
             if cue_type == CueType.GRID:
+                grid_marker_count += 1
                 grid_anchor_ms = start_ms
 
         return TrackEntry(
@@ -376,6 +514,7 @@ class NmlParser:
             tempo=tempo,
             cues=cues,
             grid_anchor_ms=grid_anchor_ms,
+            is_flex_grid=grid_marker_count > 1,
             duration_ms=duration_ms,
             peak_db=peak_db,
             perceived_db=perceived_db,
@@ -467,9 +606,6 @@ class NmlParser:
                 normalized_key = primary_key_to_normalized_path(key)
             except (ValueError, IndexError):
                 # Malformed key; skip and continue
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Skipping stale/malformed PRIMARYKEY in playlist %r: KEY=%r",
                     playlist_name,
@@ -483,9 +619,6 @@ class NmlParser:
                     normalized_key, title=None, artist=None
                 )
             except TrackNotFoundError:
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Skipping unresolved PRIMARYKEY in playlist %r: KEY=%r",
                     playlist_name,
@@ -493,9 +626,6 @@ class NmlParser:
                 )
                 continue
             except AmbiguousTrackError:
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.warning(
                     "Skipping ambiguous PRIMARYKEY in playlist %r: KEY=%r",
                     playlist_name,

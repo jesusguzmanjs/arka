@@ -12,7 +12,6 @@ export type Sensitivity = "soft" | "medium" | "hard";
 export interface CueGridConfig {
   selectedPlaylist: string | null; // the playlist currently active in LibraryBrowser's left column (batch target)
   selectedTrackPath: string | null; // location_path of the track double-clicked in the right column (preview target only)
-  includeStems: boolean;
   sensitivity: Sensitivity;
   maxCues: number;
   clearExisting: boolean;
@@ -22,7 +21,6 @@ export interface CueGridConfig {
 export const defaultConfig: CueGridConfig = {
   selectedPlaylist: null,
   selectedTrackPath: null,
-  includeStems: true,
   sensitivity: "medium",
   maxCues: 8,
   clearExisting: false,

@@ -26,6 +26,7 @@ from cuegrid.audio.loader import generate_preview_payload
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
     AmbiguousTrackError,
+    DuplicateLocationError,
     NmlParser,
     PlaylistNotFoundError,
     TrackNotFoundError,
@@ -245,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip audio analysis entirely: parse the NML, locate the "
             "playlist matching PLAYLIST_NAME, and print a JSON array of "
-            "{artist, title, location_path, flags} objects, one per track "
+            "{artist, title, location_path, flags, is_flex_grid} objects, one per track "
             "in that playlist, in playlist order, then exit. Intended for "
             "the GUI Library Browser's right-hand tracklist column."
         ),
@@ -296,6 +297,36 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             metavar="JSON_STRING",
             help="JSON string arrays of options [{'hotcue': x, 'start_ms': y}] to overwrite on TRACK_PATH",
+    )
+    parser.add_argument(
+        "--grid-anchor",
+        type=float,
+        default=None,
+        metavar="MS",
+        help=(
+            "Optional Grid marker START position in milliseconds. Valid only "
+            "with --update-cues and rejected for Flex Grid tracks."
+        ),
+    )
+    parser.add_argument(
+        "--bpm",
+        type=float,
+        default=None,
+        metavar="BPM",
+        help=(
+            "Optional track BPM to persist in the matched ENTRY. Valid only "
+            "with --update-cues and limited to the inclusive range 50-200."
+        ),
+    )
+    parser.add_argument(
+        "--get-library",
+        action="store_true",
+        default=False,
+        dest="get_library",
+        help=(
+            "Parse the complete collection and playlist tree into one compact "
+            "relational JSON payload, then exit without audio analysis."
+        ),
     )
 
     # Validation: --title is only valid with track_path (single-track mode)
@@ -550,6 +581,11 @@ def _json_summary(total: int, succeeded: int, skipped: int) -> None:
     )
 
 
+def _json_skipped(reason: str) -> None:
+    """Emit the compact protected-skip event consumed by the GUI."""
+    _emit_json({"type": "skipped", "reason": reason})
+
+
 def _emit_track_lifecycle_json(
     index: int,
     total: int,
@@ -583,6 +619,8 @@ def _json_batch_track_callback(track_result: BatchTrackResult) -> None:
     track's messages are emitted as soon as that track finishes,
     rather than only after the whole batch returns (spec section 11.4).
     """
+    if track_result.error == "flex_grid":
+        _json_skipped("flex_grid")
     _emit_track_lifecycle_json(
         index=track_result.index,
         total=track_result.total,
@@ -596,6 +634,11 @@ def _json_batch_track_callback(track_result: BatchTrackResult) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.grid_anchor is not None and args.update_cues is None:
+        build_parser().error("--grid-anchor may only be used with --update-cues")
+    if args.bpm is not None and args.update_cues is None:
+        build_parser().error("--bpm may only be used with --update-cues")
 
     # Configure this mode before any path discovery so a pre-existing logging
     # configuration cannot leak INFO/DEBUG text onto the GUI stdout stream.
@@ -627,7 +670,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.track_path,
                 cues_list,
                 title=args.title,
-                artist=args.artist
+                artist=args.artist,
+                grid_anchor_ms=args.grid_anchor,
+                bpm=args.bpm,
             )
             print(f"Successfully updated manual cues for {args.track_path}")
             return 0
@@ -650,6 +695,31 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         names = NmlParser(nml_path).list_playlist_names()
         print(json.dumps(names))
+        sys.exit(0)
+
+    # --get-library: one standalone relational query for the Global Collection
+    # browser. The parser indexes the master collection once and emits playlist
+    # references only; no audio or pipeline code is involved.
+    if args.get_library:
+        nml_path = _resolve_nml_path(args.nml)
+        if nml_path is None:
+            print(
+                "error: no collection.nml found under the standard Traktor "
+                "install directories. Pass --nml PATH explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            payload = NmlParser(nml_path).get_library()
+        except DuplicateLocationError as exc:
+            print(
+                json.dumps(
+                    {"error": "duplicate_location", "message": str(exc)},
+                    separators=(",", ":"),
+                )
+            )
+            return 1
+        print(json.dumps(payload, separators=(",", ":")))
         sys.exit(0)
 
     # --delete-cue (spec .openspec/2-core-spec.md section 13): a
@@ -795,6 +865,7 @@ def main(argv: list[str] | None = None) -> int:
                 "title": ref.entry.title,
                 "location_path": ref.entry.location_path,
                 "flags": int(ref.entry.flags) if ref.entry.flags is not None else None,
+                "is_flex_grid": ref.entry.is_flex_grid,
             }
             for ref in refs
         ]
@@ -915,6 +986,26 @@ def main(argv: list[str] | None = None) -> int:
             # This is the only stdout write in export mode: one raw JSON
             # document for the Tauri in-memory bridge.
             print(serialize_gui_payload(result, args.track_path), flush=True)
+            return 0
+
+        if result.skipped_reason is not None:
+            if use_json:
+                _json_skipped(result.skipped_reason)
+                _emit_track_lifecycle_json(
+                    index=1,
+                    total=1,
+                    artist=result.entry.artist,
+                    title=result.entry.title,
+                    detected_events=[],
+                    written_cues=[],
+                    error=result.skipped_reason,
+                )
+                _json_summary(total=1, succeeded=0, skipped=1)
+            else:
+                print(
+                    f"[skipped] {result.entry.artist} - {result.entry.title}   "
+                    "Flex Grid / variable BPM unsupported"
+                )
             return 0
 
         if use_json:

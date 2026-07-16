@@ -1,610 +1,158 @@
 # CueGrid
 
-**CueGrid** is a high-performance, asynchronous HotCue injector and surgical
-Stem analyzer for **Native Instruments Traktor Pro 4**. It parses your native
-XML `collection.nml`, evaluates auditory transients against Traktor's own
-beatgrid, and maps intelligent, grid-aligned cues directly back into your
-tracks — no independent beat-detection, no grid-fitting, and no
-snapping/quantization step, because every cue this tool writes is
-mathematically derived from the grid to begin with.
+CueGrid analyzes structurally meaningful, Traktor-grid-aligned phrase boundaries and writes standard HotCues into a Traktor `collection.nml`. The Python core is the authoritative implementation; this document describes the checked-out code as of 2026-07-16.
 
-- Reads BPM and the grid anchor (`AutoGrid`) straight from your Traktor
-  collection.
-- Analyzes only small, targeted windows of audio at musically meaningful
-  phrase boundaries (every 16/32 beats) — never the whole track.
-- Confirms structural cue points only where a real energy or timbre
-  change is detected, selecting the strongest, most confident changes
-  across the whole track (up to `--max-cues`) rather than fixed
-  intro/outro roles.
-- Writes new `<CUE_V2>` HotCue elements back into your `collection.nml`,
-  never touching your existing cues, grid, or any other track data.
-- **Batch Processing:** Process single tracks, search by title, or
-  analyze entire playlists natively through the XML tree.
-- **Parallel Signal Fusion (Smart Mode):** When a usable Traktor Drum stem
-  is present, extracts aligned Master and drum onset/energy envelopes and
-  selects peaks from their weighted combination. Without a stem, it falls
-  back to performance-preserving Master-only analysis.
-- **Desktop GUI:** A Tauri + Vue 3 studio-rack interface wraps the engine
-  as a sidecar process, giving you waveform playback, virtual HotCue
-  pads, a native library browser, and one-click telemetry export — no
-  terminal required.
-
-Full technical specifications: [`.openspec/2-core-spec.md`](.openspec/2-core-spec.md)
-(engine) and [`.openspec/3-gui-spec.md`](.openspec/3-gui-spec.md) (GUI).
-
----
-
-## Architecture
-
-CueGrid is a hybrid-topology application with a strict process boundary
-between analysis and presentation:
+It is a hybrid application:
 
 ```mermaid
 flowchart LR
-    subgraph Engine["Python 3.13 core (core/)"]
-        A[cuegrid CLI] --> B[NML parser + writer]
-        A --> C[Grid-Guided Phrase Analysis]
-        C --> D[FFmpeg drum-stem extraction]
-    end
-    subgraph Bridge["Tauri sidecar bridge"]
-        E[Standalone PyInstaller binary]
-    end
-    subgraph GUI["Vue 3 / TypeScript SPA (gui/)"]
-        F[ConfigPanel + ActionBar]
-        G[AudioPlayer + LibraryBrowser]
-        H[TelemetryConsole]
-    end
-    Engine -->|packaged as| E
-    E -->|NDJSON over stdout| GUI
-    GUI -->|spawns per run| E
+    CLI["cuegrid CLI"] --> NML["NML parser / writer"]
+    CLI --> PIPE["Pipeline"]
+    PIPE --> DET["Grid-guided HPSS detector"]
+    DET --> LIB["librosa: one full master-track decode"]
+    GUI["Vue + Tauri desktop UI"] -->|"one-shot JSON / NDJSON"| CLI
 ```
 
-- **Engine (`core/`):** a standalone Python 3.13 audio-processing engine.
-  It never imports into the GUI process — it is packaged as a
-  single-file **Tauri sidecar** executable via PyInstaller, so end users
-  never need a Python environment installed.
-- **GUI (`gui/`):** a Vue 3 (`<script setup lang="ts">`) single-page
-  application shell around Tauri, rendering the dark, studio-rack
-  interface and spawning the sidecar per analysis run.
-- **Safe reload loop:** the GUI never trusts its own in-memory state as
-  the source of truth after a write. Every operation that mutates
-  `collection.nml` — a full analysis run or a single-track context-menu
-  trigger — is followed by a strict, user-driven **teardown → force-read
-  → rebuild** cycle: the active waveform and HotCue pads are unmounted,
-  the track's metadata is re-read directly from disk, and the player is
-  rebuilt from that fresh result. This prevents Wavesurfer.js cache
-  collisions and stale-state corruption between runs.
+## What the core does
 
----
+- Reads BPM, grid anchor, duration, existing cues, and track metadata from `collection.nml`.
+- Generates candidate timestamps mathematically from Traktor's grid; it does not use whole-track novelty peak-picking or infer a new beat grid.
+- Decodes the master audio once per detection run, keeps that waveform only in local memory, and slices before/after candidate windows from RAM.
+- Separates each window into harmonic and percussive components with HPSS, then combines structural contrast with MFCC timbre distance.
+- Emits one unified detected-event label, `cue`; historical roles such as `intro_end`, `drop`, and `outro` are not produced.
+- Maps selected events to free standard HotCue slots (`0`–`7`) and writes atomically while preserving non-HotCue markers.
+- Supports single-track, playlist, and title-selected sequential batch analysis.
 
-## Key Features (v1.8)
+## Detection model
 
-### Parallel Signal Fusion Engine (Smart Mode)
+CueGrid's detector is grid-guided from start to finish:
 
-CueGrid detects native Traktor Stems by testing the `FLAGS & 0x40`
-bitmask on each `<ENTRY><INFO>` element — a reverse-engineered,
-non-literal comparison that survives whatever other flag bits Traktor
-sets. When a stem is available, it predicts the sidecar `.stem.mp4`
-path (reproducing Traktor's own MD5-derived hashing scheme) and uses
-`ffmpeg` to demux the isolated Drums/Rhythm stream.
+1. It calculates candidates at `grid_anchor_ms + beat_index * (60000 / BPM)`. The default candidate interval is `phrase_beats=4`; the `is_major_phrase` field is traceability metadata only and does not boost selection.
+2. It rejects candidates in the first eight beats and within the final eight beats before feature extraction.
+3. `detector.py` makes exactly one `librosa.load(..., mono=True)` call for the selected master track. Each candidate's before/after windows are NumPy slices of that local array.
+4. Each slice is transformed with a 1024-point STFT and HPSS (`kernel_size=15`). Mean harmonic RMS, mean percussive RMS, and mean MFCCs are measured.
+5. A structural contrast favors percussive arrivals over ordinary overall-volume changes and can recognize percussive removals where harmonic energy holds. A candidate is also significant when its MFCC distance crosses the timbre threshold.
+6. Near-silent percussive after-windows are rejected. Significant candidates are weighted with `W(x) = 1 - alpha(2x - 1)^2` (`alpha=0.6` by default), filtered relative to the strongest weighted candidate, capped at `max_cues`, and returned in chronological order.
 
-Smart Mode is **not** a post-detection classifier or filter. It extracts
-aligned onset/energy envelopes from both the original Master and Drum
-signals simultaneously, then picks peaks from the fused signal:
+The detector deletes its full-track waveform after scoring and calls `gc.collect()`. There is no global audio cache. The live analysis pipeline does not call `audio.loader.load_window`, does not use native Stem sidecars, and does not run FFmpeg extraction or source fusion.
 
-```text
-combined_energy = (master_energy * master_weight)
-                + (drum_energy * drum_weight)
-```
-
-The default weights are `master_weight = 0.6` and `drum_weight = 0.4`.
-If no drum stem is provided, cannot be extracted, or is practically silent,
-CueGrid automatically uses `master_weight = 1.0` and `drum_weight = 0.0` and
-skips stem extraction, decoding, and envelope calculations entirely. This
-strict fallback preserves standard single-track behavior and performance.
-
-The `--no-stems` override forces that same Master-only path. Empty-stem
-handling is source availability logic, not a post-detection rejection pass.
-
-### 3D Sensitivity Matrix v1.4
-
-Instead of tuning raw thresholds by hand, pick one of three presets via
-`--mode`. Each preset binds **three** detection variables together
-(energy, timbre, and the relative-confidence gate), so the modes remain
-behaviorally distinct rather than just scaling one number:
-
-| Preset | CLI value | Energy threshold (dB) | Timbre threshold | Relative confidence | Best for |
-|---|---|---:|---:|---:|---|
-| **Granular** | `soft` | 2.0 | 8.0 | 0.15 | Atmospheric or IDM textures — open-gate capture |
-| **Balanced** | `medium` (default) | 4.0 | 18.0 | 0.30 | General-purpose electronic music structures |
-| **Strict** | `hard` | 7.0 | 30.0 | 0.50 | Massive drops and structural peak transitions only |
-
-The relative-confidence gate is the decisive selector: **Granular**
-admits candidates at just 15% of the track's strongest confidence
-score, while **Strict** demands at least 50%.
-
-### Strict Player Sandbox Lifecycle (v1.5)
-
-The GUI treats Vue's reactive state, Wavesurfer's internal Regions
-state, and the on-disk `collection.nml` as three independent stores —
-no one of them is authoritative for the others. Clicking **Analyze**
-immediately unmounts the active waveform, clears every Wavesurfer
-region, and resets all virtual HotCue pads to unmapped/disabled — a
-completely clean slate. The player is only rebuilt through the
-mandatory teardown → force-read → rebuild chain once the operation
-completes, eliminating frontend race conditions and stale-cache
-collisions between runs.
-
-### Contextual Single-Track Analysis (v1.7)
-
-Right-click any track row in the library browser to open a native-style
-context menu with a single action: **Analyze track**. This triggers the
-single-track sidecar contract in isolation (never a synthetic one-track
-playlist), with a smart execution guard:
-
-- If the targeted track is the one currently loaded in the player, the
-  full player teardown sequence runs before analysis starts.
-- If it's a background track, analysis runs silently — the active
-  waveform, playback position, and pads are left completely undisturbed.
-
-### Studio-Rack Layout & Telemetry Export (v1.8)
-
-A pixel-perfect dark theme (`#121212` base, teal accent) organizes the
-interface into two segmented modular racks — Player (waveform +
-library browser) and Config (sensitivity/stems/max-cues controls +
-Action Bar) — separated by a single resizable splitter with a
-hard anti-clip floor so the primary CTA is never squeezed out of view.
-
-Every execution automatically dumps its evaluation metrics to a local
-session cache, `last_run_telemetry.csv`, with a 12-column schema. The binary
-`Smart_Boost` flag is deprecated and is not emitted:
-
-```text
-track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
-```
-
-`Drum_Weight_Applied` stores the applied drum/master alpha/beta ratio
-(`drum_weight / master_weight`) in fused Smart Mode, or `0.0` in standard
-Master-only mode. `Drum_Score` is the exact drum RMS energy at the frame index
-where the combined signal selected the peak; it is `N/A` in standard mode.
-
-Each run **overwrites** this cache (no stale rows survive across runs).
-A fixed **Export** button lives in the bottom-right status bar, next to
-the telemetry console launcher — always visible, but disabled until an
-analysis completes successfully. Clicking it opens Tauri's native OS
-save dialog and copies the cached CSV bytes to your chosen destination,
-without triggering a new analysis run or mutating the internal cache.
-
----
+Legacy Stem/FFmpeg code is retained in `audio/legacy_stems.py` and `nml/stems.py` for reference only. Neither module is imported by the active core and both are explicitly excluded from the PyInstaller build. `ffmpeg-python` is not a CueGrid dependency.
 
 ## Installation
 
-### Requirements
+Requirements:
 
-- **Python 3.13**
-- **Node.js v18+**
-- **FFmpeg** — must be discoverable on `PATH` at runtime (used for
-  native Stem extraction; not a Python dependency and not bundled).
+- Python 3.10 or newer (the packaged application may use a newer Python runtime)
+- `librosa`, NumPy, and SoundFile, installed through the core project
+- Node.js only when developing the optional Tauri/Vue GUI
 
-### Core engine (`core/`)
-
-```bash
+```powershell
 cd core
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS/Linux
-
+.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-```
 
-This installs the `cuegrid` console command along with its runtime
-dependencies (`librosa`, `numpy`, `soundfile`, `ffmpeg-python`).
-
-Run the test suite from the repository root:
-
-```bash
+# From the repository root
 pytest core
 ```
 
-> **Back up your collection first.** This tool writes directly to your
-> `collection.nml`. It always creates a `<name>.nml.bak` backup before its
-> first write in a given run (and never overwrites an existing backup),
-> but you should still keep your own copy until you're comfortable with
-> its behavior — see [Safety notes](#safety-notes).
+FFmpeg is not required for CueGrid. Legacy reference code can only be used in a separate environment where its optional dependencies are installed manually.
 
-### Desktop GUI (`gui/`)
+## CLI reference
 
-```bash
-cd gui
-npm install
-npm run dev       # local development, hot-reloaded Tauri window
-npm run build     # production build — runs vue-tsc --noEmit first
-```
-
-`npm run build` enforces a strict, zero-warning `vue-tsc --noEmit` type
-check before invoking `vite build`; the build fails fast on any
-TypeScript diagnostic. The GUI wraps the `cuegrid` engine as a packaged
-Tauri sidecar binary (see `sync.ps1` for the PyInstaller → Tauri
-binaries pipeline), so it never depends on a system Python install at
-runtime.
-
----
-
-## Workflow & Usage
-
-### Via the GUI
-
-1. Launch the app (`npm run tauri dev` or the packaged build). CueGrid
-   auto-discovers `collection.nml` from the standard Traktor install
-   locations, or you can point it at a specific file.
-2. Browse your playlists and tracks in the **Library Browser**. Double-
-   click a track to preview it in the waveform player.
-3. Configure the run using the vertical **Config Rack** switches:
-   - **Include Stems** — binary toggle; OFF appends `--no-stems`.
-   - **Sensitivity** — segmented control: Granular / Balanced / Strict.
-   - **Max Cues** — integer selector, 1–8.
-   - **Clear Existing** — wipes existing standard HotCues (never grid
-     or load markers) before writing new ones.
-4. Either:
-   - Press **Analyze & Inject** to batch-process the currently selected
-     playlist, or
-   - **Right-click** any individual track row and choose **Analyze
-     track** for a single, isolated run that never disturbs a different
-     track already playing in the background.
-5. Once analysis completes, the player automatically tears down and
-   rebuilds itself from the freshly written `collection.nml` — reload
-   the track in Traktor to see the new HotCue pads and labels.
-6. Open the telemetry console (bottom-right toggle) to watch structured
-   log output live, or click **Export** to save the last run's
-   per-candidate metrics as a CSV via the native OS file picker.
-
-### Via the CLI
-
-The CLI supports three mutually exclusive target modes (Path, Title, or
-Playlist):
-
-```
-cuegrid [TRACK_PATH | --track-title TITLE | --playlist NAME]
-        [--artist ARTIST] [--nml NML_PATH] [-v] [tuning flags...]
-```
-
-#### 1. Single Track (By Path)
-```bash
-cuegrid "D:\Music\Artist - Track.flac"
-```
-
-#### 2. Batch Processing (By Playlist)
-Analyzes an entire Traktor playlist natively. If a track fails (e.g.
-missing BPM or corrupted audio), it is safely skipped without halting the
-batch.
-```bash
-cuegrid --playlist "My IDM Breaks"
-```
-
-#### 3. Batch Processing (By Title)
-Analyzes all tracks matching a specific title. You can narrow this down
-by adding the artist.
-```bash
-cuegrid --track-title "Song Name" --artist "Artist Name"
-```
-
-### `--nml`: pointing at a specific collection
-
-```bash
-cuegrid --playlist "Techno Set" --nml "D:\Backups\collection.nml"
-```
-
-Use this to target a specific collection file explicitly — useful if you
-have multiple Traktor installations, work from a backup, or run this tool
-in a script/CI context where auto-discovery isn't appropriate.
-
-### Auto-discovery of `collection.nml`
-
-If `--nml` is not given, `cuegrid` searches the standard Traktor install
-locations:
-
-- **Windows / macOS:** `~/Documents/Native Instruments/Traktor */collection.nml`
-
-Every installed Traktor version creates its own `Traktor x.x.x` folder
-under that root; `cuegrid` checks all of them and picks the **most
-recently modified** `collection.nml`. If none is found anywhere, it exits
-with an error asking you to pass `--nml` explicitly.
-
-### `--title` / `--artist`: disambiguating duplicate tracks
-
-A track is matched to an `<ENTRY>` in your collection by its file path.
-In the rare case that more than one `<ENTRY>` shares the exact same
-`LOCATION` (e.g. an edited/merged collection), `cuegrid` will refuse to
-guess and instead report the conflict:
-
-```
-error: 2 ENTRY elements matched path: 'd:/music/artist - track.flac' in collection.nml ('Artist' - 'Track (Radio Edit)', 'Artist' - 'Track (Extended Mix)'); disambiguate with --title/--artist
-
-Multiple tracks share this LOCATION. Narrow it down with --title and/or --artist.
-```
-
-Resolve it with either or both flags:
-
-```bash
-cuegrid "D:\Music\Artist - Track.flac" --title "Track (Extended Mix)"
-cuegrid "D:\Music\Artist - Track.flac" --artist "Artist" --title "Track (Extended Mix)"
-```
-
-Matching is case-insensitive and exact (not a substring search).
-
-### `-v` / `--verbose`
-
-Enables `INFO`-level logging (which `<ENTRY>` was matched, how many
-events were detected, how many cues were written, etc.). Without it, only
-warnings and the final summary are shown.
-
-### Tuning flags (advanced)
-
-Every knob in the analysis pipeline is exposed as a CLI flag. **All of
-them are optional** — any flag you don't pass falls back to its own
-default, shown in `--help`:
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--mode` | (none) | Sensitivity preset: `soft` (Granular), `medium` (Balanced), or `hard` (Strict). When set, overrides `--energy-threshold`, `--timbre-threshold`, and `--relative-confidence-threshold` together. See [3D Sensitivity Matrix](#3d-sensitivity-matrix-v14). |
-| `--phrase-beats` | `16` | Base phrase granularity, in beats (a 4-bar block). Candidates are generated every N beats from the grid anchor. |
-| `--major-phrase-multiple` | `2` | Every Nth candidate is additionally tagged a "major" (8-bar / 32-beat) phrase boundary. |
-| `--sample-rate` | native | Resample analysis windows to this rate; omit to keep each track's native sample rate. |
-| `--hop-length` | `512` | Frame hop used for RMS/MFCC extraction within each window. |
-| `--window-beats` | `4.0` | Size of the before/after analysis window around each candidate, in beats (1 bar). |
-| `--mfcc-count` | `13` | Number of MFCC coefficients extracted per window (timbre fingerprint size). |
-| `--energy-threshold` | `4.0` | Minimum absolute RMS energy change, in dB, to flag a candidate as significant. |
-| `--timbre-threshold` | `18.0` | Minimum Euclidean distance between MFCC vectors to flag a candidate as significant. |
-| `--max-cues` | `8` | Maximum number of cues written per track (1–8). |
-| `--clear-existing` | (flag) | Clear existing standard HotCues (TYPE="0") before writing new ones. Grid/BPM (TYPE="4") and Load (TYPE="3") markers are preserved. **Smart slot reclamation:** when active, the tool calculates slot availability as if those old HotCues are already gone, preventing premature "all slots occupied" warnings and ensuring a perfect sequential fill from slot 0 upward. |
-| `--relative-confidence-threshold` | `0.30` | Keep only candidates whose confidence is at least this fraction of the track's strongest candidate. |
-
-| `--no-stems` | (flag) | Bypass native Stems and force Master-only analysis with `master_weight=1.0` and `drum_weight=0.0`; stem calculations are skipped. |
-| `--export-csv` | (none) | Write per-candidate telemetry to a CSV file for data-driven tuning (see [Data Export](#data-export)). |
-
-```bash
-# Gentle detection for ambient / downtempo
-cuegrid --playlist "Ambient" --mode soft
-
-# Only catch the biggest structural changes
-cuegrid --playlist "Hard Techno" --mode hard
-
-# Force Master-only analysis, skipping native Stems
-cuegrid "D:\Music\Artist - Track.flac" --no-stems
-```
-
-Run `cuegrid --help` for the full, always-up-to-date list.
-
----
-
-## How Grid-Guided Phrase Analysis works
-
-Most auto-cue tools run beat/onset/novelty detection blindly across an
-entire track. `cuegrid` takes a different, DJ-centric approach: in
-club-oriented electronic music, structural changes (drops, breakdowns,
-intro/outro boundaries) overwhelmingly land on **musical phrase
-boundaries** — 4-bar (16-beat) or 8-bar (32-beat) blocks. So instead of
-searching everywhere, `cuegrid` only looks *there*.
-
-```mermaid
-flowchart TD
-    A[Read BPM + grid anchor + duration from collection.nml] --> B[Generate phrase-boundary candidates every 16/32 beats]
-    B --> S{Usable native Drum stem?}
-    S -->|yes| T[Extract aligned Master + Drum windows]
-    S -->|no / silent / --no-stems| M[Use Master only; skip stem calculations]
-    T --> U[Extract aligned onset/energy envelopes]
-    U --> V[Fuse weighted envelopes: Master 0.6 + Drum 0.4]
-    M --> W[Use Master energy with weight 1.0]
-    V --> C[Select peaks at candidate frames]
-    W --> C
-    C --> D[Extract RMS energy + MFCC timbre for each window]
-    D --> E[Score energy-delta dB + timbre distance]
-    E --> F{Change significant?}
-    F -->|yes| G[Confirm as a structural cue]
-    F -->|no| H[Discard candidate]
-    G --> I[Map to lowest free HOTCUE slot 0-7]
-    I --> J[Append CUE_V2 elements to collection.nml]
-```
-
-### 1. Candidates come from the grid, not from guessing
-
-Given the track's `BPM` and its Traktor-assigned grid anchor `G` (the
-`AutoGrid` cue's timestamp), the beat length is `L = 60000 / BPM`
-milliseconds. A candidate timestamp is generated every `phrase_beats`
-(default 16) beats from the anchor:
-
-```
-t_ms(n) = G + n * phrase_beats * L,   for n = 0, 1, 2, ... up to the track's duration
-```
-
-Every other candidate (`n` even, by default) is additionally tagged a
-"major" 32-beat phrase boundary. Because every candidate is already
-`G + k*L` for an integer `k`, **it is exactly grid-aligned by
-construction** — there is no separate beat-snapping step, unlike tools
-that detect an arbitrary timestamp first and then round it to the
-nearest beat afterward.
-
-### 2. Only small windows are ever decoded
-
-For each candidate, `cuegrid` decodes exactly two short audio windows —
-one immediately before it, one immediately after (sized in beats, so the
-window automatically scales with tempo) — using `librosa`'s
-offset/duration seeking. The rest of the track is never touched. For a
-typical 4-minute track this means analyzing on the order of a hundred
-short windows instead of the entire waveform, which is both faster and,
-because arrangement changes really are phrase-aligned in this genre, more
-musically accurate than blind whole-track novelty detection.
-
-### 3. A candidate is confirmed only if the change is real
-
-Each window pair is scored on two independent signals:
-
-- **Energy change** — the change in RMS loudness, in decibels.
-- **Timbre change** — the Euclidean distance between MFCC vectors
-  (a numeric fingerprint of the sound's texture/instrumentation).
-
-A candidate is confirmed only if either signal crosses its threshold
-(`--energy-threshold` / `--timbre-threshold`) *and* its "after" window
-isn't practically silent (an anti-silence guard that keeps fade-outs from
-ever being confirmed). All confirmed candidates across the whole track
-form a single pool: only those within `--relative-confidence-threshold`
-of the track's strongest candidate survive, and the top `--max-cues` (by
-confidence) are written.
-
-### 4. Cues are written, never anything else touched
-
-Confirmed events are mapped to the lowest free `HOTCUE` slot (0–7) and
-appended as new `<CUE_V2>` elements. The writer:
-
-- Never touches the existing `AutoGrid` cue or any other existing
-  `<CUE_V2>`/child element — it only appends.
-- Never overwrites a `HOTCUE` slot you (or a previous run) already used;
-  if all 8 slots are taken, remaining events are skipped with a warning,
-  not an error.
-- Always backs up the original file to `<name>.nml.bak` before its first
-  write of a run.
-
-For the full algorithm, data structures, and edge-case handling, see
-[`.openspec/2-core-spec.md`](.openspec/2-core-spec.md), sections 4, 6, and 8.
-
----
-
-## Data Export
-
-### CLI (`--export-csv`)
-
-Pass `--export-csv metrics.csv` to write per-candidate telemetry for
-every track analyzed. Each row represents one phrase-boundary candidate
-that was evaluated, with these columns:
-
-| Column | Description |
-|---|---|
-| `track_title` | `"Artist - Title"` string identifying the track |
-| `Formatted_Time` | Human-readable candidate time in `MM:SS.mmm` format |
-| `beat` | Beat index of the phrase-boundary candidate |
-| `time_ms` | Timestamp of the candidate in milliseconds |
-| `energy_delta_db` | RMS energy change (dB) across the candidate; positive = rising, negative = falling |
-| `timbre_dist` | Euclidean distance between before/after MFCC vectors |
-| `confidence` | Combined confidence score (arbitrary positive scale) based on the fused signal |
-| `status` | Final disposition: `SELECTED`, `DISCARDED_LIMIT`, `REJECTED_THRESHOLD`, `REJECTED_SILENCE`, or `REJECTED_MISSING_WINDOW` |
-| `track_peak_db` | Master peak loudness at the evaluated candidate |
-| `track_perceived_db` | Master perceived loudness at the evaluated candidate |
-| `Drum_Score` | Exact drum RMS energy at the combined peak frame index; `N/A` in standard Master-only mode |
-| `Drum_Weight_Applied` | Applied drum/master alpha/beta ratio (`drum_weight / master_weight`), or `0.0` in standard mode |
-
-`Smart_Boost` is deprecated and must not be emitted. Smart Mode does not
-classify or filter a completed detection result; the Drum signal contributes
-before peak selection through the weighted fusion formula.
-
-Rows are appended on each run, so you can accumulate data across multiple
-sessions. Open the CSV in any spreadsheet or load it into a database to
-filter by status, compare thresholds, and tune the detection parameters
-data-driven.
-
-```bash
-# Export telemetry while analyzing a playlist
-cuegrid --playlist "Techno Set" --export-csv tuning_data.csv -v
-```
-
-### GUI (Last-Run Telemetry cache)
-
-Every GUI-triggered run overwrites a fixed internal cache,
-`last_run_telemetry.csv`, in the application's local data directory —
-never appended, always the most recent execution only. Its schema is:
+The current command has three analysis selectors; exactly one is required for an analysis run:
 
 ```text
-track_title,Formatted_Time,beat,time_ms,energy_delta_db,timbre_dist,confidence,status,track_peak_db,track_perceived_db,Drum_Score,Drum_Weight_Applied
+cuegrid TRACK_PATH [options]
+cuegrid --track-title TITLE [--artist ARTIST] [options]
+cuegrid --playlist NAME [options]
 ```
 
-Click **Export** in the status bar to copy this cache to a
-user-chosen path via Tauri's native save dialog — the export never
-triggers a new analysis run or mutates the cache itself.
+`--nml PATH` selects the Traktor collection. If omitted, CueGrid searches the standard Native Instruments document directories and selects the most recently modified `collection.nml`.
 
----
+### Analysis selection and writes
 
-## Safety notes
+| Flag | Current behavior |
+|---|---|
+| `TRACK_PATH` | Analyze one path-matched collection entry. |
+| `--track-title TITLE` | Batch-select every case-insensitive exact title match; `--artist` may narrow it. |
+| `--playlist NAME` | Batch-select a case-sensitive playlist name in playlist order. Duplicate playlist names are an error. |
+| `--title TITLE` | Disambiguates a duplicate path match in single-track mode only. |
+| `--artist ARTIST` | Disambiguates a single-track match or narrows `--track-title`. It is invalid with `--playlist`. |
+| `--clear-existing` | Removes only standard `TYPE="0"` HotCues before new cues are written; Grid and Load markers remain. |
+| `--delete-cue HOTCUE_INDEX` | Standalone mutation: deletes one standard zero-based HotCue slot from `TRACK_PATH`. |
+| `--update-cues JSON_STRING` | Standalone mutation: updates or creates standard HotCues from `[{'hotcue': 0, 'start_ms': 12000.0}]`. Use JSON double quotes in real shells. |
+| `--grid-anchor MS` | Only valid with `--update-cues`; updates the sole Grid marker and rejects Flex Grid tracks. |
+| `--bpm BPM` | Only valid with `--update-cues`; persists a finite BPM in the inclusive range 50–200. |
 
-- Always keep your own backup of `collection.nml` in addition to the
-  automatic `.bak` this tool creates — especially the first few times
-  you run it.
-- Close Traktor before running `cuegrid` against your live collection,
-  the same way you would for any other external collection editor.
-- Re-running `cuegrid` on a track it has already processed is safe: it
-  will detect the already-used `HOTCUE` slots and either fill in
-  remaining free slots or skip with a warning once all 8 are occupied —
-  it will never overwrite a cue it (or you) already placed.
+Examples:
 
----
-
-## Development
-
-### Core engine
-
-```bash
-cd core
-pip install -e ".[dev]"
-pytest -v
+```powershell
+cuegrid "D:\Music\Artist - Track.flac" --nml "D:\Traktor\collection.nml"
+cuegrid --playlist "Friday set" --mode hard --clear-existing
+cuegrid --track-title "Untitled" --artist "Artist" --json
+cuegrid "D:\Music\Artist - Track.flac" --delete-cue 2
+cuegrid "D:\Music\Artist - Track.flac" --update-cues "[{\"hotcue\":0,\"start_ms\":12000.0}]" --bpm 128
 ```
 
-Or, from the repository root:
+### Read-only sidecar queries and output modes
 
-```bash
-pytest core
+| Flag | Output / behavior |
+|---|---|
+| `--json` | NDJSON lifecycle output for an analysis run. Messages include `nml_resolved`, `track_start`, zero or more `event_detected` / `cue_written`, `track_complete`, and `summary`; errors use `log`. |
+| `--export-gui` | A single GUI analysis JSON document for one `TRACK_PATH`; cannot be combined with `--json`. |
+| `--discover-nml` | Prints `{"path": "..."}` or an error JSON object, then exits. |
+| `--list-playlists` | Prints a plain JSON array of playlist names and exits. |
+| `--get-playlist-tracks NAME` | Prints a plain JSON array of playlist track summaries and exits. |
+| `--get-track-metadata TRACK_PATH` | Prints one Super JSON metadata/preview object and exits. It includes track metadata, existing cues, `waveform_peaks`, and `color_map`. |
+| `--get-library` | Prints one compact relational JSON object with a collection map and nested playlist/folder structure, then exits. |
+
+The Super JSON preview is intentionally separate from detection: `generate_preview_payload()` performs its own complete low-rate decode at 11,025 Hz to produce interleaved signed-8-bit waveform extrema and 500 ms low/mid/high colour buckets.
+
+### Advanced analysis and export flags
+
+| Flag | Default / behavior |
+|---|---|
+| `--mode {soft,medium,hard}` | Applies the linked threshold presets: soft `(2, 8, .15)`, medium `(4, 18, .30)`, hard `(7, 30, .50)` for energy dB, MFCC distance, and relative confidence. |
+| `--phrase-beats N` | Candidate interval in beats; default `4`. |
+| `--major-phrase-multiple N` | Major-candidate traceability interval; default `1`. |
+| `--sample-rate N` | Resamples the one detection decode; omitted keeps native rate. |
+| `--hop-length N` | STFT/MFCC hop length; default `512`. |
+| `--window-beats N` | Before/after context width; default `2.0`. |
+| `--mfcc-count N` | MFCC coefficient count; default `13`. |
+| `--energy-threshold N` | Structural contrast threshold in dB; default `4.0`. |
+| `--timbre-threshold N` | MFCC Euclidean-distance threshold; default `18.0`. |
+| `--relative-confidence-threshold N` | Fraction of the strongest weighted candidate; default `0.30`. |
+| `--max-cues N` | Maximum selected cues; default `8`. |
+| `--export-csv PATH` | Appends current candidate telemetry to a CSV file. |
+| `-v`, `--verbose` | Enables INFO logging on stderr. |
+
+`--stems-dir`, `--verify {fast,smart}`, and `--no-stems` are still accepted for command-line compatibility. They do not alter the active master-track detector. `--verify` only affects one human-readable reporting branch.
+
+## NML safety
+
+- Flex Grid entries (more than one `TYPE="4"` marker) are skipped before audio decoding.
+- The writer preserves existing Grid, Load, and other nonstandard-Cue XML elements.
+- Automated writes append only standard `TYPE="0"` cues and never overwrite occupied pad slots unless `--clear-existing` was requested.
+- Manual update and delete commands validate their complete payload before mutation.
+- Every mutation writes a daily backup in `CueGrid Backups/<collection.nml>.YYYYMMDD.bak`, retaining the five most recent backups, then atomically replaces the collection through a `.tmp` file.
+
+Keep an independent backup of your collection until you are comfortable with the workflow.
+
+## Development layout
+
+```text
+core/src/cuegrid/
+  cli.py                 command-line and sidecar contracts
+  audio/beatgrid.py      grid candidate arithmetic
+  audio/detector.py      one-decode RAM-sliced HPSS detection
+  audio/features.py      structural and timbral scoring
+  audio/loader.py        active preview generation and seek-window utility
+  audio/legacy_stems.py  excluded legacy FFmpeg/Stem reference code
+  core/pipeline.py       single-track and sequential batch orchestration
+  nml/                   XML parsing, mapping, and atomic persistence
+gui/                     Vue + Tauri desktop application
+.openspec/               implementation-aligned technical specifications
 ```
 
-The test suite includes a deterministic synthetic audio fixture
-(`tests/fixtures/generate_synthetic_fixture.py`) so the detection logic
-is fully covered without requiring any real music files.
-
-### GUI
-
-```bash
-cd gui
-npm install
-npm run dev      # Vite + Tauri dev server, hot-reloaded
-npm run build    # vue-tsc --noEmit type-check, then vite build
-```
-
-`npm run build` is a strict gate: any TypeScript diagnostic surfaced by
-`vue-tsc` fails the build before `vite` ever runs.
-
-### Packaging the sidecar
-
-CueGrid's sidecar identifier is `cuegrid-core` (`bundle.externalBin:
-["binaries/cuegrid-core"]` in `gui/src-tauri/tauri.conf.json`, scoped by
-`shell:allow-spawn` in `gui/src-tauri/capabilities/default.json`). Tauri
-requires the frozen binary on disk to carry the Rust target-triple suffix,
-e.g. `binaries/cuegrid-core-x86_64-pc-windows-msvc.exe` on 64-bit Windows.
-
-Two scripts drive this, for two different workflows:
-
-- **`sync.ps1` (dev loop):** runs PyInstaller against `core/cuegrid.spec`,
-  moves the output into `gui/src-tauri/binaries/`, and nudges Tauri's
-  dev-server watcher to hot-reload the new sidecar without a full restart.
-- **`build-win.ps1` (v1.9 production release):** the full, sequential
-  release pipeline —
-  1. `npm run --prefix gui build` — builds the production frontend,
-     gated by `vue-tsc --noEmit`.
-  2. Freezes the Python core with `pyinstaller --clean --noconfirm
-     cuegrid.spec` (see `core/cuegrid.spec` — a `--onefile` build with
-     `collect_submodules()` hidden-import coverage for `librosa`,
-     `audioread`, and `soundfile`'s runtime-conditional imports), then
-     moves/renames the result into
-     `gui/src-tauri/binaries/cuegrid-core-<target-triple>.exe`, detecting
-     the local target triple via `rustc -vV`.
-  3. Runs `npx tauri build` from `gui/`, which bundles `frontendDist`
-     (`gui/dist`, per `beforeBuildCommand`/`frontendDist` in
-     `tauri.conf.json`) and the sidecar binary into a native Windows
-     installer under `gui/src-tauri/target/release/bundle/`.
-
-  Run it from the repository root:
-
-  ```powershell
-  .\build-win.ps1
-  ```
-
-  or via the npm wrapper:
-
-  ```bash
-  npm run --prefix gui package
-  ```
+See [the core specification](.openspec/2-core-spec.md) for the definitive implementation contract.

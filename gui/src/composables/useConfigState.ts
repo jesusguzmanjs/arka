@@ -14,7 +14,13 @@ function loadPersisted(): Partial<CueGridConfig> | null {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    return JSON.parse(raw) as Partial<CueGridConfig>;
+    const parsed = JSON.parse(raw) as Partial<CueGridConfig>;
+    return {
+      sensitivity: parsed.sensitivity,
+      maxCues: parsed.maxCues,
+      clearExisting: parsed.clearExisting,
+      nmlPathOverride: parsed.nmlPathOverride,
+    };
   } catch {
     return null;
   }

@@ -14,6 +14,7 @@ from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
     AmbiguousTrackError,
     BatchTrackRef,
+    DuplicateLocationError,
     NmlParser,
     PlaylistNotFoundError,
     TrackNotFoundError,
@@ -403,3 +404,81 @@ class TestFindEntriesByTitle:
         parser = NmlParser(SAMPLE_COLLECTION)
         with pytest.raises(TrackNotFoundError):
             parser.find_entries_by_title("NO 1 KNEW", artist="Wrong Artist")
+
+
+class TestFlexGridDetection:
+    def test_marks_entry_with_multiple_grid_markers_as_flex_grid(self, tmp_path):
+        nml_file = tmp_path / "flex_grid.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Flex" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="flex.flac" />
+<INFO PLAYTIME="60" /><TEMPO BPM="120" />
+<CUE_V2 TYPE="4" START="100.0" /><CUE_V2 TYPE="4" START="200.0" />
+</ENTRY></COLLECTION></NML>""",
+            encoding="utf-8",
+        )
+        path = r"C:\Music\flex.flac"
+
+        parser = NmlParser(nml_file)
+        entry = parser.find_entry(path)
+        metadata = parser.get_track_metadata(path)
+
+        assert entry.is_flex_grid is True
+        assert metadata["is_flex_grid"] is True
+
+
+class TestGlobalLibraryExport:
+    def test_includes_orphans_and_playlist_paths_without_embedded_tracks(self):
+        parser = NmlParser(SAMPLE_COLLECTION)
+
+        payload = parser.get_library()
+        collection = payload["collection"]
+        root = payload["playlists"][0]
+        prueba = next(child for child in root["children"] if child["name"] == "prueba")
+
+        assert len(collection) == 2
+        assert set(collection) == {
+            "c:/users/ska_m/music/tidal/machinedrum - no 1 knew.flac",
+            "c:/users/ska_m/music/tidal/james blake, dave - doesn't just happen.flac",
+        }
+        assert collection[prueba["track_paths"][0]]["title"] == "NO 1 KNEW"
+        assert collection[prueba["track_paths"][0]]["collection_index"] == 0
+        assert collection[prueba["track_paths"][0]]["location_path"] == prueba[
+            "track_paths"
+        ][0]
+        assert set(prueba) == {"kind", "name", "track_paths"}
+        assert all("artist" not in node and "title" not in node for node in root["children"])
+
+    def test_preserves_nested_folders_and_skips_stale_playlist_paths(
+        self, tmp_path, caplog
+    ):
+        nml_content = """<NML><COLLECTION><ENTRY TITLE="Found" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="found.flac" />
+<INFO PLAYTIME="60" /><TEMPO BPM="120" />
+<CUE_V2 TYPE="4" START="10" />
+</ENTRY></COLLECTION><PLAYLISTS><NODE TYPE="FOLDER" NAME="$ROOT"><SUBNODES>
+<NODE TYPE="FOLDER" NAME="Nested"><SUBNODES>
+<NODE TYPE="PLAYLIST" NAME="Mix"><PLAYLIST><ENTRY><PRIMARYKEY TYPE="TRACK" KEY="C:/:Music/:found.flac" /></ENTRY>
+<ENTRY><PRIMARYKEY TYPE="TRACK" KEY="C:/:Music/:missing.flac" /></ENTRY></PLAYLIST></NODE>
+</SUBNODES></NODE></SUBNODES></NODE></PLAYLISTS></NML>"""
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(nml_content, encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            payload = NmlParser(nml_file).get_library()
+
+        nested = payload["playlists"][0]["children"][0]
+        playlist = nested["children"][0]
+        assert playlist["track_paths"] == ["c:/music/found.flac"]
+        assert "missing.flac" in caplog.text
+
+    def test_rejects_duplicate_normalized_collection_locations(self, tmp_path):
+        duplicate_nml = _write_duplicate_collection(
+            tmp_path / "duplicate_library.nml",
+            [_entry_xml("Track A", "Artist A"), _entry_xml("Track B", "Artist B")],
+        )
+
+        with pytest.raises(DuplicateLocationError) as exc_info:
+            NmlParser(duplicate_nml).get_library()
+
+        assert "c:/users/dj/music/track.mp3" in str(exc_info.value)

@@ -1,168 +1,202 @@
-// composables/useLibraryState.ts
-// See .openspec/4-library-spec.md §3.3.
-//
-// Module-scoped singleton state for the Library Browser: the playlists
-// list (populated on boot via --list-playlists), the tracklist of the
-// currently-selected playlist (populated on click via
-// --get-playlist-tracks), and the loading/error flags each fetch owns.
-//
-// Mirrors useTrackMetadata.ts's spawn-buffer-parse-on-close pattern for
-// both one-shot sidecar calls (NOT the NDJSON streaming pattern of
-// useCueGridSidecar.ts). State mutations write through useConfigState()
-// for `selectedPlaylist` / `selectedTrackPath` so the rest of the app
-// (ActionBar, AudioPlayer) reacts to the same singleton source of truth.
-
-import { nextTick, reactive, toRefs } from "vue";
-import { invoke } from "@tauri-apps/api/core"; // Swapeado por la API nativa de invocación
+import { computed, nextTick, reactive, toRefs } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { useConfigState } from "./useConfigState";
 import { useCueGridSidecar } from "./useCueGridSidecar";
-import {
-  type LibraryTrack,
-  type PlaylistTracksResult,
-  isPlaylistTracksError,
+import type {
+  LibraryPayload,
+  LibraryTrack,
+  PlaylistLeaf,
+  PlaylistNode,
+  TrackMetadata,
 } from "../types/library";
 
+export const ALL_TRACKS_CONTEXT = "ALL_TRACKS";
+
 interface LibraryState {
-  playlists: string[];
-  playlistsLoading: boolean;
-  tracks: LibraryTrack[];
-  tracksLoading: boolean;
-  tracksError: string | null; // human-readable, already unwrapped from PlaylistTracksError
+  collection: Record<string, TrackMetadata>;
+  playlists: PlaylistNode[];
+  selectedContext: string;
+  libraryLoading: boolean;
+  libraryError: string | null;
 }
 
 const state = reactive<LibraryState>({
+  collection: {},
   playlists: [],
-  playlistsLoading: false,
-  tracks: [],
-  tracksLoading: false,
-  tracksError: null,
+  selectedContext: ALL_TRACKS_CONTEXT,
+  libraryLoading: false,
+  libraryError: null,
 });
 
-// Stale-response guard, matching AudioPlayer.vue's `stage1Token` pattern
-// (3-player-spec.md's runStage1 implementation) — a rapid second click
-// on a different playlist must not let the first click's late-arriving
-// response clobber the second's once-correct result.
-let selectionToken = 0;
+let loadToken = 0;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+// En useLibraryState.ts, añade esta función por encima del return:
+
+function patchTrackInCollection(path: string, updates: Partial<TrackMetadata>) {
+  if (state.collection[path]) {
+    // Actualizamos solo las propiedades que nos pasen (ej: bpm)
+    Object.assign(state.collection[path], updates);
+  }
+}
+
+function isNullableFiniteNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isTrackMetadata(value: unknown): value is TrackMetadata {
+  if (!isRecord(value)) return false;
+
+  return (
+    typeof value.artist === "string" &&
+    typeof value.title === "string" &&
+    typeof value.location_path === "string" &&
+    isNullableFiniteNumber(value.bpm) &&
+    isNullableFiniteNumber(value.grid_anchor_ms) &&
+    isNullableFiniteNumber(value.duration_ms) &&
+    typeof value.is_flex_grid === "boolean" &&
+    Array.isArray(value.existing_cues) &&
+    typeof value.collection_index === "number" &&
+    Number.isInteger(value.collection_index)
+  );
+}
+
+function isPlaylistNode(value: unknown): value is PlaylistNode {
+  if (!isRecord(value) || typeof value.kind !== "string" || typeof value.name !== "string") {
+    return false;
+  }
+
+  if (value.kind === "folder") {
+    return Array.isArray(value.children) && value.children.every(isPlaylistNode);
+  }
+
+  return value.kind === "playlist" &&
+    Array.isArray(value.track_paths) &&
+    value.track_paths.every((path) => typeof path === "string");
+}
+
+function isLibraryPayload(value: unknown): value is LibraryPayload {
+  if (!isRecord(value) || !isRecord(value.collection) || !Array.isArray(value.playlists)) {
+    return false;
+  }
+
+  return (
+    Object.entries(value.collection).every(([path, track]) =>
+      typeof path === "string" && isTrackMetadata(track),
+    ) && value.playlists.every(isPlaylistNode)
+  );
+}
+
+function findPlaylist(nodes: readonly PlaylistNode[], name: string): PlaylistLeaf | undefined {
+  for (const node of nodes) {
+    if (node.kind === "playlist" && node.name === name) return node;
+    if (node.kind === "folder") {
+      const match = findPlaylist(node.children, name);
+      if (match) return match;
+    }
+  }
+  return undefined;
+}
+
+function flattenPlaylists(nodes: readonly PlaylistNode[]): PlaylistLeaf[] {
+  return nodes.flatMap((node) =>
+    node.kind === "playlist" ? [node] : flattenPlaylists(node.children),
+  );
+}
+
+function parseLibraryPayload(raw: unknown): LibraryPayload {
+  const parsed = typeof raw === "string" ? JSON.parse(raw) as unknown : raw;
+  if (!isLibraryPayload(parsed)) {
+    throw new Error("Sidecar returned an invalid --get-library payload.");
+  }
+
+  return parsed;
+}
 
 export function useLibraryState() {
   const { update, selectedTrackPath } = useConfigState();
   const { nmlPathOverride } = useCueGridSidecar();
 
-  /**
-   * Invokes `call_cuegrid_core` with `["--list-playlists"]` via Rust resource resolving.
-   * Populates `state.playlists`. Relocated verbatim from TargetSelector.vue's former
-   * onMounted hook (4-library-spec.md §3.1).
-   */
-  async function loadPlaylists(): Promise<void> {
-    state.playlistsLoading = true;
-
-    const args = ["--list-playlists"];
-    if (nmlPathOverride.value) {
-      args.push("--nml", nmlPathOverride.value);
+  const currentViewTracks = computed<TrackMetadata[]>(() => {
+    if (state.selectedContext === ALL_TRACKS_CONTEXT) {
+      return Object.values(state.collection).sort(
+        (a, b) => a.collection_index - b.collection_index,
+      );
     }
 
+    const playlist = findPlaylist(state.playlists, state.selectedContext);
+    if (!playlist) return [];
+
+    return playlist.track_paths
+      .map((path) => state.collection[path])
+      .filter((track): track is TrackMetadata => track !== undefined);
+  });
+
+  const playlistLeaves = computed(() => flattenPlaylists(state.playlists));
+
+  async function loadLibrary(): Promise<void> {
+    const myToken = ++loadToken;
+    state.libraryLoading = true;
+    state.libraryError = null;
+
+    const args = ["--get-library"];
+    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
+
     try {
-      // Llamamos al puente nativo de Rust pasando los argumentos estructurados
       const raw = await invoke<string>("call_cuegrid_core", { args });
-      const trimmed = raw.trim();
+      const payload = parseLibraryPayload(raw);
 
-      if (!trimmed) {
-        state.playlists = [];
-        state.playlistsLoading = false;
-        return;
+      if (myToken !== loadToken) return;
+
+      const selectedPlaylist = findPlaylist(payload.playlists, state.selectedContext);
+      const selectedPath = selectedTrackPath.value;
+      const canKeepSelectedTrack = selectedPath !== null &&
+        Object.prototype.hasOwnProperty.call(payload.collection, selectedPath);
+
+      state.collection = payload.collection;
+      state.playlists = payload.playlists;
+
+      if (state.selectedContext !== ALL_TRACKS_CONTEXT && !selectedPlaylist) {
+        state.selectedContext = ALL_TRACKS_CONTEXT;
+        update("selectedPlaylist", null);
       }
 
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed) && parsed.every((p) => typeof p === "string")) {
-        state.playlists = parsed;
-      } else {
-        console.error("[--list-playlists] unexpected JSON shape:", parsed);
-        state.playlists = [];
-      }
-    } catch (err) {
-      console.error("[--list-playlists] run or parse error:", err);
+      if (!canKeepSelectedTrack) update("selectedTrackPath", null);
+    } catch (error) {
+      if (myToken !== loadToken) return;
+      state.collection = {};
       state.playlists = [];
+      state.selectedContext = ALL_TRACKS_CONTEXT;
+      update("selectedPlaylist", null);
+      update("selectedTrackPath", null);
+      state.libraryError = error instanceof Error ? error.message : String(error);
     } finally {
-      state.playlistsLoading = false;
+      if (myToken === loadToken) state.libraryLoading = false;
     }
   }
 
-  /**
-   * Invokes `call_cuegrid_core` with `["--get-playlist-tracks", name]` via Rust resource
-   * resolving. On a modeled error (§1.4) the message is surfaced via `state.tracksError`;
-   * on success `state.tracks` is replaced wholesale.
-   *
-   * §2.4 clearing rule: also clears `selectedTrackPath` unconditionally
-   * so a stale preview from a previous playlist can't survive the switch.
-   */
-  async function selectPlaylist(name: string): Promise<void> {
-    const myToken = ++selectionToken;
-    update("selectedPlaylist", name);
-    update("selectedTrackPath", null); // §2.4 clearing rule — unconditional
-    state.tracksLoading = true;
-    state.tracksError = null;
+  function selectContext(context: string): void {
+    if (context !== ALL_TRACKS_CONTEXT && !findPlaylist(state.playlists, context)) return;
 
-    const args = ["--get-playlist-tracks", name];
-    if (nmlPathOverride.value) {
-      args.push("--nml", nmlPathOverride.value);
-    }
-
-    try {
-      const raw = await invoke<string>("call_cuegrid_core", { args });
-
-      // Stale response — another playlist was clicked while we were waiting.
-      if (myToken !== selectionToken) {
-        return;
-      }
-
-      const trimmed = raw.trim();
-      if (!trimmed) {
-        state.tracks = [];
-        state.tracksError = "Sidecar returned no output for this playlist.";
-        state.tracksLoading = false;
-        return;
-      }
-
-      const parsed = JSON.parse(trimmed) as PlaylistTracksResult;
-      if (isPlaylistTracksError(parsed)) {
-        state.tracks = [];
-        state.tracksError = parsed.message;
-      } else {
-        state.tracks = parsed;
-        state.tracksError = null;
-      }
-    } catch (err) {
-      if (myToken !== selectionToken) {
-        return;
-      }
-      console.error("[--get-playlist-tracks] execution error:", err);
-      state.tracks = [];
-      state.tracksError = typeof err === "string" ? err : String(err);
-    } finally {
-      if (myToken === selectionToken) {
-        state.tracksLoading = false;
-      }
-    }
+    state.selectedContext = context;
+    update("selectedPlaylist", context === ALL_TRACKS_CONTEXT ? null : context);
+    update("selectedTrackPath", null);
   }
 
-  /**
-   * §4.1 — double-click bridge: writes the track's location_path into
-   * `useConfigState().selectedTrackPath`, which AudioPlayer.vue watches
-   * to fire Stage 1 sync. Does NOT touch the batch target.
-   */
+  function selectPlaylist(name: string): void {
+    selectContext(name);
+  }
+
   function selectTrackForPreview(track: LibraryTrack): void {
     const path = track.location_path;
 
-    // Re-selecting the same path must still reload the player. A direct
-    // same-value assignment does not trigger AudioPlayer's watcher, so force
-    // a null -> path transition. Guard the next-tick write so a newer click
-    // cannot be overwritten by this older reload request.
     if (selectedTrackPath.value === path) {
       update("selectedTrackPath", null);
       void nextTick(() => {
-        if (selectedTrackPath.value === null) {
-          update("selectedTrackPath", path);
-        }
+        if (selectedTrackPath.value === null) update("selectedTrackPath", path);
       });
       return;
     }
@@ -172,7 +206,11 @@ export function useLibraryState() {
 
   return {
     ...toRefs(state),
-    loadPlaylists,
+    currentViewTracks,
+    playlistLeaves,
+    patchTrackInCollection,
+    loadLibrary,
+    selectContext,
     selectPlaylist,
     selectTrackForPreview,
   };

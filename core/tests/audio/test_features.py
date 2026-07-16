@@ -125,15 +125,30 @@ class TestScoreCandidate:
         config = AppConfig(
             energy_change_threshold_db=3.0, timbre_change_distance_threshold=12.0
         )
-        rms_before, rms_after = 0.1, 0.2
+        harmonic_before, harmonic_after = 0.1, 0.1
+        percussive_before, percussive_after = 0.1, 0.2
         mfcc_before = np.array([0.0, 0.0])
         mfcc_after = np.array([3.0, 4.0])
 
-        result = score_candidate(rms_before, rms_after, mfcc_before, mfcc_after, config)
+        result = score_candidate(
+            harmonic_before,
+            harmonic_after,
+            percussive_before,
+            percussive_after,
+            mfcc_before,
+            mfcc_after,
+            config,
+        )
 
-        expected_delta_db = energy_delta_db(rms_before, rms_after)
+        expected_harmonic_delta_db = energy_delta_db(harmonic_before, harmonic_after)
+        expected_percussive_delta_db = energy_delta_db(
+            percussive_before, percussive_after
+        )
+        expected_delta_db = expected_percussive_delta_db
         expected_distance = timbre_distance(mfcc_before, mfcc_after)
         assert result.energy_delta_db == pytest.approx(expected_delta_db)
+        assert result.harmonic_delta_db == pytest.approx(expected_harmonic_delta_db)
+        assert result.percussive_delta_db == pytest.approx(expected_percussive_delta_db)
         assert result.timbre_distance == pytest.approx(expected_distance)
         assert result.confidence == pytest.approx(
             confidence_score(expected_delta_db, expected_distance, config)
@@ -145,5 +160,24 @@ class TestScoreCandidate:
     def test_quiet_unchanging_window_is_not_significant(self):
         config = AppConfig()
         mfcc = np.zeros(13)
-        result = score_candidate(0.05, 0.05, mfcc, mfcc, config)
+        result = score_candidate(0.05, 0.05, 0.05, 0.05, mfcc, mfcc, config)
         assert result.is_significant is False
+
+    def test_drop_requires_a_percussive_rise_not_a_matched_volume_rise(self):
+        config = AppConfig(energy_change_threshold_db=4.0)
+        mfcc = np.zeros(13)
+        result = score_candidate(0.1, 0.1, 0.1, 0.3, mfcc, mfcc, config)
+
+        assert result.percussive_delta_db > 4.0
+        assert result.harmonic_delta_db == pytest.approx(0.0)
+        assert result.is_significant is True
+
+    def test_breakdown_requires_harmonic_energy_to_hold_or_rise(self):
+        config = AppConfig(energy_change_threshold_db=4.0)
+        mfcc = np.zeros(13)
+        result = score_candidate(0.1, 0.2, 0.3, 0.1, mfcc, mfcc, config)
+
+        assert result.percussive_delta_db < -4.0
+        assert result.harmonic_delta_db > 0.0
+        assert result.energy_delta_db < -4.0
+        assert result.is_significant is True

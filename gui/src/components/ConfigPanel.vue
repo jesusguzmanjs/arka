@@ -5,12 +5,11 @@
 //
 // Phase 4: TargetSelector.vue is fully removed; target selection now lives
 // in the sibling LibraryBrowser.vue. This panel keeps only the tuning
-// controls (Include Stems / Sensitivity / Max Cues / Clear Existing) plus
+// controls (Sensitivity / Max Cues / Clear Existing) plus
 // the validation hint.
 import { computed } from "vue";
 import { useConfigState } from "../composables/useConfigState";
 import { useRunState } from "../composables/useRunState";
-import IncludeStemsSwitch from "./IncludeStemsSwitch.vue";
 import SensitivitySelect from "./SensitivitySelect.vue";
 import MaxCuesSelect from "./MaxCuesSelect.vue";
 import ClearExistingSwitch from "./ClearExistingSwitch.vue";
@@ -19,7 +18,7 @@ const props = defineProps<{
   disabled?: boolean;
 }>();
 
-const { includeStems, sensitivity, maxCues, clearExisting, isValid, update } =
+const { sensitivity, maxCues, clearExisting, isValid, update } =
   useConfigState();
 const { status } = useRunState();
 
@@ -31,16 +30,8 @@ const locked = computed(() => props.disabled || status.value === "running");
   <section class="flex flex-1 min-h-0 items-center justify-center overflow-y-auto scrollbar-amber bg-panel border-b border-border px-4 py-6">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-5">
       <div class="flex flex-wrap items-center justify-center gap-x-2 gap-y-4">
-        <!-- Section 1: boolean controls share one vertical rhythm and switch primitive. -->
+        <!-- Section 1: remaining boolean control. -->
         <div class="flex flex-col justify-center gap-2 border-r border-zinc-800 pr-6">
-          <div class="grid min-h-6 grid-cols-[8rem_2.75rem] items-center gap-3">
-            <span class="text-sm text-muted">Include stems</span>
-            <IncludeStemsSwitch
-              :model-value="includeStems"
-              :disabled="locked"
-              @update:model-value="(v) => update('includeStems', v)"
-            />
-          </div>
           <div class="grid min-h-6 grid-cols-[8rem_2.75rem] items-center gap-3">
             <span class="text-sm text-muted">Clear current cues</span>
             <ClearExistingSwitch

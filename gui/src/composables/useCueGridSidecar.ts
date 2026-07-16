@@ -15,6 +15,16 @@ import { preparePlayerForAnalysis } from "./useTrackMetadata";
 import type { CueGridConfig } from "../types/config";
 import type { SidecarMessage } from "../types/sidecar";
 
+export interface CuePointPayload {
+  name: string;
+  type: 0;
+  start_ms: number;
+  len_ms: 0.0;
+  repeats: -1;
+  hotcue: number;
+  displ_order: 0;
+}
+
 /**
  * Builds the argv array for the sidecar directly from CueGridConfig.
  */
@@ -26,10 +36,10 @@ function buildArgs(cfg: CueGridConfig, target: "track" | "playlist"): string[] {
     args.push("--playlist", cfg.selectedPlaylist!);
   }
   if (cfg.nmlPathOverride) args.push("--nml", cfg.nmlPathOverride);
-  if (!cfg.includeStems) args.push("--no-stems");
   args.push("--mode", cfg.sensitivity);
   args.push("--max-cues", String(cfg.maxCues));
   if (cfg.clearExisting) args.push("--clear-existing");
+  args.push("--verbose");
   args.push("--json"); // §6.5 — switches core's main() to NDJSON stdout
   return args;
 }
@@ -45,7 +55,6 @@ function cleanupListeners() {
 export function useCueGridSidecar() {
   const {
     selectedPlaylist,
-    includeStems,
     sensitivity,
     maxCues,
     clearExisting,
@@ -82,7 +91,6 @@ export function useCueGridSidecar() {
     const cfg: CueGridConfig = {
       selectedPlaylist: target === "playlist" ? targetValue : null,
       selectedTrackPath: target === "track" ? targetValue : null,
-      includeStems: includeStems.value,
       sensitivity: sensitivity.value,
       maxCues: maxCues.value,
       clearExisting: clearExisting.value,
@@ -152,9 +160,13 @@ export function useCueGridSidecar() {
    */
   async function updateTrackCues(
     trackPath: string,
-    cues: Array<{ hotcue: number; start_ms: number }>
+    cues: CuePointPayload[],
+    newGridAnchorMs?: number,
+    newBpm?: number,
   ): Promise<{ ok: boolean; error?: string }> {
     const args = [trackPath, "--update-cues", JSON.stringify(cues)];
+    if (newGridAnchorMs !== undefined) args.push("--grid-anchor", String(newGridAnchorMs));
+    if (newBpm !== undefined) args.push("--bpm", String(newBpm));
     if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
 
     try {

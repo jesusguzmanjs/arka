@@ -1,96 +1,105 @@
 <script setup lang="ts">
-// LibraryBrowser.vue
-// Two-column playlist/tracklist browser replacing the deprecated
-// TargetSelector.vue. See .openspec/4-library-spec.md §3 (Component
-// Contract), §3.5 (Split-column layout, revised v1.1), §4.4 (Concurrency
-// Lock — isLoadingTrack), §5 (Visual Integration & Anti-Clip).
-//
-// Left column (w-1/3): vertical list of playlist names from
-//   --list-playlists, single-click selects + fetches tracks.
-// Right column (w-2/3): Action | Artist | Title table of the selected
-//   playlist's tracks from --get-playlist-tracks; double-click a row OR
-//   click its leading Load icon to preview it in AudioPlayer.vue via
-//   selectedTrackPath.
-//
-// Self-contained: reads useLibraryState()/useConfigState()/usePlayerState()
-// directly, accepts a single `disabled` prop matching every other top-level
-// panel.
-
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { useLibraryState } from "../composables/useLibraryState";
+import { useVirtualizer } from "@tanstack/vue-virtual";
+import { computed, nextTick, onMounted, onUnmounted, useTemplateRef, ref, watch } from "vue";
+import { ALL_TRACKS_CONTEXT, useLibraryState } from "../composables/useLibraryState";
 import { useConfigState } from "../composables/useConfigState";
 import { usePlayerState } from "../composables/useTrackMetadata";
 import { useRunState } from "../composables/useRunState";
 import { useCueGridSidecar } from "../composables/useCueGridSidecar";
 import type { LibraryTrack } from "../types/library";
 
+const ROW_HEIGHT = 40;
+
 const props = defineProps<{ disabled?: boolean }>();
 
 const {
-  playlists,
-  playlistsLoading,
-  tracks,
-  tracksLoading,
-  tracksError,
-  loadPlaylists,
-  selectPlaylist,
+  playlistLeaves,
+  selectedContext,
+  libraryLoading,
+  currentViewTracks,
+  libraryError,
+  loadLibrary,
+  selectContext,
   selectTrackForPreview,
 } = useLibraryState();
-
-// Extremos 'isValid' para controlar cuándo se puede ejecutar el análisis
 const { selectedPlaylist, selectedTrackPath, isValid } = useConfigState();
-
-// §4.4 — read the shared isLoadingTrack concurrency lock directly from the
-// player's singleton state. While true, every row-level interaction is
-// inert so a second click can never race the first.
 const { isLoadingTrack } = usePlayerState();
-
-// Extraemos los estados reactivos de la ejecución global
 const { status, analysisStatus, setAnalysisStatus } = useRunState();
-
-// Extraemos los métodos de control del proceso por lote e individual de Python
 const { run, runSingleTrack, cancel, resetRun } = useCueGridSidecar();
 
+const trackScrollElement = useTemplateRef<HTMLDivElement>("trackScrollElement");
+const searchInputRef = useTemplateRef<HTMLInputElement>("searchInputRef");
 const contextMenuVisible = ref(false);
 const contextMenuX = ref(0);
 const contextMenuY = ref(0);
 const contextMenuTrack = ref<LibraryTrack | null>(null);
+const searchQuery = ref("");
+const isSearchVisible = ref(false);
 
-// Condiciones de validación para activar o desactivar los botones
-const canRunPlaylist = computed(
-  () => isValid.value && status.value !== "running" && selectedPlaylist.value,
-);
+const filteredTracks = computed(() => {
+  const query = searchQuery.value.trim().toLowerCase();
+  const baseTracks = currentViewTracks.value;
 
-const canRunCurrentTrack = computed(
-  () => status.value !== "running" && selectedTrackPath.value,
-);
+  if (!query) return baseTracks;
 
-// Buscamos los metadatos de la canción actual para mandárselos a la CLI de Python
-const currentTrackRecord = computed(() => {
-  if (!selectedTrackPath.value) return null;
-  return tracks.value.find(t => t.location_path === selectedTrackPath.value) || null;
+  return baseTracks.filter((track) =>
+      (track.artist && track.artist.toLowerCase().includes(query)) ||
+      (track.title && track.title.toLowerCase().includes(query)) ||
+      (track.bpm !== null && String(track.bpm).includes(query))
+  );
 });
 
-const currentTrackTitle = computed(() => currentTrackRecord.value?.title || "Current Track");
-
-// Gestores de clics para los botones integrados
-function onAnalyzePlaylist() {
-  if (status.value === "running") return;
-  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
-    resetRun();
+async function toggleSearch() {
+  if (isSearchVisible.value) {
+    clearSearch();
+  } else {
+    isSearchVisible.value = true;
+    await nextTick();
+    searchInputRef.value?.focus();
   }
-  run();
 }
 
-function onAnalyzeCurrentTrack() {
-  if (status.value === "running" || !selectedTrackPath.value) return;
-  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
-    resetRun();
-  }
-  void runSingleTrack(selectedTrackPath.value, currentTrackTitle.value);
+function clearSearch() {
+  searchQuery.value = "";
+  isSearchVisible.value = false;
+}
+
+const virtualizer = useVirtualizer<HTMLDivElement, HTMLButtonElement>(
+    computed(() => ({
+      count: filteredTracks.value.length, // <- AHORA USA LA LISTA FILTRADA
+      getScrollElement: () => trackScrollElement.value,
+      estimateSize: () => ROW_HEIGHT,
+      overscan: 10,
+    })),
+);
+
+const currentTrackRecord = computed(() => {
+  if (!selectedTrackPath.value) return null;
+  return currentViewTracks.value.find(
+    (track) => track.location_path === selectedTrackPath.value,
+  ) ?? null;
+});
+
+const currentTrackTitle = computed(() => currentTrackRecord.value?.title ?? "Current Track");
+const canRunPlaylist = computed(
+  () => isValid.value && status.value !== "running" && selectedPlaylist.value !== null,
+);
+const canRunCurrentTrack = computed(
+  () => status.value !== "running" && Boolean(selectedTrackPath.value) && !currentTrackRecord.value?.is_flex_grid,
+);
+
+const flexGridTooltip = "Variable BPM (Flex Grid) is unsupported; analysis is disabled.";
+
+function bpmLabel(track: LibraryTrack): string {
+  return track.bpm === null ? "—" : track.bpm.toFixed(1);
+}
+
+function gridLabel(track: LibraryTrack): string {
+  return track.is_flex_grid ? "Flex" : "Grid";
 }
 
 function selectTrackForPreviewAndClearStatus(track: LibraryTrack): void {
+  if (track.is_flex_grid) return;
   setAnalysisStatus(null);
   selectTrackForPreview(track);
 }
@@ -101,7 +110,7 @@ function closeContextMenu(): void {
 }
 
 function openTrackContextMenu(event: MouseEvent, track: LibraryTrack): void {
-  if (props.disabled || isLoadingTrack.value) return;
+  if (props.disabled || isLoadingTrack.value || track.is_flex_grid) return;
   contextMenuTrack.value = track;
   contextMenuX.value = event.clientX;
   contextMenuY.value = event.clientY;
@@ -111,25 +120,40 @@ function openTrackContextMenu(event: MouseEvent, track: LibraryTrack): void {
 async function analyzeContextTrack(): Promise<void> {
   const track = contextMenuTrack.value;
   closeContextMenu();
-
-  // Let Vue remove the menu overlay before the analysis updates shared state.
-  // This keeps the menu's VNodes out of the same patch cycle as the sidecar
-  // status changes triggered by runSingleTrack().
   await nextTick();
 
-  if (!track || props.disabled || isLoadingTrack.value) return;
+  if (!track || props.disabled || isLoadingTrack.value || track.is_flex_grid) return;
   await runSingleTrack(track.location_path, track.title);
+}
+
+function onAnalyzePlaylist(): void {
+  if (status.value === "running") return;
+  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
+    resetRun();
+  }
+  run();
+}
+
+function onAnalyzeCurrentTrack(): void {
+  if (status.value === "running" || !selectedTrackPath.value || currentTrackRecord.value?.is_flex_grid) return;
+  if (status.value === "success" || status.value === "error" || status.value === "cancelled") {
+    resetRun();
+  }
+  void runSingleTrack(selectedTrackPath.value, currentTrackTitle.value);
 }
 
 function onWindowKeyDown(event: KeyboardEvent): void {
   if (event.key === "Escape") closeContextMenu();
 }
 
+watch(selectedContext, () => {
+  clearSearch();
+  void nextTick(() => trackScrollElement.value?.scrollTo({ top: 0 }));
+});
+
 onMounted(() => {
   window.addEventListener("keydown", onWindowKeyDown);
-  // §3.3 — replaces TargetSelector.vue's former onMounted --list-playlists
-  // fetch. The left column is always freshly repopulated on boot.
-  void loadPlaylists();
+  void loadLibrary();
 });
 
 onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
@@ -137,232 +161,224 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
 
 <template>
   <section
-    class="flex h-full min-h-0 flex-1 flex-col overflow-hidden"
-    :class="{ 'opacity-60 pointer-events-none': props.disabled }"
+    class="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-zinc-900"
+    :class="{ 'pointer-events-none opacity-60': props.disabled }"
   >
-    <div
-      class="flex items-center gap-2 px-4 py-2 border-b border-zinc-800/80 border-l-2 border-l-secondary/30"
-    >
-      <span class="text-xs uppercase tracking-widest text-muted">Library</span>
-      <span class="text-xs text-dim">{{ playlists.length }} playlists</span>
+    <div class="flex shrink-0 items-center justify-between border-b border-zinc-800 px-4 py-2.5">
+      <div class="flex min-w-0 items-center gap-2">
+        <span class="h-2 w-2 rounded-full bg-primary shadow-[0_0_8px_rgba(234,169,0,0.65)]" aria-hidden="true" />
+        <h2 class="truncate text-xs font-semibold uppercase tracking-[0.18em] text-primary">Library</h2>
+      </div>
+      <span class="font-mono text-[11px] tabular-nums text-dim">{{ currentViewTracks.length }} tracks</span>
     </div>
 
-    <div class="flex-1 min-h-0 flex">
-      <div
-        class="flex w-[min(22rem,34%)] min-h-0 shrink-0 flex-col border-r border-zinc-800/80"
-      >
-        <div class="shrink-0 border-b border-zinc-800/60 px-4 py-2">
-          <span class="text-xs font-semibold uppercase tracking-wide text-muted">Playlists</span>
+    <div class="flex min-h-0 flex-1 overflow-hidden">
+      <aside class="flex w-64 min-h-0 shrink-0 flex-col overflow-y-auto border-r border-zinc-800 bg-zinc-950/35">
+        <div class="shrink-0 border-b border-zinc-800/80 px-4 py-2">
+          <span class="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted">Navigate</span>
         </div>
-        <div class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">
-          <div
-            v-if="playlistsLoading && playlists.length === 0"
-            class="flex h-full items-center justify-center px-4 text-center text-sm text-dim"
+
+        <nav class="min-h-0 flex-1 p-2" aria-label="Library contexts">
+          <button
+            type="button"
+            class="mb-1 flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            :class="selectedContext === ALL_TRACKS_CONTEXT
+              ? 'border-l-2 border-primary bg-primary/10 pl-[10px] text-primary'
+              : 'border-l-2 border-transparent text-muted hover:bg-zinc-800/70 hover:text-primary'"
+            :aria-current="selectedContext === ALL_TRACKS_CONTEXT ? 'page' : undefined"
+            @click="selectContext(ALL_TRACKS_CONTEXT)"
           >
+            <svg class="h-4 w-4 shrink-0" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+              <path d="M3 3.5A1.5 1.5 0 014.5 2h11A1.5 1.5 0 0117 3.5v13a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13zM5 5v2h10V5H5zm0 4v2h6V9H5zm0 4v2h8v-2H5z" />
+            </svg>
+            <span class="truncate">All Tracks</span>
+<!--            <span class="ml-auto font-mono text-[10px] tabular-nums text-dim">{{ currentViewTracks.length }}</span>-->
+          </button>
+
+          <div class="mb-1 mt-4 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-dim">
+            Playlists
+          </div>
+
+          <div v-if="libraryLoading && playlistLeaves.length === 0" class="px-3 py-3 text-xs text-dim">
             Loading playlists…
           </div>
-          <ul v-else class="h-full py-2">
-            <li
-              v-for="name in playlists"
-              :key="name"
-              class="px-3 py-1.5 text-sm cursor-pointer truncate"
-              :class="
-                name === selectedPlaylist
-                  ? 'bg-elevated text-accent'
-                  : 'text-muted hover:bg-zinc-800/60 hover:text-primary'
-              "
-              @click="!props.disabled && selectPlaylist(name)"
-            >
-              {{ name }}
-            </li>
-            <li
-              v-if="!playlistsLoading && playlists.length === 0"
-              class="flex h-full min-h-40 items-center justify-center px-4 text-center text-sm text-dim"
-            >
-              No playlists found in collection.nml.
-            </li>
-          </ul>
-        </div>
-
-        <div class="hidden">
-
-          <div
-            v-if="analysisStatus"
-            class="min-h-4 text-center text-[11px] font-mono text-zinc-400 border border-zinc-800/60 rounded p-1.5 bg-zinc-950 truncate"
-            aria-live="polite"
-            :title="analysisStatus"
-          >
-            {{ analysisStatus }}
+          <div v-else-if="playlistLeaves.length === 0" class="px-3 py-3 text-xs leading-5 text-dim">
+            No playlists found in collection.nml.
           </div>
-
-          <div class="flex flex-col gap-1.5">
+          <div v-else class="space-y-0.5">
             <button
-              v-if="status !== 'running'"
+              v-for="playlist in playlistLeaves"
+              :key="playlist.name"
               type="button"
-              :disabled="!canRunPlaylist"
-              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors"
-              :class="
-                canRunPlaylist
-                  ? 'bg-primary text-zinc-950 hover:bg-accent active:bg-primary-pressed font-semibold'
-                  : 'bg-zinc-800/50 text-zinc-600 cursor-not-allowed'
-              "
-              @click="onAnalyzePlaylist"
+              class="flex w-full min-w-0 items-center gap-2 rounded px-3 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              :class="selectedContext === playlist.name
+                ? 'border-l-2 border-primary bg-primary/10 pl-[10px] text-primary'
+                : 'border-l-2 border-transparent text-muted hover:bg-zinc-800/70 hover:text-primary'"
+              :aria-current="selectedContext === playlist.name ? 'page' : undefined"
+              @click="selectContext(playlist.name)"
             >
-              <span>▶</span>
-              <span>Analyze Playlist</span>
-            </button>
-
-            <button
-              v-if="status !== 'running'"
-              type="button"
-              :disabled="!canRunCurrentTrack"
-              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium transition-colors border"
-              :class="
-                canRunCurrentTrack
-                  ? 'border-secondary/30 bg-zinc-900 text-accent hover:bg-zinc-800 hover:text-accent'
-                  : 'border-zinc-800/80 bg-transparent text-zinc-600 cursor-not-allowed'
-              "
-              @click="onAnalyzeCurrentTrack"
-            >
-              <span>🎯</span>
-              <span>Analyze Current Track</span>
-            </button>
-
-            <button
-              v-if="status === 'running'"
-              type="button"
-              class="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-medium border border-red-500/40 bg-zinc-900 text-red-400 hover:bg-red-950/40 hover:text-red-300 transition-colors animate-pulse"
-              @click="cancel"
-            >
-              <span class="inline-block w-2.5 h-2.5 border-2 border-red-400/30 border-t-red-400 rounded-full animate-spin" />
-              <span>Cancel Analysis…</span>
+              <svg class="h-4 w-4 shrink-0 text-secondary" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                <path d="M3 4.5A1.5 1.5 0 014.5 3h4l1.25 1.5h5.75A1.5 1.5 0 0117 6v9.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 15.5v-11z" />
+              </svg>
+              <span class="min-w-0 flex-1 truncate">{{ playlist.name }}</span>
             </button>
           </div>
-        </div>
+        </nav>
+      </aside>
+
+      <main class="flex min-w-0 min-h-0 flex-1 flex-col bg-zinc-900">
+        <div class="flex shrink-0 items-center justify-between border-b border-zinc-800 px-4 py-2.5 h-10">
+          <div class="min-w-0">
+            <h3 class="truncate text-sm font-semibold text-primary">
+              {{ selectedContext === ALL_TRACKS_CONTEXT ? "All Tracks" : selectedContext }}
+            </h3>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <span v-if="libraryLoading" class="font-mono text-[11px] text-primary" aria-live="polite">Loading…</span>
+
+            <div class="relative flex items-center h-6">
+              <button
+                  v-if="!isSearchVisible"
+                  type="button"
+                  class="text-zinc-500 hover:text-zinc-300 transition-colors p-1"
+                  @click="toggleSearch"
+                  title="Search in current view"
+              >
+                <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+              </button>
+
+              <div v-else class="relative flex items-center">
+                <input
+                    ref="searchInputRef"
+                    v-model="searchQuery"
+                    type="search"
+                    placeholder="Filter tracks..."
+                    class="bg-zinc-800/80 text-xs text-zinc-200 pl-7 pr-6 py-1 rounded border border-zinc-700 focus:border-primary/50 focus:ring-1 focus:ring-primary w-48 transition-all outline-none"
+                    @keydown.escape="clearSearch"
+                    @blur="searchQuery === '' ? isSearchVisible = false : null"
+                />
+                <svg class="h-3.5 w-3.5 text-zinc-500 absolute left-2 top-1/2 -translate-y-1/2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <button
+                    v-if="searchQuery !== ''"
+                    type="button"
+                    class="absolute right-1.5 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+                    @click="clearSearch"
+                >
+                  <svg class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
-      <div class="flex min-w-0 flex-1 min-h-0 flex-col">
-        <div class="flex shrink-0 items-center justify-between border-b border-zinc-800/60 px-4 py-2">
-          <span class="text-xs font-semibold uppercase tracking-wide text-muted">Tracks</span>
-          <span v-if="selectedPlaylist" class="max-w-[60%] truncate text-xs text-dim" :title="selectedPlaylist">
-            {{ selectedPlaylist }}
-          </span>
-        </div>
         <div
-          v-if="tracksError"
-          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-warn font-mono"
+          v-if="libraryError"
+          class="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-warn"
+          role="alert"
         >
-          {{ tracksError }}
+          {{ libraryError }}
         </div>
-
         <div
-          v-else-if="tracksLoading"
-          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
+          v-else-if="libraryLoading && currentViewTracks.length === 0"
+          class="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-dim"
+          aria-live="polite"
         >
           Loading tracks…
         </div>
-
         <div
-          v-else-if="!selectedPlaylist"
-          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
+            v-else-if="filteredTracks.length === 0"
+            class="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-dim"
         >
-          Select a playlist to view its tracks.
+          {{ searchQuery ? "No tracks match your search." : (selectedContext === ALL_TRACKS_CONTEXT ? "No tracks found in collection.nml." : "This playlist is empty.") }}
         </div>
+        <div v-else class="flex min-h-0 flex-1 flex-col">
+          <div
+            class="grid shrink-0 grid-cols-[2.75rem_minmax(0,1.1fr)_minmax(0,2fr)_5rem_5rem] items-center border-b border-zinc-800/80 bg-zinc-950/45 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-dim"
+            role="row"
+          >
+            <span class="px-2 py-2" role="columnheader" aria-label="Status" />
+            <span class="px-2 py-2" role="columnheader">Artist</span>
+            <span class="px-2 py-2" role="columnheader">Title</span>
+            <span class="px-2 py-2 text-right" role="columnheader">BPM</span>
+            <span class="px-2 py-2 text-right" role="columnheader">Grid</span>
+          </div>
 
-        <div
-          v-else-if="tracks.length === 0"
-          class="flex flex-1 min-h-0 items-center justify-center px-4 text-center text-sm text-dim"
-        >
-          This playlist is empty.
-        </div>
-
-        <div v-else class="flex-1 min-h-0 overflow-y-auto scrollbar-amber">
-          <table class="w-full table-fixed text-sm">
-            <thead class="sticky top-0 z-10 bg-panel">
-              <tr>
-                <th class="w-10 px-2 py-1.5"></th>
-                <th class="w-10 px-2 py-1.5"></th>
-                <th class="text-left px-3 py-1.5 text-muted font-normal">
-                  Artist
-                </th>
-                <th class="text-left px-3 py-1.5 text-muted font-normal">
-                  Title
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="track in tracks"
-                :key="track.location_path"
-                class="cursor-pointer"
+          <!-- The scroll container must own the height and vertical overflow. -->
+          <div
+            ref="trackScrollElement"
+            class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain scrollbar-amber"
+            role="table"
+            :aria-rowcount="filteredTracks.length"
+            tabindex="0"
+          >
+            <!-- The relative spacer preserves the complete virtual scroll height. -->
+            <div
+              class="relative w-full"
+              :style="{ height: `${virtualizer.getTotalSize()}px` }"
+            >
+              <button
+                v-for="virtualRow in virtualizer.getVirtualItems()"
+                :key="String(virtualRow.key)"
+                type="button"
+                class="absolute left-0 top-0 grid w-full grid-cols-[2.75rem_minmax(0,1.1fr)_minmax(0,2fr)_5rem_5rem] items-center border-b border-zinc-800/50 px-2 text-left text-sm transition-colors focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
                 :class="[
-                  track.location_path === selectedTrackPath
-                    ? 'bg-elevated'
-                    : 'hover:bg-zinc-800/60',
-                  // §4.4 — isLoadingTrack lock: dim + inert rows while a
-                  // load is in flight, layered independently of the run-lock
-                  // `disabled` prop on the root <section>.
-                  isLoadingTrack ? 'opacity-50 pointer-events-none' : '',
+                  filteredTracks[virtualRow.index].location_path === selectedTrackPath
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-primary hover:bg-zinc-800/70',
+                  filteredTracks[virtualRow.index].is_flex_grid ? 'cursor-not-allowed opacity-50' : '',
+                  isLoadingTrack ? 'pointer-events-none opacity-50' : '',
                 ]"
-                @dblclick="!props.disabled && !isLoadingTrack && selectTrackForPreviewAndClearStatus(track)"
-                @contextmenu.prevent="openTrackContextMenu($event, track)"
+                :style="{ height: `${ROW_HEIGHT}px`, transform: `translateY(${virtualRow.start}px)` }"
+                :aria-rowindex="virtualRow.index + 2"
+                :aria-label="`Load ${filteredTracks[virtualRow.index].artist} – ${filteredTracks[virtualRow.index].title}`"
+                :aria-disabled="filteredTracks[virtualRow.index].is_flex_grid || isLoadingTrack"
+                :title="filteredTracks[virtualRow.index].is_flex_grid ? flexGridTooltip : undefined"
+                @click="!isLoadingTrack && !filteredTracks[virtualRow.index].is_flex_grid && selectTrackForPreviewAndClearStatus(filteredTracks[virtualRow.index])"
+                @contextmenu.prevent="openTrackContextMenu($event, filteredTracks[virtualRow.index])"
               >
-                <td class="px-2 py-1 text-center">
-                  <button
-                    type="button"
-                    class="text-muted hover:text-accent disabled:opacity-40 disabled:hover:text-muted transition-colors"
-                    :disabled="isLoadingTrack"
-                    :aria-label="`Load ${track.artist} - ${track.title}`"
-                    title="Load for preview"
-                    @click.stop="!props.disabled && !isLoadingTrack && selectTrackForPreviewAndClearStatus(track)"
+                <span class="flex items-center px-2" role="cell">
+                  <svg
+                    v-if="filteredTracks[virtualRow.index].is_flex_grid"
+                    class="h-4 w-4 text-primary"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    aria-hidden="true"
                   >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                      class="w-4 h-4 inline-block"
-                      aria-hidden="true"
-                    >
-                      <path
-                        fill-rule="evenodd"
-                        d="M2 10a8 8 0 1116 0 8 8 0 01-16 0zm6.5-3.25a.75.75 0 00-1.5 0v6.5a.75.75 0 001.2.6l4.5-3.25a.75.75 0 000-1.2l-4.5-3.25a.75.75 0 00-.3-.1z"
-                        clip-rule="evenodd"
-                      />
-                    </svg>
-                  </button>
-                </td>
-                <td class="w-10 px-2 py-1 text-center">
-                  <span
-                    v-if="track.flags != null && (Number(track.flags) & 0x40) === 0x40"
-                    class="inline-flex text-emerald-400 transition-colors hover:text-emerald-300"
-                    title="Stems available"
-                    aria-label="Stems available"
-                  >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 20 20"
-                      fill="currentColor"
-                      class="h-3.5 w-3.5"
-                      aria-hidden="true"
-                    >
-                      <path d="M3 5.25A1.25 1.25 0 014.25 4h11.5A1.25 1.25 0 0117 5.25v1.5A1.25 1.25 0 0115.75 8H4.25A1.25 1.25 0 013 6.75v-1.5zM3 10.25A1.25 1.25 0 014.25 9h11.5A1.25 1.25 0 0117 10.25v1.5A1.25 1.25 0 0115.75 13H4.25A1.25 1.25 0 013 11.75v-1.5zM3 15.25A1.25 1.25 0 014.25 14h11.5A1.25 1.25 0 0117 15.25v1.5A1.25 1.25 0 0115.75 18H4.25A1.25 1.25 0 013 16.75v-1.5z" />
-                    </svg>
-                  </span>
-                </td>
-                <td class="px-3 py-1 text-primary truncate">{{ track.artist }}</td>
-                <td class="px-3 py-1 text-primary truncate">{{ track.title }}</td>
-              </tr>
-            </tbody>
-          </table>
+                    <path fill-rule="evenodd" d="M8.485 2.495a1.75 1.75 0 013.03 0l6.285 10.875A1.75 1.75 0 0116.285 16H3.715a1.75 1.75 0 01-1.515-2.63L8.485 2.495zM10 7a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5a.75.75 0 01-.75-1.5zM10 13a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd" />
+                  </svg>
+                  <svg v-else class="h-4 w-4 text-secondary" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                    <path d="M6.5 4.25A1.25 1.25 0 018.39 3.2l7.1 5.75a1.35 1.35 0 010 2.1l-7.1 5.75A1.25 1.25 0 016.5 15.83V4.25z" />
+                  </svg>
+                </span>
+                <span class="min-w-0 truncate px-2" role="cell">{{ filteredTracks[virtualRow.index].artist }}</span>
+                <span class="min-w-0 truncate px-2 font-medium" role="cell">{{ filteredTracks[virtualRow.index].title }}</span>
+                <span class="px-2 text-right font-mono text-xs tabular-nums text-muted" role="cell">{{ bpmLabel(filteredTracks[virtualRow.index]) }}</span>
+                <span
+                  class="px-2 text-right text-[11px]"
+                  :class="filteredTracks[virtualRow.index].is_flex_grid ? 'text-primary' : 'text-dim'"
+                  role="cell"
+                >
+                  {{ gridLabel(filteredTracks[virtualRow.index]) }}
+                </span>
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      </main>
     </div>
 
-    <div class="shrink-0 border-t border-zinc-800/60 bg-zinc-950/40 p-2">
+    <div class="shrink-0 border-t border-zinc-800/80 bg-zinc-950/45 p-2">
       <div class="flex flex-wrap items-center gap-2">
         <div
           v-if="analysisStatus"
-          class="min-w-0 flex-1 truncate rounded border border-zinc-800/60 bg-zinc-950 px-2 py-1 text-center text-[11px] font-mono text-zinc-400"
+          class="min-w-0 flex-1 truncate rounded border border-zinc-800/80 bg-zinc-950 px-2 py-1 text-center font-mono text-[11px] text-zinc-400"
           aria-live="polite"
           :title="analysisStatus"
         >
@@ -374,38 +390,26 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
           v-if="status !== 'running'"
           type="button"
           :disabled="!canRunPlaylist"
-          class="inline-flex min-w-40 items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors"
-          :class="
-            canRunPlaylist
-              ? 'bg-primary text-zinc-950 hover:bg-accent active:bg-primary-pressed'
-              : 'cursor-not-allowed bg-zinc-800/50 text-zinc-600'
-          "
+          class="inline-flex min-w-40 items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          :class="canRunPlaylist ? 'bg-primary text-zinc-950 hover:bg-accent' : 'cursor-not-allowed bg-zinc-800/50 text-zinc-600'"
           @click="onAnalyzePlaylist"
         >
-          <span aria-hidden="true">▶</span>
-          <span>Analyze Playlist</span>
+          Analyze Playlist
         </button>
-
         <button
           v-if="status !== 'running'"
           type="button"
           :disabled="!canRunCurrentTrack"
-          class="inline-flex min-w-44 items-center justify-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold transition-colors"
-          :class="
-            canRunCurrentTrack
-              ? 'border-secondary/30 bg-zinc-900 text-accent hover:bg-zinc-800'
-              : 'cursor-not-allowed border-zinc-800/80 bg-transparent text-zinc-600'
-          "
+          class="inline-flex min-w-44 items-center justify-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          :class="canRunCurrentTrack ? 'border-secondary/30 bg-zinc-900 text-primary hover:bg-zinc-800' : 'cursor-not-allowed border-zinc-800/80 bg-transparent text-zinc-600'"
           @click="onAnalyzeCurrentTrack"
         >
-          <span aria-hidden="true">🎯</span>
-          <span>Analyze Current Track</span>
+          Analyze Current Track
         </button>
-
         <button
           v-if="status === 'running'"
           type="button"
-          class="w-full rounded-md border border-red-500/40 bg-zinc-900 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-950/40"
+          class="w-full rounded-md border border-red-500/40 bg-zinc-900 px-3 py-2 text-xs font-medium text-red-400 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 hover:bg-red-950/40"
           @click="cancel"
         >
           Cancel Analysis…
@@ -424,15 +428,16 @@ onUnmounted(() => window.removeEventListener("keydown", onWindowKeyDown));
       class="fixed z-50 min-w-40 rounded-md border border-zinc-700 bg-zinc-900 py-1 text-sm text-zinc-200 shadow-xl"
       :style="{ left: `${contextMenuX}px`, top: `${contextMenuY}px` }"
       role="menu"
+      aria-label="Track actions"
       @click.stop
     >
       <button
         type="button"
-        class="w-full px-3 py-2 text-left hover:bg-zinc-800 focus:bg-zinc-800 focus:outline-none"
+        class="w-full px-3 py-2 text-left transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
         role="menuitem"
         @click="analyzeContextTrack"
       >
-        Analyze track
+        Analyze Track
       </button>
     </div>
   </div>

@@ -15,9 +15,11 @@ tree exposed by ``nml.parser.NmlParser``.
 
 from __future__ import annotations
 
+import math
 import shutil
 import time
 import xml.etree.ElementTree as ET
+import datetime
 from pathlib import Path
 
 from cuegrid.nml.models import CuePoint
@@ -26,6 +28,8 @@ from cuegrid.nml.parser import NmlParser
 # Matches Traktor's own declaration exactly (spec section 3.1's example),
 # rather than Python's default single-quoted, standalone-less declaration.
 _XML_DECLARATION = b'<?xml version="1.0" encoding="UTF-8" standalone="no" ?>\n'
+_MIN_BPM = 50.0
+_MAX_BPM = 200.0
 
 
 class HotcueSlotConflictError(Exception):
@@ -154,44 +158,137 @@ class NmlWriter:
         cues_list: list[dict],
         title: str | None = None,
         artist: str | None = None,
+        grid_anchor_ms: float | None = None,
+        bpm: float | None = None,
     ) -> None:
-        """Update existing standard HotCues in-place or create missing ones.
+        """Update standard HotCues, one Grid anchor, and/or BPM atomically.
 
         Designed for frontend UI sync (drag & drop adjustments). Modifies the
         START attribute of existing CUE_V2 elements to preserve user-defined
-        names, rather than destroying and recreating the nodes.
+        names, rather than destroying and recreating the nodes. When
+        ``grid_anchor_ms`` is supplied, the target must have exactly one Grid
+        marker; Flex Grid entries are rejected before any XML is mutated.
+        When ``bpm`` is supplied, the target must contain a direct ``TEMPO``
+        child and the value must be finite and within the inclusive range
+        ``[50, 200]``.
+
+        NML ``START`` values in this project are milliseconds, so no unit
+        conversion is performed before six-decimal formatting.
         """
         entry_el = self._parser.find_entry_element(track_path, title, artist)
 
+        normalized_cues = self._validate_manual_cues(cues_list)
+        normalized_bpm = self._validate_bpm(bpm)
+        grid_marker: ET.Element | None = None
+        if grid_anchor_ms is not None:
+            if not math.isfinite(grid_anchor_ms) or grid_anchor_ms < 0:
+                raise ValueError("grid anchor must be a finite value greater than or equal to zero")
+            grid_markers = [
+                element
+                for element in entry_el.findall("CUE_V2")
+                if element.get("TYPE") == "4"
+            ]
+            if len(grid_markers) != 1:
+                if len(grid_markers) > 1:
+                    raise ValueError("cannot update grid anchor for a Flex Grid track")
+                raise ValueError("cannot update grid anchor: no Grid marker found")
+            grid_marker = grid_markers[0]
+
+        original_starts: dict[ET.Element, str | None] = {}
+        created_cues: list[ET.Element] = []
+        grid_start = grid_marker.get("START") if grid_marker is not None else None
+        tempo_el = entry_el.find("TEMPO") if normalized_bpm is not None else None
+        if normalized_bpm is not None and tempo_el is None:
+            raise ValueError("cannot update BPM: no TEMPO element found")
+        original_bpm = tempo_el.get("BPM") if tempo_el is not None else None
+        try:
+            for hotcue, start_ms in normalized_cues:
+                hotcue_str = str(hotcue)
+                cue_el = next(
+                    (
+                        el
+                        for el in entry_el.findall("CUE_V2")
+                        if el.get("TYPE") == "0" and el.get("HOTCUE") == hotcue_str
+                    ),
+                    None,
+                )
+                formatted_time = f"{start_ms:.6f}"
+
+                if cue_el is not None:
+                    original_starts[cue_el] = cue_el.get("START")
+                    cue_el.set("START", formatted_time)
+                else:
+                    cue_el = ET.SubElement(entry_el, "CUE_V2")
+                    created_cues.append(cue_el)
+                    cue_el.set("NAME", f"Cue {hotcue + 1}")
+                    cue_el.set("DISPL_ORDER", "0")
+                    cue_el.set("TYPE", "0")
+                    cue_el.set("START", formatted_time)
+                    cue_el.set("LEN", "0.000000")
+                    cue_el.set("REPEATS", "-1")
+                    cue_el.set("HOTCUE", hotcue_str)
+
+            if grid_marker is not None:
+                grid_marker.set("START", f"{grid_anchor_ms:.6f}")
+            if tempo_el is not None and normalized_bpm is not None:
+                tempo_el.set("BPM", f"{normalized_bpm:.6f}")
+
+            self._backup_if_needed()
+            self._write_atomic()
+        except Exception:
+            for cue_el, original_start in original_starts.items():
+                if original_start is None:
+                    cue_el.attrib.pop("START", None)
+                else:
+                    cue_el.set("START", original_start)
+            for cue_el in created_cues:
+                entry_el.remove(cue_el)
+            if grid_marker is not None:
+                if grid_start is None:
+                    grid_marker.attrib.pop("START", None)
+                else:
+                    grid_marker.set("START", grid_start)
+            if tempo_el is not None:
+                if original_bpm is None:
+                    tempo_el.attrib.pop("BPM", None)
+                else:
+                    tempo_el.set("BPM", original_bpm)
+            raise
+
+    @staticmethod
+    def _validate_bpm(bpm: float | None) -> float | None:
+        """Validate the optional manual BPM update before mutating XML."""
+        if bpm is None:
+            return None
+        if not math.isfinite(bpm) or not _MIN_BPM <= bpm <= _MAX_BPM:
+            raise ValueError("BPM must be a finite value between 50 and 200")
+        return float(bpm)
+
+    @staticmethod
+    def _validate_manual_cues(cues_list: list[dict]) -> list[tuple[int, float]]:
+        """Validate the complete manual-save payload before mutating XML."""
+        if not isinstance(cues_list, list):
+            raise ValueError("--update-cues must be a JSON array")
+
+        normalized: list[tuple[int, float]] = []
+        seen_hotcues: set[int] = set()
         for cue_data in cues_list:
-            hotcue_str = str(cue_data["hotcue"])
-
-            # Buscar el nodo exacto que coincide con el ID del pad
-            cue_el = next(
-                (el for el in entry_el.findall("CUE_V2")
-                    if el.get("TYPE") == "0" and el.get("HOTCUE") == hotcue_str),
-                None
-            )
-
-            seconds = float(cue_data["start_ms"])
-            formatted_time = f"{seconds:.6f}"
-
-            if cue_el is not None:
-                # El Cue existe: Solo actualizamos su tiempo, respetando su nombre/color original
-                cue_el.set("START", formatted_time)
-            else:
-                # El Cue no existe: Lo creamos desde cero con los valores por defecto
-                cue_el = ET.SubElement(entry_el, "CUE_V2")
-                cue_el.set("NAME", f"Cue {int(hotcue_str) + 1}")
-                cue_el.set("DISPL_ORDER", "0")
-                cue_el.set("TYPE", "0")
-                cue_el.set("START", formatted_time)
-                cue_el.set("LEN", "0.000000")
-                cue_el.set("REPEATS", "-1")
-                cue_el.set("HOTCUE", hotcue_str)
-
-        self._backup_if_needed()
-        self._write_atomic()
+            if not isinstance(cue_data, dict):
+                raise ValueError("each manual cue must be an object")
+            try:
+                hotcue = int(cue_data["hotcue"])
+                start_ms = float(cue_data["start_ms"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("each manual cue requires numeric hotcue and start_ms") from exc
+            if not 0 <= hotcue <= 7:
+                raise ValueError(f"HOTCUE index must be between 0 and 7, got {hotcue}")
+            if not math.isfinite(start_ms) or start_ms < 0:
+                raise ValueError("manual cue start_ms must be finite and non-negative")
+            if hotcue in seen_hotcues:
+                raise ValueError(f"duplicate HOTCUE index in manual update: {hotcue}")
+            seen_hotcues.add(hotcue)
+            normalized.append((hotcue, start_ms))
+        return normalized
 
     def write_cues_to_element(
         self, entry_el: ET.Element, cues: list[CuePoint], clear_existing: bool = False
@@ -264,10 +361,31 @@ class NmlWriter:
         cue_el.set("HOTCUE", str(cue.hotcue))
 
     def _backup_if_needed(self) -> None:
-        """Copy the original file to ``<name>.nml.bak`` (spec section 3.4)."""
-        backup_path = Path(str(self._parser.nml_path) + ".bak")
-        if not backup_path.exists():
-            shutil.copy2(self._parser.nml_path, backup_path)
+        """Crea un backup diario (máximo 5) en una subcarpeta dedicada."""
+        nml_path = Path(self._parser.nml_path)
+
+        # 1. Definir y crear la subcarpeta "CueGrid Backups" junto al collection.nml
+        backup_dir = nml_path.parent / "CueGrid Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Generar el nombre del backup de hoy
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        backup_file_name = f"{nml_path.name}.{today_str}.bak"
+        backup_path = backup_dir / backup_file_name
+
+        # 3. Si ya tenemos un backup de HOY, salimos inmediatamente.
+        if backup_path.exists():
+            return
+
+        # 4. Si no existe, copiamos el NML actual a la nueva carpeta
+        shutil.copy2(nml_path, backup_path)
+
+        # 5. Limpieza: mantener solo los 5 backups más recientes en esa carpeta
+        all_backups = sorted(backup_dir.glob(f"{nml_path.name}.*.bak"))
+
+        if len(all_backups) > 5:
+            for old_backup in all_backups[:-5]:
+                old_backup.unlink(missing_ok=True)
 
     def _write_atomic(self) -> None:
         start_time = time.time()

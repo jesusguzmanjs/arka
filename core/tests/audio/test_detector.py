@@ -29,8 +29,6 @@ from cuegrid.audio.loader import load_window
 from cuegrid.config import AppConfig
 
 from tests.fixtures import generate_synthetic_fixture as fixture_gen
-
-
 @pytest.fixture(scope="module")
 def synthetic_track_path() -> Path:
     """(Re)generate the deterministic synthetic fixture at its canonical

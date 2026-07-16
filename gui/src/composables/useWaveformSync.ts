@@ -24,27 +24,51 @@ export function useWaveformSync(options: WaveformSyncOptions) {
   const trackCssGradient = computed(() => {
     const colorMap = options.preview.value?.color_map;
     if (!colorMap?.length || !options.trackData.value.duration_ms) return "none";
-    const low = hexToRgb("#e11d48");
-    const mid = hexToRgb("#10b981");
-    const high = hexToRgb("#3b82f6");
+
+    // 1. Corregido el # en los Hex
+    const low = hexToRgb("#E01622"); // Rojo/Rosa Neón (Kicks)
+    const mid = hexToRgb("#84588A"); // Púrpura brillante (Sintes/Voces)
+    const high = hexToRgb("#279AF1"); // Cyan eléctrico (Hi-hats)
+
     const lastIndex = Math.max(1, colorMap.length - 1);
     const stops = colorMap.map((bucket, index) => {
-      const l = bucket.l || 0;
-      const m = bucket.m || 0;
-      const h = bucket.h || 0;
+      // 2. Asegúrate de que tu JSON manda l, m, h. Si no, esto será 0.
+// Extraemos los valores puros
+      const l_raw = bucket.l || 0;
+      const m_raw = bucket.m || 0;
+      const h_raw = bucket.h || 0;
+
+      // ---------------------------------------------------------
+      // TRUCO PRO 2: Visual EQ (Ecualización Visual)
+      // Ajustamos los pesos artificialmente para equilibrar la vista
+      // ---------------------------------------------------------
+      const l = l_raw * 1.1; // Los graves (kicks) los subimos un pelín
+      const m = m_raw * 0.6; // ATENUAMOS los medios casi a la mitad
+      const h = h_raw * 2.5; // MULTIPLICAMOS los agudos para que destaquen
+
       const total = l + m + h;
-      let color = "#18181b";
+
+      let color = "#18181b"; // Zinc-900 (Ruido de fondo)
+
       if (total > 0.005) {
-        const r = Math.min(255, Math.round((low.r * l / total + mid.r * m / total + high.r * h / total) * 1.2));
-        const g = Math.min(255, Math.round((low.g * l / total + mid.g * m / total + high.g * h / total) * 1.2));
-        const b = Math.min(255, Math.round((low.b * l / total + mid.b * m / total + high.b * h / total) * 1.2));
+        // Ahora aplicamos el cuadrado sobre los valores ya ecualizados
+        const weightL = Math.pow(l / total, 2);
+        const weightM = Math.pow(m / total, 2);
+        const weightH = Math.pow(h / total, 2);
+        const weightTotal = weightL + weightM + weightH;
+
+        // Normalizamos los nuevos pesos y aplicamos el boost de brillo (* 1.2)
+        const r = Math.min(255, Math.round(((low.r * weightL + mid.r * weightM + high.r * weightH) / weightTotal) * 1.2));
+        const g = Math.min(255, Math.round(((low.g * weightL + mid.g * weightM + high.g * weightH) / weightTotal) * 1.2));
+        const b = Math.min(255, Math.round(((low.b * weightL + mid.b * weightM + high.b * weightH) / weightTotal) * 1.2));
+
         color = `rgb(${r}, ${g}, ${b})`;
       }
       return `${color} ${((index / lastIndex) * 100).toFixed(2)}%`;
     });
     return `linear-gradient(to right, ${stops.join(", ")})`;
   });
-
+// ...
   function syncZoomGradientLoop(): void {
     const view = options.peaks.value?.views?.getView("zoomview");
     const gradientEl = options.getGradientElement();
@@ -71,9 +95,9 @@ export function useWaveformSync(options: WaveformSyncOptions) {
           let fadeBars = fade(150, 100);
           let fade16 = fade(300, 200);
           let fade32 = fade(600, 300);
-          if (visibleBeats > 150) fadeBeats = 0;
-          if (visibleBeats > 300) fadeBars = 0;
-          if (visibleBeats > 600) fade16 = 0;
+          if (visibleBeats > 300) fadeBeats = 0;
+          if (visibleBeats > 600) fadeBars = 0;
+          if (visibleBeats > 1000) fade16 = 0;
           if (visibleBeats > 1000) fade32 = 0;
           let needsRedraw = false;
           const gridLines = options.getGridLines();

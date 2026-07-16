@@ -1,17 +1,14 @@
-"""Tests for the v2.2 Multi-Source Validation energy probe added to
-``cuegrid.audio.loader``.
+"""Tests for dormant legacy Stem energy helpers.
 
-Covers ``measure_audio_energy``/``is_drum_stem_empty`` (spec section
-10.1): the lightning-fast, seek-based RMS estimate used to detect a
-practically silent/ambient drum stem so ``core.pipeline`` can fall back
-to the original Master audio instead of analyzing silence.
+These functions are retained in ``cuegrid.audio.legacy_stems`` but are not
+part of the active detector or production import graph.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import soundfile as sf
-from cuegrid.audio.loader import (
+from cuegrid.audio.legacy_stems import (
     DRUM_STEM_SILENCE_RMS_THRESHOLD,
     is_drum_stem_empty,
     measure_audio_energy,

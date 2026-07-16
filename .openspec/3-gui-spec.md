@@ -1,8 +1,9 @@
 # Spec: CueGrid GUI (Phase 2 — Tauri + Vue 3)
 
-Status: Current implementation synchronized 2026-07-13 (Vue/Tauri shell, Peaks.js player, library browser, and Python sidecar flow)
-(v1.7 adds the single-track context-menu interaction, conditional player teardown, and reactive analysis status messages; v1.5 adds the Include Stems binary switch, removes the Fast/Smart verify
-selector, adds dynamic Stem availability badges in the track list, and
+Status: Current implementation synchronized 2026-07-16 (Vue/Tauri shell, Peaks.js player, library browser, and Python sidecar flow).
+
+Historical revision notes below are retained only where they describe still-visible UI behavior; they do not indicate pending implementation. The core sidecar contract is defined by `2-core-spec.md`. Active analysis is master-track HPSS analysis and has no Stem/source-selection mode; NML `FLAGS` may still be displayed as UI metadata.
+(v1.7 adds the single-track context-menu interaction, conditional player teardown, and reactive analysis status messages; v1.5 adds dynamic Stem availability badges in the track list and
 retains the mandatory post-operation synchronization loop between Vue
 state, Wavesurfer regions, and disk-backed NML metadata, plus the
 `AudioPlayer.vue` state-sanitization contract; v1.4 adds the
@@ -44,12 +45,15 @@ the historical sections below. The current source of truth is:
   teal as the brand accent are legacy terminology, not current visual rules.
 - `AudioPlayer.vue` uses Peaks.js, a local `TrackData`/`cueState`
   model, custom grid/cue markers, eight computed pad slots, custom wheel
-  handling, and a local dirty/save boundary. `CueContextMenu.vue` owns the
+  handling, BPM adjustment state, and a local dirty/save boundary. `CueContextMenu.vue` owns the
   cue deletion menu shell and emits only `close` and `delete` events.
 - The sidecar name is `binaries/cuegrid-core`. `useCueGridSidecar.ts` builds
   playlist or single-track analysis arguments, includes the in-memory
   `nmlPathOverride` when applicable, parses NDJSON for analysis, and exposes
-  `updateTrackCues`, `deleteCue`, and `discoverAndSetDefaultNml`. Metadata and
+  `updateTrackCues` (including optional grid anchor and BPM), `deleteCue`, and
+  `discoverAndSetDefaultNml`. The player persists manual create/delete edits
+  through `updateTrackCues` on explicit Save Changes; `deleteCue` remains a
+  bridge capability and is not the player interaction path. Metadata and
   playlist queries are one-shot JSON sidecar calls.
 
 Any older section that prescribes a three-block resizable rack, a mounted
@@ -101,8 +105,8 @@ Out of scope (deferred to a future spec revision):
   handlers). This document is a technical specification only.
 - Exposing the "Grid-Guided Phrase Analysis tuning (advanced)" CLI flags
   (`--phrase-beats`, `--energy-threshold`, etc., `2-core-spec.md` §2.2) in
-  the UI. The Configuration Panel exposes Target, Include Stems,
-  Sensitivity, Max Cues, and Clear Existing; advanced tuning stays CLI-only
+  the UI. The Configuration Panel exposes Target, Sensitivity, Max Cues,
+  and Clear Existing; advanced tuning stays CLI-only
   until a future proposal revision asks for it.
 - CSV export (`--export-csv`), multi-window support, and auto-update.
 - Any change to the Python core itself. Section 6 identifies one core
@@ -145,7 +149,6 @@ graph TD
     C --> D[ActionBar.vue]
     A --> TB[TelemetryToggleButton.vue new]
     A --> E[TelemetryConsole.vue floating overlay]
-    C0 --> C2[IncludeStemsSwitch.vue]
     C0 --> C3[SensitivitySelect.vue]
     C0 --> C4[ClearExistingSwitch.vue]
     E --> E1[LogLine.vue]
@@ -177,9 +180,8 @@ src/
   main.ts                       # createApp bootstrap
   components/
     AppHeader.vue                # title/branding, NML path indicator
-    ConfigPanel.vue              # composes the five config controls
+    ConfigPanel.vue              # composes the four config controls
     TargetSelector.vue           # Track / Track Title / Playlist + text input(s)
-    IncludeStemsSwitch.vue       # boolean Include Stems / Analizar Stems toggle
     SensitivitySelect.vue        # soft | medium | hard
     ClearExistingSwitch.vue      # boolean toggle
     ActionBar.vue                 # "Analyze & Inject" button + reactive analysis status
@@ -210,10 +212,9 @@ of any component.
 | Component | Responsibility | Reads | Emits / Calls |
 |---|---|---|---|
 | `App.vue` | Layout grid (header / config / action / console) | — | — |
-| `AudioPlayer.vue` | Waveform player + transport (Play/Stop) + 8 virtual HotCue pads + global keyboard shortcuts. **The pad row, momentary cue behavior, keyboard shortcut mapping, beat-jump mechanics, and mandatory post-operation cleanup are specified in full in `3-player-spec.md` §3.9–§3.12 and §3.4/§4.2–§4.4** — that document owns the binding and lifecycle contract for this component's transport layer; this table lists it only for architectural placement. | `useConfigState()` (trackPath/targetType), `useRunState()` (post-operation sync), `usePlayerState()` (§3.7 concurrency lock, shared with `LibraryBrowser.vue`) | calls `wavesurfer` play/pause/setTime and `resetPlayerState()`; emits nothing (state is private to `usePlayerState`) |
-| `ConfigPanel.vue` | Groups the 5 config controls, shows validation state | `useConfigState()` | mutates config state directly (v-model into composable refs) |
+| `AudioPlayer.vue` | Waveform player + transport (Play/Stop) + 8 virtual HotCue pads + global keyboard shortcuts. **The pad row, snapped empty-pad creation, momentary cue behavior, local deletion, keyboard shortcut mapping, beat-jump mechanics, and explicit-save synchronization are specified in full in `3-player-spec.md` §3.9–§3.13 and §3.4/§4.2–§4.4** — that document owns the binding and lifecycle contract for this component's transport layer; this table lists it only for architectural placement. | `useConfigState()` (trackPath/targetType), `useRunState()` (post-operation sync), `usePlayerState()` (§3.7 concurrency lock, shared with `LibraryBrowser.vue`) | calls `wavesurfer` play/pause/setTime and `resetPlayerState()`; emits nothing (state is private to `usePlayerState`) |
+| `ConfigPanel.vue` | Groups the 4 config controls, shows validation state | `useConfigState()` | mutates config state directly (v-model into composable refs) |
 | `TargetSelector.vue` | Radio group for target type + the matching text input(s) (path / title / playlist), each with an `artist` disambiguator field mirroring `cli.py`'s mutually-exclusive group | `useConfigState()` | updates `targetType`, `trackPath`, `trackTitle`, `playlistName`, `artist` |
-| `IncludeStemsSwitch.vue` | Binary switch labeled **Include Stems** (or **Analizar Stems**) | `includeStems` | updates `includeStems`; ON leaves standard sidecar parameters unchanged, OFF requests `--no-stems` |
 | `SensitivitySelect.vue` | 3-way segmented control; selects the complete core sensitivity preset | `sensitivity` | updates `sensitivity` |
 | `MaxCuesSelect.vue` | Compact integer selector with values 1–8 | `maxCues` | updates `maxCues` |
 | `ClearExistingSwitch.vue` | Boolean switch with a short warning tooltip ("removes existing HotCues before writing") | `clearExisting` | updates `clearExisting` |
@@ -225,7 +226,7 @@ of any component.
 
 ### 3.4 Props/emits convention
 
-Every leaf control component (`IncludeStemsSwitch.vue`, etc.) follows the
+Every leaf control component follows the
 same minimal contract to keep them presentational and reusable:
 
 ```ts
@@ -251,6 +252,11 @@ context menu for that row. The menu contains exactly one action:
 must provide one absolute filesystem `path`, no multi-selection state may be
 accepted or converted into a batch request, and the action must invoke the
 single-track sidecar contract in `2-core-spec.md` §8.6.
+
+For rows whose playlist-query payload has `is_flex_grid: true`, this action is
+unavailable. The row follows the disabled lock/warning and tooltip contract in
+`4-library-spec.md` section 3.3.1; it must not open an enabled analysis menu
+or produce a single-track request.
 
 The menu closes after invocation, on click-away, or on `Escape`. It must not
 change the active player track merely because the menu was opened. The
@@ -295,7 +301,6 @@ floating overlay that is no longer part of the resizable stack at all:
 │  │  (1/3)     │ (2/3, scrolls independently)             │ │    (Block 1 filler)
 │  └──────────────────────────────────────────────────────┘ │
 ├──────────────────────────────────────────────────────────┤  ← Splitter (only one left)
-│  Include Stems  [ ● on ]                                  │
 │  Sensitivity    ( Soft ) ( Medium ) ( Hard )               │  ← ConfigPanel + ActionBar
 │  Max Cues       [ 1 ][ 2 ][ 3 ] ... [ 8 ]                 │
 │  Clear Existing  [ ⏻ off ]                                │    (Block 2, min-height enforced)
@@ -435,7 +440,6 @@ export interface CueGridConfig {
   playlistName: string | null   // used when targetType === "playlist"
   artist: string | null         // optional disambiguator, any target type
   title: string | null          // optional disambiguator, "track" mode only
-  includeStems: boolean
   sensitivity: Sensitivity
   maxCues: number              // integer, 1–8; maximum cues per track
   clearExisting: boolean
@@ -449,7 +453,6 @@ export const defaultConfig: CueGridConfig = {
   playlistName: null,
   artist: null,
   title: null,
-  includeStems: true,
   sensitivity: "medium",
   maxCues: 8,
   clearExisting: false,
@@ -459,10 +462,10 @@ export const defaultConfig: CueGridConfig = {
 
 This maps 1:1 onto `cli.py`'s mutually-exclusive selection group and its
 `--mode`/`--max-cues`/`--clear-existing`/`--artist`/`--title`/`--nml` flags,
-plus the v1.5 `--no-stems` override (`build_parser`), so the
-argument-building step in §6.4 is a direct translation with no hidden
-Stems default living in two places. `includeStems` defaults to `true`.
-When it is `false`, the sidecar argument builder appends `--no-stems`.
+so the argument-building step in §6.4 is a direct translation. Analysis
+source selection is not a GUI configuration concern: every run analyzes the
+selected Master-track audio unconditionally, as specified in
+`2-core-spec.md` §9.
 
 `SensitivitySelect` must present the following core-owned preset matrix;
 selecting a sensitivity always selects all three threshold values together:
@@ -553,7 +556,7 @@ store is authoritative for all three. `AudioPlayer.vue` owns a mandatory
 track reloads and NML-mutating operation completions must use it.
 
 Any asynchronous backend operation that modifies the `.nml` — including a
-completed analysis run or a successful manual deletion sidecar call —
+completed analysis run or a successful explicit manual-cue save —
 MUST trigger this strict, sequential three-step chain:
 
 1. **TEARDOWN:** call `resetPlayerState()`. It must use the Wavesurfer
@@ -567,6 +570,12 @@ MUST trigger this strict, sequential three-step chain:
 3. **REBUILD:** populate the reactive player state from the fresh disk
    result, derive the pad bindings from that result, and perform a clean
    Wavesurfer marker repaint from scratch.
+
+When `hasUnsavedChanges` results from a grid-anchor edit (with or without
+linked cue movement), the explicit save call must pass the player's current
+finite, non-negative `grid_anchor_ms` as `gridAnchorMs` to
+`updateTrackCues`. A cue-only save passes no grid anchor. A successful manual
+cue or grid save must use the same synchronization chain above.
 
 The sidecar's successful exit code only permits this chain to begin; it
 is not permission to skip the force-read step. The chain must be awaited
@@ -625,6 +634,12 @@ obligations and prevents later component work from weakening that contract:
   shared player state exposes `hasUnsavedChanges`; when it is true, the UI
   renders a prominent **Save Changes** action. Save is explicit and clears
   the flag only after backend confirmation.
+- Grid correction is an explicit local **Grid Edit Mode** governed by
+  `3-player-spec.md` §0.5.1/§3.14: its draggable Grid Anchor, 30%-opacity
+  HotCues, **Grid Only** versus **Grid + Cues** shift modes, non-negative
+  clamp, playhead action, titles/tooltips, and `hasUnsavedChanges` behavior
+  are binding there. This shell contract must not replace those explicit
+  controls with an implicit drag or modifier-key behavior.
 - The frontend is a renderer, not an audio-analysis engine. It consumes the
   Python/librosa frequency map defined in `2-core-spec.md` §2.3.1 and must
   not run real-time FFT or heavy frequency analysis in JavaScript.
@@ -743,31 +758,43 @@ removed when `App.vue` is replaced.)
 ### 6.4 Argument construction (`CueGridConfig` → argv)
 
 `useCueGridSidecar.run()` reads the reactive configuration returned by
-`useConfigState()` (including `maxCues` and `includeStems`) and builds the
+`useConfigState()` (including `maxCues`) and builds the
 argv array directly from `CueGridConfig`, mirroring `cli.py`'s parser 1:1.
 `maxCues` must be an integer from 1 through 8 and is always appended as the
-`--max-cues` option and its value. The Include Stems switch is binary:
-
-- **ON:** pass the standard target, sensitivity, cue-limit, output, and
-  other configured parameters; do not append `--no-stems`.
-- **OFF:** append exactly one `--no-stems` flag to force regular analysis of
-  the original Master audio, even if the selected entry advertises Stems
-  and a `.stem.mp4` is present.
-
-The old Fast/Smart verify-mode selector is not part of the configuration
-state or argument payload.
+`--max-cues` option and its value. The argument builder has no
+source-selection or Stems flag. Every analysis invocation uses
+the unified Master-track pipeline defined in `2-core-spec.md` §9.
 
 The current implementation uses `selectedPlaylist` for the main batch run
 and `selectedTrackPath` for the single-track row action. It invokes the
 packaged binary as `binaries/cuegrid-core` and adds `--nml` whenever the
 discovered/overridden `nmlPathOverride` is available. Manual player saves use
 the separate argv shape
-`[trackPath, "--update-cues", JSON.stringify(cues), "--nml", nmlPath]` and
-manual deletion uses
-`[trackPath, "--delete-cue", String(hotcueIndex), "--nml", nmlPath]`; both
-resolve completion from the process exit code.
+`[trackPath, "--update-cues", JSON.stringify(cues), "--grid-anchor", String(gridAnchorMs), "--bpm", String(newBpm), "--nml", nmlPath]`
+when Grid Edit and BPM edits changed the local state, with each optional flag
+omitted when its corresponding value is unchanged. A BPM-only save still
+passes the complete current cue payload. Creation, deletion, grid, and BPM
+edits mutate local state only; the subsequent explicit save is the sole
+player-side NML write and resolves completion from the process exit code.
 
 ```ts
+async function updateTrackCues(
+  trackPath: string,
+  cues: CuePointPayload[],
+  newGridAnchorMs?: number,
+  newBpm?: number,
+): Promise<{ ok: boolean; error?: string }> {
+  const args = [trackPath, "--update-cues", JSON.stringify(cues)]
+  if (newGridAnchorMs !== undefined) {
+    args.push("--grid-anchor", String(newGridAnchorMs))
+  }
+  if (newBpm !== undefined) args.push("--bpm", String(newBpm))
+  if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value)
+  return invoke("call_cuegrid_core", { args })
+    .then(() => ({ ok: true }))
+    .catch((error) => ({ ok: false, error: String(error) }))
+}
+
 function buildArgs(cfg: CueGridConfig): string[] {
   const args: string[] = []
   if (cfg.targetType === "track") args.push(cfg.trackPath!)
@@ -776,8 +803,6 @@ function buildArgs(cfg: CueGridConfig): string[] {
   if (cfg.artist) args.push("--artist", cfg.artist)
   if (cfg.targetType === "track" && cfg.title) args.push("--title", cfg.title)
   if (cfg.nmlPathOverride) args.push("--nml", cfg.nmlPathOverride)
-  // Stems are included by default; disabling them is an explicit core override.
-  if (!cfg.includeStems) args.push("--no-stems")
   // --mode selects the bound energy/timbre/relative-confidence preset;
   // the GUI must not emit separate overrides for those thresholds.
   args.push("--mode", cfg.sensitivity)

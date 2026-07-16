@@ -1,4 +1,4 @@
-export type CueTypeName = "CUE" | "FADE_IN" | "FADE_OUT" | "LOAD" | "LOOP";
+export type CueTypeName = "CUE" | "FADE_IN" | "FADE_OUT" | "LOAD" | "LOOP" | "GRID";
 
 export interface ExistingCue {
   hotcue: number;

@@ -1,14 +1,41 @@
-// types/library.ts
-// See .openspec/4-library-spec.md §1.3/§1.4 — mirrors the core's
-// `--get-playlist-tracks` one-shot JSON schema exactly, including the
-// source NML flags used to render native Stem availability badges.
+import type { ExistingCue } from "./trackMetadata";
 
-export interface LibraryTrack {
+/** Metadata owned by the relational collection map. */
+export interface TrackMetadata {
   artist: string;
   title: string;
   location_path: string;
-  flags: number | null;
+  bpm: number | null;
+  grid_anchor_ms: number | null;
+  duration_ms: number | null;
+  is_flex_grid: boolean;
+  existing_cues: ExistingCue[];
+  collection_index: number;
+  /** Optional legacy NML flags field used only for the Stems badge. */
+  flags?: number | null;
 }
+
+export interface PlaylistFolder {
+  kind: "folder";
+  name: string;
+  children: PlaylistNode[];
+}
+
+export interface PlaylistLeaf {
+  kind: "playlist";
+  name: string;
+  track_paths: string[];
+}
+
+export type PlaylistNode = PlaylistFolder | PlaylistLeaf;
+
+export interface LibraryPayload {
+  collection: Record<string, TrackMetadata>;
+  playlists: PlaylistNode[];
+}
+
+// Kept as a source-compatible name for existing table/player consumers.
+export type LibraryTrack = TrackMetadata;
 
 export interface PlaylistTracksError {
   error: "not_found" | "ambiguous";
@@ -17,13 +44,6 @@ export interface PlaylistTracksError {
 
 export type PlaylistTracksResult = LibraryTrack[] | PlaylistTracksError;
 
-/**
- * §1.4's discriminator: success is always a bare array, error is always
- * a flat object — Array.isArray() alone is sufficient and preferred
- * over an "error" in obj check (which would also be correct, but the
- * array/object distinction is the more direct fit for this flag's
- * schema, unlike --get-track-metadata's object/object schema).
- */
 export function isPlaylistTracksError(
   r: PlaylistTracksResult,
 ): r is PlaylistTracksError {
