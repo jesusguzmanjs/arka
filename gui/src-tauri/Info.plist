@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>CueGrid necesita acceder a Documentos para leer el collection.nml de Traktor.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>CueGrid necesita acceder a tus discos externos para leer y analizar los archivos de audio.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>CueGrid necesita acceder al Escritorio por si tu música está alojada ahí.</string>
+</dict>
+</plist>

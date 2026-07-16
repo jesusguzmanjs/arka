@@ -1,8 +1,8 @@
 use std::fs;
-use std::io::{BufRead, BufReader}; // <--- AÑADE ESTOS IMPORTS
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock}; // <--- AÑADE ESTOS IMPORTS
+use std::sync::{Mutex, OnceLock};
 use tauri::{Emitter, Manager};
 
 fn telemetry_cache_path() -> PathBuf {
@@ -18,11 +18,26 @@ fn get_active_process() -> &'static Mutex<Option<std::process::Child>> {
     ACTIVE_PROCESS.get_or_init(|| Mutex::new(None))
 }
 
+// --- NUEVA FUNCIÓN AUXILIAR MULTIPLATAFORMA ---
+fn get_core_executable_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let exe_name = "cuegrid-core.exe";
+
+    #[cfg(not(target_os = "windows"))]
+    let exe_name = "cuegrid-core";
+
+    app.path()
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource directory: {}", e))
+        .map(|dir| dir.join("resources").join("cuegrid-core").join(exe_name))
+}
+// ----------------------------------------------
+
 #[tauri::command]
 async fn cancel_analysis() -> Result<(), String> {
     if let Ok(mut guard) = get_active_process().lock() {
         if let Some(mut child) = guard.take() {
-            let _ = child.kill(); // Mata el procesoco de Python al instante
+            let _ = child.kill(); // Mata el proceso de Python al instante
         }
     }
     Ok(())
@@ -30,13 +45,8 @@ async fn cancel_analysis() -> Result<(), String> {
 
 #[tauri::command]
 async fn start_analysis_stream(app: tauri::AppHandle, args: Vec<String>) -> Result<(), String> {
-    let core_exe = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource directory: {}", e))?
-        .join("resources")
-        .join("cuegrid-core")
-        .join("cuegrid-core.exe");
+    // Usamos la función auxiliar
+    let core_exe = get_core_executable_path(&app)?;
 
     let mut child = Command::new(core_exe)
         .args(args)
@@ -122,14 +132,8 @@ async fn load_track_for_player(
         return Err("Track path must not be empty".to_string());
     }
 
-    // CORRECCIÓN PARA TAURI v2: Usamos resource_dir() y entramos directo a la carpeta del core
-    let core_exe = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource directory: {}", e))?
-        .join("resources")
-        .join("cuegrid-core")
-        .join("cuegrid-core.exe");
+    // Usamos la función auxiliar
+    let core_exe = get_core_executable_path(&app)?;
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new(core_exe)
@@ -159,14 +163,8 @@ async fn load_track_for_player(
 
 #[tauri::command]
 async fn call_cuegrid_core(app: tauri::AppHandle, args: Vec<String>) -> Result<String, String> {
-    // Localizamos de forma nativa la carpeta de recursos (0ms latencia)
-    let core_exe = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource directory: {}", e))?
-        .join("resources")
-        .join("cuegrid-core")
-        .join("cuegrid-core.exe");
+    // Usamos la función auxiliar
+    let core_exe = get_core_executable_path(&app)?;
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new(core_exe)
