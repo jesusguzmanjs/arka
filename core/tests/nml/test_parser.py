@@ -45,7 +45,15 @@ class TestNmlLocationToPath:
             dir_="/:Users/:dj/:Music/:",
             file_="track.mp3",
         )
-        assert result == "/volumes/macintosh hd/users/dj/music/track.mp3"
+        assert result == "/users/dj/music/track.mp3"
+
+    def test_macos_non_boot_volume_name(self):
+        result = nml_location_to_path(
+            volume="External Drive",
+            dir_="/:Music/:",
+            file_="track.mp3",
+        )
+        assert result == "/volumes/external drive/music/track.mp3"
 
 
 class TestFindEntry:
@@ -428,6 +436,75 @@ class TestFlexGridDetection:
 
 
 class TestGlobalLibraryExport:
+    def test_includes_complete_editable_metadata_dictionary(self, tmp_path):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Title" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="metadata.flac" />
+<ALBUM TITLE="Release" /><INFO REMIXER="Remixer" PRODUCER="Producer" GENRE="Techno" LABEL="Label" COMMENT="Comment" RATING="Comment 2" KEY_LYRICS="Lyrics" MIX="Extended" RANKING="204" PLAYTIME="60" /><TEMPO BPM="120" />
+</ENTRY></COLLECTION><PLAYLISTS /></NML>""",
+            encoding="utf-8",
+        )
+
+        row = NmlParser(nml_file).get_library()["collection"]["c:/music/metadata.flac"]
+
+        assert {key: row[key] for key in (
+            "title", "artist", "album", "remixer", "producer", "genre",
+            "label", "comment", "comment2", "lyrics", "mix", "rating",
+        )} == {
+            "title": "Title", "artist": "Artist", "album": "Release",
+            "remixer": "Remixer", "producer": "Producer", "genre": "Techno",
+            "label": "Label", "comment": "Comment", "comment2": "Comment 2",
+            "lyrics": "Lyrics", "mix": "Extended", "rating": 4,
+        }
+
+    def test_materializes_empty_editable_metadata_defaults(self, tmp_path):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Title" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="empty.flac" />
+<TEMPO BPM="120" /></ENTRY></COLLECTION><PLAYLISTS /></NML>""",
+            encoding="utf-8",
+        )
+
+        row = NmlParser(nml_file).get_library()["collection"]["c:/music/empty.flac"]
+
+        assert row["album"] == ""
+        assert all(row[name] == "" for name in (
+            "remixer", "producer", "genre", "label", "comment", "comment2", "lyrics", "mix",
+        ))
+        assert row["rating"] == 0
+    def test_extracts_and_serializes_musical_key(self, tmp_path):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Keyed" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="keyed.flac" />
+<INFO KEY="8A" PLAYTIME="60" /><TEMPO BPM="120" />
+</ENTRY></COLLECTION><PLAYLISTS /></NML>""",
+            encoding="utf-8",
+        )
+
+        parser = NmlParser(nml_file)
+        entry = parser.find_entry("c:/music/keyed.flac")
+        payload = parser.get_library()
+
+        assert entry.key == "8A"
+        assert payload["collection"]["c:/music/keyed.flac"]["key"] == "8A"
+
+    def test_serializes_null_for_absent_musical_key(self, tmp_path):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Unkeyed" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="unkeyed.flac" />
+<INFO PLAYTIME="60" /><TEMPO BPM="120" />
+</ENTRY></COLLECTION><PLAYLISTS /></NML>""",
+            encoding="utf-8",
+        )
+
+        payload = NmlParser(nml_file).get_library()
+
+        assert payload["collection"]["c:/music/unkeyed.flac"]["key"] is None
+
     def test_includes_orphans_and_playlist_paths_without_embedded_tracks(self):
         parser = NmlParser(SAMPLE_COLLECTION)
 
@@ -446,8 +523,10 @@ class TestGlobalLibraryExport:
         assert collection[prueba["track_paths"][0]]["location_path"] == prueba[
             "track_paths"
         ][0]
-        assert set(prueba) == {"kind", "name", "track_paths"}
+        assert set(prueba) == {"kind", "uuid", "name", "track_paths"}
+        assert isinstance(prueba["uuid"], str) and prueba["uuid"]
         assert all("artist" not in node and "title" not in node for node in root["children"])
+        assert {child["name"] for child in root["children"]} == {"prueba"}
 
     def test_preserves_nested_folders_and_skips_stale_playlist_paths(
         self, tmp_path, caplog

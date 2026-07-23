@@ -15,6 +15,7 @@ import json
 import logging
 import platform
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, cast, TYPE_CHECKING
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 from cuegrid.config import DETECTION_MODES, AppConfig
 from cuegrid.audio.loader import generate_preview_payload
+from cuegrid.core.smart_playlist import matches_rules
 
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
@@ -40,6 +42,8 @@ logger = logging.getLogger(__name__)
 # commands. Normal execution resolves them lazily below.
 run_pipeline: Any = None
 run_batch_pipeline: Any = None
+run_metadata_update_pipeline: Any = None
+run_batch_save_pipeline: Any = None
 serialize_gui_payload: Any = None
 
 # Matches Native Instruments' own documented default install layout on
@@ -113,18 +117,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # Mutually exclusive track selection group (spec section 8.4).
+    # Mutually exclusive track selection group (spec section 7.1).
     # Not required=True here: --list-playlists (section 12) is a
     # standalone metadata query that needs none of these. main() enforces
     # that exactly one selector is present whenever --list-playlists is
     # NOT given (see the manual check right after parsing).
     selection = parser.add_mutually_exclusive_group(required=False)
     selection.add_argument(
-        "track_path",
-        nargs="?",
+        "track_paths",
+        nargs="*",
         type=Path,
-        default=None,
-        help="Path to the audio file to analyze (v1.0 single-track mode)",
+        default=[],
+        help="Path(s) to audio files to analyze",
     )
     selection.add_argument(
         "--track-title",
@@ -299,6 +303,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="JSON string arrays of options [{'hotcue': x, 'start_ms': y}] to overwrite on TRACK_PATH",
     )
     parser.add_argument(
+        "--batch-save",
+        type=str,
+        default=None,
+        dest="batch_save",
+        metavar="JSON",
+        help="Atomically persist final track and playlist state in one NML transaction.",
+    )
+    parser.add_argument(
         "--grid-anchor",
         type=float,
         default=None,
@@ -326,6 +338,46 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Parse the complete collection and playlist tree into one compact "
             "relational JSON payload, then exit without audio analysis."
+        ),
+    )
+    parser.add_argument(
+        "--update-metadata",
+        type=str,
+        default=None,
+        metavar="JSON",
+        dest="update_metadata",
+        help=(
+            "Apply one metadata JSON patch to each listed track path and "
+            "atomically persist collection.nml."
+        ),
+    )
+    parser.add_argument(
+        "--compile-smart-playlist",
+        type=str,
+        default=None,
+        dest="compile_smart_playlist",
+        metavar="JSON",
+        help=(
+            "Evaluate a Smart Playlist JSON rule payload against the collection "
+            "and compile its matches into a static Traktor playlist."
+        ),
+    )
+    parser.add_argument(
+        "--create-static-playlist",
+        type=str,
+        default=None,
+        dest="create_static_playlist",
+        metavar="JSON",
+        help="Create and immediately persist a regular static playlist from ordered collection paths.",
+    )
+    parser.add_argument(
+        "--write-to-files",
+        action="store_true",
+        default=False,
+        dest="write_to_files",
+        help=(
+            "With --update-metadata, also best-effort write the patch to "
+            "the corresponding physical audio files."
         ),
     )
 
@@ -632,13 +684,243 @@ def _json_batch_track_callback(track_result: BatchTrackResult) -> None:
     )
 
 
+def _json_metadata_track_complete(result: Any) -> None:
+    _emit_json(
+        {
+            "type": "metadata_track_complete",
+            "path": result.path,
+            "nml_updated": result.nml_updated,
+            "physical_file_updated": result.physical_file_updated,
+            "error": result.error,
+        }
+    )
+
+
+def _json_metadata_track_start(result: Any, index: int, total: int) -> None:
+    _emit_json({"type": "metadata_track_start", "path": result.path, "index": index, "total": total})
+
+
+def _json_metadata_nml_status(result: Any) -> None:
+    _emit_json({"type": "metadata_nml_status", "path": result.path, "success": result.nml_updated})
+
+
+def _json_metadata_mutagen_status(result: Any) -> None:
+    _emit_json(
+        {
+            "type": "metadata_mutagen_status",
+            "path": result.path,
+            "success": result.physical_file_updated,
+            "error": result.error["message"] if result.error is not None else None,
+        }
+    )
+
+
+def _json_metadata_summary(result: Any) -> None:
+    _emit_json(
+        {
+            "type": "metadata_summary",
+            "requested": len(result.results),
+            "nml_updated": result.nml_updated_count,
+            "physical_file_updated": result.physical_file_updated_count,
+            "errors": result.error_count,
+        }
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    if args.grid_anchor is not None and args.update_cues is None:
-        build_parser().error("--grid-anchor may only be used with --update-cues")
-    if args.bpm is not None and args.update_cues is None:
-        build_parser().error("--bpm may only be used with --update-cues")
+    if args.update_cues is not None or args.delete_cue is not None or args.update_metadata is not None:
+        build_parser().error("--update-cues, --delete-cue, and --update-metadata are retired; use --batch-save")
+    if args.grid_anchor is not None or args.bpm is not None:
+        build_parser().error("--grid-anchor and --bpm are valid only inside --batch-save JSON")
+    if args.write_to_files and args.batch_save is None:
+        build_parser().error("--write-to-files may only be used with --batch-save")
+
+    if args.batch_save is not None:
+        incompatible = (
+            bool(args.track_paths)
+            or args.track_title is not None
+            or args.playlist is not None
+            or args.title is not None
+            or args.artist is not None
+            or args.list_playlists
+            or args.get_track_metadata is not None
+            or args.get_playlist_tracks is not None
+            or args.get_library
+            or args.discover_nml
+            or args.compile_smart_playlist is not None
+            or args.create_static_playlist is not None
+            or args.clear_existing
+            or args.export_gui
+            or args.export_csv_path is not None
+        )
+        if incompatible:
+            print("error: --batch-save cannot be combined with selectors or other operations", file=sys.stderr)
+            return 1
+        try:
+            payload = json.loads(args.batch_save)
+            nml_path = _resolve_nml_path(args.nml)
+            if nml_path is None:
+                raise ValueError("no collection.nml found; pass --nml PATH explicitly")
+            global run_batch_save_pipeline
+            if run_batch_save_pipeline is None:
+                from cuegrid.core.pipeline import run_batch_save_pipeline as batch_save_run
+                run_batch_save_pipeline = batch_save_run
+            if args.json:
+                _json_nml_resolved(nml_path)
+            result = run_batch_save_pipeline(
+                nml_path=nml_path,
+                payload=payload,
+                write_to_files=args.write_to_files,
+            )
+        except (ValueError, json.JSONDecodeError, TrackNotFoundError, AmbiguousTrackError, OSError) as exc:
+            print(f"error: failed to batch save: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            playlist_count = len(payload.get("playlists", [])) if isinstance(payload, dict) else 0
+            _emit_json({"type": "batch_save_validated", "requested": len(result.results), "playlists": playlist_count})
+            _emit_json({"type": "batch_save_nml_committed", "requested": len(result.results), "playlists": playlist_count})
+            for track in result.results:
+                _emit_json({"type": "batch_save_track_complete", "path": track.path, "nml_updated": True})
+                if args.write_to_files and (track.physical_file_updated or track.error is not None):
+                    _emit_json({"type": "batch_save_physical_status", "path": track.path, "success": track.physical_file_updated, "error": track.error["message"] if track.error else None})
+            _emit_json({"type": "batch_save_summary", "requested": len(result.results), "nml_updated": result.nml_updated_count, "physical_file_updated": result.physical_file_updated_count, "errors": result.error_count})
+        return 1 if result.error_count else 0
+
+    # --create-static-playlist is a standalone NML operation. Resolve every
+    # path before invoking the writer so failed validation cannot mutate NML.
+    if args.create_static_playlist is not None:
+        incompatible = (
+            bool(args.track_paths) or args.track_title is not None or args.playlist is not None
+            or args.title is not None or args.artist is not None or args.list_playlists
+            or args.get_track_metadata is not None or args.get_playlist_tracks is not None
+            or args.get_library or args.discover_nml or args.delete_cue is not None
+            or args.update_cues is not None or args.update_metadata is not None
+            or args.write_to_files or args.clear_existing or args.export_gui
+            or args.export_csv_path is not None or args.compile_smart_playlist is not None
+            or args.batch_save is not None
+        )
+        if incompatible:
+            print(json.dumps({"ok": False, "error": "--create-static-playlist cannot be combined with other operations or analysis selectors"}, separators=(",", ":")))
+            return 1
+        try:
+            payload = json.loads(args.create_static_playlist)
+            if not isinstance(payload, dict):
+                raise ValueError("Static Playlist payload must be a JSON object")
+            name = payload.get("name")
+            paths = payload.get("entries")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Static Playlist name must be a non-empty string")
+            if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path.strip() for path in paths):
+                raise ValueError("Static Playlist entries must be a non-empty JSON array of paths")
+            nml_path = _resolve_nml_path(args.nml)
+            if nml_path is None:
+                raise ValueError("no collection.nml found under the standard Traktor install directories. Pass --nml PATH explicitly.")
+            nml_parser = NmlParser(nml_path)
+            entries = [nml_parser.find_entry_element(path) for path in paths]
+            playlist_uuid = NmlWriter(nml_parser).write_static_playlist(name.strip(), entries)
+        except (ET.ParseError, json.JSONDecodeError, OSError, ValueError, TrackNotFoundError, AmbiguousTrackError) as exc:
+            result = {"type": "fatal_error", "message": str(exc)}
+            print(json.dumps(result if args.json else {"ok": False, "error": str(exc)}, separators=(",", ":")))
+            return 1
+        result = {"type": "static_playlist_created", "name": name.strip(), "entries": len(entries), "uuid": playlist_uuid}
+        print(json.dumps(result, separators=(",", ":")))
+        return 0
+
+    # --compile-smart-playlist is a standalone NML operation. It must bypass
+    # the normal analysis selector validation and never initialize audio code.
+    if args.compile_smart_playlist is not None:
+        incompatible = (
+            bool(args.track_paths)
+            or args.track_title is not None
+            or args.playlist is not None
+            or args.title is not None
+            or args.artist is not None
+            or args.list_playlists
+            or args.get_track_metadata is not None
+            or args.get_playlist_tracks is not None
+            or args.get_library
+            or args.discover_nml
+            or args.delete_cue is not None
+            or args.update_cues is not None
+            or args.update_metadata is not None
+            or args.write_to_files
+            or args.clear_existing
+            or args.export_gui
+            or args.export_csv_path is not None
+            or args.create_static_playlist is not None
+        )
+        if incompatible:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "--compile-smart-playlist cannot be combined with other operations or analysis selectors",
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            return 1
+
+        try:
+            payload = json.loads(args.compile_smart_playlist)
+            if not isinstance(payload, dict):
+                raise ValueError("Smart Playlist payload must be a JSON object")
+
+            name = payload.get("name")
+            rules = payload.get("rules")
+            match = payload.get("match", "all")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Smart Playlist name must be a non-empty string")
+            if not isinstance(rules, list):
+                raise ValueError("Smart Playlist rules must be a JSON array")
+            if not all(isinstance(rule, dict) for rule in rules):
+                raise ValueError("Each Smart Playlist rule must be a JSON object")
+            if match not in {"all", "any"}:
+                raise ValueError("Smart Playlist match must be 'all' or 'any'")
+
+            nml_path = _resolve_nml_path(args.nml)
+            if nml_path is None:
+                raise ValueError(
+                    "no collection.nml found under the standard Traktor install directories. "
+                    "Pass --nml PATH explicitly."
+                )
+
+            nml_parser = NmlParser(nml_path)
+            entries = list(nml_parser.tree.getroot().iterfind("./COLLECTION/ENTRY"))
+            matched_entries = [
+                entry for entry in entries if matches_rules(entry, rules, match)
+            ]
+            if not matched_entries:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "No tracks match these rules. Adjust your filters and try again.",
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                return 1
+            playlist_uuid = NmlWriter(nml_parser).write_smart_playlist(
+                name.strip(), matched_entries
+            )
+        except (ET.ParseError, json.JSONDecodeError, OSError, ValueError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+            return 1
+
+        result = {
+            "type": "smart_playlist_compiled",
+            "name": name.strip(),
+            "matched": len(matched_entries),
+            "uuid": playlist_uuid,
+        }
+        # The envelope is the CLI contract. The duplicate top-level fields
+        # retain compatibility with the GUI's existing NDJSON response parser.
+        print(json.dumps({"ok": True, "result": result, **result}, separators=(",", ":")))
+        return 0
 
     # Configure this mode before any path discovery so a pre-existing logging
     # configuration cannot leak INFO/DEBUG text onto the GUI stdout stream.
@@ -650,10 +932,104 @@ def main(argv: list[str] | None = None) -> int:
             force=True,
         )
 
+    if args.update_metadata is not None:
+        incompatible = (
+            bool(args.track_paths)
+            or args.track_title is not None
+            or args.playlist is not None
+            or args.title is not None
+            or args.artist is not None
+            or args.delete_cue is not None
+            or args.update_cues is not None
+            or args.grid_anchor is not None
+            or args.bpm is not None
+            or args.clear_existing
+            or args.export_gui
+            or args.export_csv_path is not None
+            or any(
+                getattr(args, name) is not None
+                for name in (
+                    "mode",
+                    "phrase_beats",
+                    "major_phrase_multiple",
+                    "sample_rate",
+                    "hop_length",
+                    "window_beats",
+                    "mfcc_count",
+                    "energy_threshold",
+                    "timbre_threshold",
+                    "max_cues",
+                    "relative_confidence_threshold",
+                )
+            )
+        )
+        if incompatible:
+            print(
+                "error: --update-metadata cannot be combined with selectors, "
+                "other mutations, analysis flags, --export-csv, or --export-gui",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            metadata_payload = json.loads(args.update_metadata)
+        except json.JSONDecodeError as exc:
+            print(f"error: invalid --update-metadata JSON: {exc.msg}", file=sys.stderr)
+            return 1
+
+        nml_path = _resolve_nml_path(args.nml)
+        if nml_path is None:
+            print(
+                "error: no collection.nml found under the standard Traktor "
+                "install directories. Pass --nml PATH explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        global run_metadata_update_pipeline
+        if run_metadata_update_pipeline is None:
+            from cuegrid.core.pipeline import (
+                run_metadata_update_pipeline as metadata_pipeline_run,
+            )
+
+            run_metadata_update_pipeline = metadata_pipeline_run
+        try:
+            if args.json:
+                _json_nml_resolved(nml_path)
+            result = run_metadata_update_pipeline(
+                nml_path=nml_path,
+                payload=metadata_payload,
+                write_to_files=args.write_to_files,
+                on_track_start=_json_metadata_track_start if args.json else None,
+                on_nml_status=_json_metadata_nml_status if args.json else None,
+                on_mutagen_status=_json_metadata_mutagen_status if args.json else None,
+            )
+        except (ValueError, OSError) as exc:
+            print(f"error: failed to update metadata: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            for track_result in result.results:
+                _json_metadata_track_complete(track_result)
+            _json_metadata_summary(result)
+        else:
+            for track_result in result.results:
+                status = "[ok]" if track_result.error is None else "[error]"
+                print(f"{status:7} {track_result.path}")
+                if track_result.error is not None:
+                    print(
+                        f"          {track_result.error['code']}: "
+                        f"{track_result.error['message']}",
+                        file=sys.stderr,
+                    )
+            print(
+                "Updated NML metadata for "
+                f"{result.nml_updated_count}/{len(result.results)} track(s)"
+            )
+        return 1 if result.error_count else 0
+
 
     # --update-cues: operación de actualización manual desde el grid
     if args.update_cues is not None:
-        if args.track_path is None:
+        if len(args.track_paths) != 1:
             print("error: --update-cues requires TRACK_PATH.", file=sys.stderr)
             return 1
             
@@ -667,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
             
             # Aquí invocas la lógica de tu NmlWriter (debes implementar 'update_track_hotcues' en tu escritor)
             NmlWriter(NmlParser(nml_path)).update_track_hotcues(
-                args.track_path,
+                args.track_paths[0],
                 cues_list,
                 title=args.title,
                 artist=args.artist,
@@ -726,7 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
     # standalone destructive operation. It must run before normal selector
     # validation and never enters the audio pipeline.
     if args.delete_cue is not None:
-        if args.track_path is None:
+        if len(args.track_paths) != 1:
             print(
                 "error: --delete-cue requires TRACK_PATH as the track identifier.",
                 file=sys.stderr,
@@ -751,7 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:
             NmlWriter(NmlParser(nml_path)).delete_cue(
-                args.track_path,
+                args.track_paths[0],
                 args.delete_cue,
                 title=args.title,
                 artist=args.artist,
@@ -765,7 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: failed to delete HotCue: {exc}", file=sys.stderr)
             return 1
         print(
-            f'Deleted HotCue {args.delete_cue} from "{args.track_path}" in {nml_path}'
+            f'Deleted HotCue {args.delete_cue} from "{args.track_paths[0]}" in {nml_path}'
         )
         return 0
 
@@ -885,17 +1261,17 @@ def main(argv: list[str] | None = None) -> int:
         force=args.export_gui,
     )
 
-    # Validation: exactly one of track_path/--track-title/--playlist is
+    # Validation: exactly one of TRACK_PATHS/--track-title/--playlist is
     # required (spec section 8.4) -- enforced manually now that the
     # argparse group itself is not required=True (section 12.1).
     selectors_given = sum(
         1
-        for v in (args.track_path, args.track_title, args.playlist)
-        if v is not None
+        for v in (bool(args.track_paths), args.track_title, args.playlist)
+        if v
     )
     if selectors_given != 1:
         message = (
-            "exactly one of TRACK_PATH, --track-title, or --playlist is required"
+            "exactly one of TRACK_PATHS, --track-title, or --playlist is required"
         )
         if use_json:
             _json_log("error", message)
@@ -903,7 +1279,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {message}", file=sys.stderr)
         return 1
 
-    if args.export_gui and args.track_path is None:
+    if args.export_gui and len(args.track_paths) != 1:
         print(
             "error: --export-gui requires TRACK_PATH and cannot be used with "
             "--track-title or --playlist",
@@ -912,7 +1288,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # Validation: --title is only allowed in single-track mode
-    if args.title is not None and args.track_path is None:
+    if args.title is not None and len(args.track_paths) != 1:
         message = (
             "--title is only valid in single-track mode (with TRACK_PATH). "
             "Use --artist to narrow batch title search."
@@ -941,7 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
     config = build_config_from_args(args)
 
     # Route to single-track or batch pipeline based on selection mode
-    if args.track_path is not None:
+    if len(args.track_paths) == 1:
         global run_pipeline, serialize_gui_payload
         if run_pipeline is None:
             from cuegrid.core.pipeline import run_pipeline as pipeline_run
@@ -953,7 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = run_pipeline(
                 nml_path=nml_path,
-                track_path=args.track_path,
+                track_path=args.track_paths[0],
                 config=config,
                 title=args.title,
                 artist=args.artist,
@@ -985,7 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.export_gui:
             # This is the only stdout write in export mode: one raw JSON
             # document for the Tauri in-memory bridge.
-            print(serialize_gui_payload(result, args.track_path), flush=True)
+            print(serialize_gui_payload(result, args.track_paths[0]), flush=True)
             return 0
 
         if result.skipped_reason is not None:
@@ -1052,6 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                 config=config,
                 playlist=args.playlist,
                 track_title=args.track_title,
+                track_paths=[str(path) for path in args.track_paths] or None,
                 artist=args.artist,
                 clear_existing=args.clear_existing,
                 on_track_complete=_json_batch_track_callback if use_json else None,

@@ -4,7 +4,7 @@
 // overlay. See .openspec/3-gui-spec.md §4 (TelemetryToggleButton / overlay).
 //
 // Sits outside the flex flow at the bottom-right corner, on top of the rack
-// and SummaryBadge. Recedes when idle (muted, low opacity), brightens on
+// and the workspace rack. Recedes when idle (muted, low opacity), brightens on
 // hover, and shows a subtle dot indicator when new log lines have arrived
 // while the console is closed — so a running/finished job is never silently
 // invisible.

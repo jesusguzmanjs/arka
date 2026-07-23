@@ -11,13 +11,22 @@ dataclass defaults on a per-flag basis.
 from __future__ import annotations
 
 import json
+import shutil
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 from cuegrid import cli
 from cuegrid.config import AppConfig
-from cuegrid.core.pipeline import PipelineResult
+from cuegrid.core.pipeline import (
+    BatchResult,
+    BatchSaveResult,
+    BatchSaveTrackResult,
+    MetadataBatchResult,
+    MetadataTrackResult,
+    PipelineResult,
+)
 from cuegrid.nml.constants import CueType
 from cuegrid.nml.models import TempoInfo, TrackEntry
 from cuegrid.nml.parser import AmbiguousTrackError, NmlParser, TrackNotFoundError
@@ -124,6 +133,99 @@ class TestResolveNmlPath:
         assert cli._resolve_nml_path(None) is None
 
 
+class TestCompileSmartPlaylist:
+    def test_parser_registers_smart_playlist_payload(self):
+        payload = '{"name":"Fast","match":"all","rules":[{"field":"bpm","operator":"greater_than","value":120}]}'
+
+        args = cli.build_parser().parse_args(["--compile-smart-playlist", payload])
+
+        assert args.compile_smart_playlist == payload
+
+    def test_compiles_matching_entries_and_emits_json_result(
+        self, tmp_path, capsys
+    ):
+        nml_path = tmp_path / "collection.nml"
+        shutil.copy2(SAMPLE_COLLECTION, nml_path)
+        payload = {
+            "name": "Fast tracks",
+            "match": "all",
+            "rules": [
+                {"field": "bpm", "operator": "greater_than", "value": 120}
+            ],
+        }
+
+        exit_code = cli.main(
+            [
+                "--compile-smart-playlist",
+                json.dumps(payload),
+                "--nml",
+                str(nml_path),
+                "--json",
+            ]
+        )
+
+        assert exit_code == 0
+        response = json.loads(capsys.readouterr().out)
+        assert response["ok"] is True
+        assert response["result"] == {
+            "type": "smart_playlist_compiled",
+            "name": "Fast tracks",
+            "matched": 1,
+            "uuid": response["uuid"],
+        }
+        assert response["type"] == "smart_playlist_compiled"
+
+        root = ET.parse(nml_path).getroot()
+        playlist = root.find(
+            "./PLAYLISTS/NODE[@TYPE='FOLDER'][@NAME='$ROOT']/SUBNODES/"
+            "NODE[@TYPE='PLAYLIST'][@NAME='Fast tracks']/PLAYLIST"
+        )
+        assert playlist is not None
+        assert playlist.get("ENTRIES") == "1"
+
+    def test_reports_invalid_payload_as_json_error(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        shutil.copy2(SAMPLE_COLLECTION, nml_path)
+
+        exit_code = cli.main(
+            ["--compile-smart-playlist", "not json", "--nml", str(nml_path), "--json"]
+        )
+
+        assert exit_code == 1
+        response = json.loads(capsys.readouterr().out)
+        assert response["ok"] is False
+        assert "error" in response
+
+    def test_rejects_zero_matches_without_writing_the_nml(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        shutil.copy2(SAMPLE_COLLECTION, nml_path)
+        original_contents = nml_path.read_bytes()
+        payload = {
+            "name": "No matches",
+            "match": "all",
+            "rules": [
+                {"field": "bpm", "operator": "greater_than", "value": 999}
+            ],
+        }
+
+        exit_code = cli.main(
+            [
+                "--compile-smart-playlist",
+                json.dumps(payload),
+                "--nml",
+                str(nml_path),
+                "--json",
+            ]
+        )
+
+        assert exit_code == 1
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": False,
+            "error": "No tracks match these rules. Adjust your filters and try again.",
+        }
+        assert nml_path.read_bytes() == original_contents
+
+
 # --------------------------------------------------------------------------
 # main(): argument passthrough and graceful error handling
 # --------------------------------------------------------------------------
@@ -186,6 +288,26 @@ class TestExportGui:
 
 
 class TestMainArgumentPassthrough:
+    def test_passes_multiple_positional_paths_to_batch_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        captured_kwargs = {}
+
+        def fake_run_batch_pipeline(**kwargs):
+            captured_kwargs.update(kwargs)
+            return BatchResult(results=[])
+
+        monkeypatch.setattr(cli, "run_batch_pipeline", fake_run_batch_pipeline)
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+
+        exit_code = cli.main(
+            ["first.mp3", "second.mp3", "--nml", str(nml_path)]
+        )
+
+        assert exit_code == 0
+        assert captured_kwargs["track_paths"] == ["first.mp3", "second.mp3"]
+
     def test_emits_flex_grid_skip_event_in_json_mode(self, tmp_path, monkeypatch, capsys):
         def fake_run_pipeline(**kwargs):
             result = _fake_result()
@@ -305,6 +427,52 @@ class TestMainArgumentPassthrough:
         cli.main(["track.mp3"])
 
         assert captured_kwargs["nml_path"] == discovered
+
+
+# --------------------------------------------------------------------------
+# --batch-save: unified atomic track mutation with compact NDJSON output.
+# --------------------------------------------------------------------------
+
+
+class TestBatchSave:
+    def test_routes_payload_and_emits_ndjson(self, tmp_path, monkeypatch, capsys):
+        captured: dict[str, object] = {}
+
+        def fake_pipeline(**kwargs):
+            captured.update(kwargs)
+            track_result = BatchSaveTrackResult(
+                path="track.flac",
+                nml_updated=True,
+                physical_file_updated=True,
+            )
+            return BatchSaveResult(results=[track_result])
+
+        monkeypatch.setattr(cli, "run_batch_save_pipeline", fake_pipeline)
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+        payload = '{"tracks":[{"path":"track.flac","metadata":{"genre":"Techno"}}]}'
+
+        assert cli.main(["--nml", str(nml_path), "--batch-save", payload, "--write-to-files", "--json"]) == 0
+
+        assert captured["write_to_files"] is True
+        assert captured["payload"] == json.loads(payload)
+        messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert [message["type"] for message in messages] == [
+            "nml_resolved",
+            "batch_save_validated",
+            "batch_save_nml_committed",
+            "batch_save_track_complete",
+            "batch_save_physical_status",
+            "batch_save_summary",
+        ]
+
+    def test_rejects_analysis_selector(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+        payload = '{"tracks":[{"path":"track.flac","metadata":{"genre":"Techno"}}]}'
+
+        assert cli.main(["track.flac", "--nml", str(nml_path), "--batch-save", payload]) == 1
+        assert "cannot be combined" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

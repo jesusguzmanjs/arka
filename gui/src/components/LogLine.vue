@@ -35,6 +35,16 @@ const tag = computed(() => {
       return "done";
     case "summary":
       return "summary";
+    case "metadata_track_start":
+      return "metadata";
+    case "metadata_nml_status":
+      return "nml";
+    case "metadata_mutagen_status":
+      return "mutagen";
+    case "metadata_track_complete":
+      return "metadata";
+    case "metadata_summary":
+      return "summary";
     case "fatal_error":
       return "fatal";
   }
@@ -60,6 +70,16 @@ const tagColor = computed(() => {
       return "text-success";
     case "summary":
       return "text-success";
+    case "metadata_track_start":
+      return "text-accent";
+    case "metadata_nml_status":
+      return m.success ? "text-success" : "text-error";
+    case "metadata_mutagen_status":
+      return m.success ? "text-success" : "text-error";
+    case "metadata_track_complete":
+      return m.error ? "text-error" : "text-success";
+    case "metadata_summary":
+      return m.errors > 0 ? "text-warn" : "text-success";
     case "fatal_error":
       return "text-error";
   }
@@ -83,6 +103,18 @@ const body = computed(() => {
       return `Processed ${m.artist} - ${m.title}: ${m.event_count} events, ${m.cue_count} cues${m.error ? `  error: ${m.error}` : ""}`;
     case "summary":
       return `Processed ${m.succeeded}/${m.total} tracks (${m.skipped} skipped)`;
+    case "metadata_track_start":
+      return `Metadata ${m.index}/${m.total}: ${m.path}`;
+    case "metadata_nml_status":
+      return m.success ? `NML update committed: ${m.path}` : `NML update failed: ${m.path}`;
+    case "metadata_mutagen_status":
+      return m.success
+        ? `Physical file metadata written: ${m.path}`
+        : `Physical file metadata failed: ${m.path}${m.error ? ` — ${m.error}` : ""}`;
+    case "metadata_track_complete":
+      return `Metadata complete: ${m.path}${m.error ? ` — ${m.error.message}` : ""}`;
+    case "metadata_summary":
+      return `Metadata updated for ${m.nml_updated}/${m.requested} tracks; ${m.physical_file_updated} physical files written; ${m.errors} errors`;
     case "fatal_error":
       return `FATAL: ${m.message}`;
   }

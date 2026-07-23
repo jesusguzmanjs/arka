@@ -1,6 +1,7 @@
 /** Pure beat-grid calculations. This module deliberately has no Vue or DOM dependency. */
 export interface GridTrackData {
   bpm: number;
+  key: string;
   grid_anchor_ms: number;
   duration_ms: number;
 }

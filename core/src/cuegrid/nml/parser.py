@@ -112,9 +112,11 @@ def nml_location_to_path(volume: str, dir_: str, file_: str) -> str:
     if _WINDOWS_VOLUME_RE.match(volume):
         raw = str(PureWindowsPath(volume + "\\", *segments, file_))
     else:
-        # macOS-style volume name; best-effort only, not required to
-        # resolve on a Windows machine running this tool.
-        raw = str(PurePosixPath("/Volumes", volume, *segments, file_))
+        # macOS mounts its boot volume at /, rather than under /Volumes.
+        if volume == "Macintosh HD":
+            raw = str(PurePosixPath("/", *segments, file_))
+        else:
+            raw = str(PurePosixPath("/Volumes", volume, *segments, file_))
     return raw.replace("\\", "/").casefold()
 
 
@@ -307,7 +309,9 @@ class NmlParser:
                 metadata = self._track_entry_to_metadata_dict(track_entry)
                 metadata.update(
                     {
+                        **self._editable_metadata_dict(track_entry),
                         "location_path": location_path,
+                        "key": track_entry.key,
                         "duration_ms": track_entry.duration_ms,
                         "collection_index": collection_index,
                     }
@@ -322,6 +326,29 @@ class NmlParser:
             else []
         )
         return {"collection": collection, "playlists": playlists}
+
+    @staticmethod
+    def _editable_metadata_dict(entry: TrackEntry) -> dict[str, Any]:
+        """Return the complete editable metadata portion of a library row.
+
+        Library rows deliberately materialize absent NML fields as empty
+        strings (and an absent/invalid ranking as zero) so the GUI never has
+        to make a second query before rendering an editable column.
+        """
+        return {
+            "title": entry.title,
+            "artist": entry.artist,
+            "album": entry.album,
+            "remixer": entry.remixer,
+            "producer": entry.producer,
+            "genre": entry.genre,
+            "label": entry.label,
+            "comment": entry.comment,
+            "comment2": entry.comment2,
+            "lyrics": entry.lyrics,
+            "mix": entry.mix,
+            "rating": entry.rating,
+        }
 
     def _playlist_nodes_to_payload(
         self,
@@ -363,6 +390,9 @@ class NmlParser:
             return {"kind": "folder", "name": name, "children": children}
 
         if node_type == "PLAYLIST":
+            if name in TRAKTOR_SYSTEM_PLAYLISTS:
+                return None
+
             playlist_el = node_el.find("PLAYLIST")
             track_paths: list[str] = []
             if playlist_el is not None:
@@ -395,7 +425,12 @@ class NmlParser:
                         continue
                     track_paths.append(normalized_path)
 
-            return {"kind": "playlist", "name": name, "track_paths": track_paths}
+            return {
+                "kind": "playlist",
+                "uuid": playlist_el.get("UUID", ""),
+                "name": name,
+                "track_paths": track_paths,
+            }
 
         return None
 
@@ -433,6 +468,11 @@ class NmlParser:
     def tree(self) -> ET.ElementTree:
         """The parsed ``ElementTree``, for ``nml.writer`` to serialize back to disk."""
         return self._tree
+
+    def restore_tree(self, tree: ET.ElementTree) -> None:
+        """Restore a previously retained tree after a failed mutation write."""
+        self._tree = tree
+        self._root = tree.getroot()
 
     @staticmethod
     def _entry_from_element(entry_el: ET.Element) -> TrackEntry:
@@ -478,8 +518,23 @@ class NmlParser:
         # v2.0 stems: AUDIO_ID lives on <ENTRY> itself; FLAGS lives on <INFO>.
         audio_id = entry_el.get("AUDIO_ID") or None
         info_el = entry_el.find("INFO")
+        key: str | None = None
         flags: int | None = None
+        album_el = entry_el.find("ALBUM")
+        album = album_el.get("TITLE", "") if album_el is not None else ""
+        remixer = producer = genre = label = comment = comment2 = lyrics = mix = ""
+        rating = 0
         if info_el is not None:
+            key = info_el.get("KEY") or None
+            remixer = info_el.get("REMIXER", "")
+            producer = info_el.get("PRODUCER", "")
+            genre = info_el.get("GENRE", "")
+            label = info_el.get("LABEL", "")
+            comment = info_el.get("COMMENT", "")
+            comment2 = info_el.get("RATING", "")
+            lyrics = info_el.get("KEY_LYRICS", "")
+            mix = info_el.get("MIX", "")
+            rating = NmlParser._extract_rating(info_el.get("RANKING"))
             flags_str = info_el.get("FLAGS")
             if flags_str is not None:
                 flags = int(flags_str)
@@ -516,11 +571,32 @@ class NmlParser:
             grid_anchor_ms=grid_anchor_ms,
             is_flex_grid=grid_marker_count > 1,
             duration_ms=duration_ms,
+            key=key,
+            album=album,
+            remixer=remixer,
+            producer=producer,
+            genre=genre,
+            label=label,
+            comment=comment,
+            comment2=comment2,
+            lyrics=lyrics,
+            mix=mix,
+            rating=rating,
             peak_db=peak_db,
             perceived_db=perceived_db,
             audio_id=audio_id,
             flags=flags,
         )
+
+    @staticmethod
+    def _extract_rating(ranking: str | None) -> int:
+        """Convert Traktor's 0-255 ``RANKING`` attribute to a 0-5 rating."""
+        if ranking is None:
+            return 0
+        try:
+            return max(0, min(5, round(float(ranking) / 51.0)))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _extract_duration_ms(entry_el: ET.Element) -> float:

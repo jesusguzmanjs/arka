@@ -2,11 +2,13 @@
 
 Status: implemented baseline, synchronized 2026-07-16.
 
-CueGrid is a desktop-assisted Python application that injects grid-aligned HotCues into Native Instruments Traktor collections. The checked-out code is the product baseline; detailed implementation contracts live in [2-core-spec.md](2-core-spec.md), [3-gui-spec.md](3-gui-spec.md), [3-player-spec.md](3-player-spec.md), and [4-library-spec.md](4-library-spec.md).
+CueGrid is a desktop-assisted Python application that injects grid-aligned HotCues and performs batch metadata updates in Native Instruments Traktor collections. The checked-out code is the product baseline; detailed implementation contracts live in [2-core-spec.md](2-core-spec.md), [3-gui-spec.md](3-gui-spec.md), [3-player-spec.md](3-player-spec.md), and [4-library-spec.md](4-library-spec.md).
 
 ## Product goal
 
 Help DJs identify structural transitions without inventing a second beat grid. CueGrid takes Traktor's BPM and Grid marker as authoritative, evaluates phrase-boundary candidates against the master audio, and writes only safe standard HotCue changes back to the matching `collection.nml` entry.
+
+CueGrid also supports batch updates to standard Traktor track metadata. The atomic `collection.nml` update is authoritative; optionally, CueGrid mirrors the same patch to compatible physical audio-file tags.
 
 ## Current core behavior
 
@@ -16,6 +18,7 @@ Help DJs identify structural transitions without inventing a second beat grid. C
 - The active pipeline is master-track-only. FFmpeg Stem extraction and master/drum fusion are retired from the analysis path; reference-only helpers live in PyInstaller-excluded legacy modules and are not dependencies of CueGrid.
 - Single-track, playlist, and title-selected batch processing are implemented. Batch execution is sequential and isolates individual track failures.
 - The CLI supplies NDJSON analysis progress, Super JSON track-preview data, playlist/library queries, discovery, manual cue/grid/BPM updates, and standard HotCue deletion.
+- The CLI supports a standalone batch metadata mutation. It updates `collection.nml` atomically and can optionally mirror the supported metadata fields to MP3, FLAC, M4A/AAC, AIFF, and WAV files with per-track error isolation.
 - NML writes are atomic and create retained daily backups. Flex Grid tracks are protected from automatic analysis.
 
 ## Current desktop behavior

@@ -16,12 +16,18 @@ export interface RunSummary {
   skipped: number;
 }
 
+export interface RunProgress {
+  current: number;
+  total: number;
+}
+
 interface RunState {
   status: RunStatus;
   analysisStatus: string | null;
   logs: LogEntry[]; // append-only for the current run
   startedAt: number | null;
   summary: RunSummary | null; // set once a "summary" message arrives
+  progress: RunProgress | null;
   currentPid: number | null; // for cancellation (§6.6)
 }
 
@@ -31,8 +37,21 @@ const state = reactive<RunState>({
   logs: [],
   startedAt: null,
   summary: null,
+  progress: null,
   currentPid: null,
 });
+
+function handleMessage(msg: SidecarMessage): void {
+  if (msg.type === "track_start") {
+    state.progress = { current: msg.index, total: msg.total };
+  }
+  state.logs.push({ ts: Date.now(), msg });
+}
+
+export function clearSummary(): void {
+  state.summary = null;
+  state.analysisStatus = null;
+}
 
 export function useRunState() {
   return {
@@ -42,6 +61,7 @@ export function useRunState() {
       state.logs = [];
       state.analysisStatus = null;
       state.summary = null;
+      state.progress = null;
       state.startedAt = Date.now();
       state.status = "running";
     },
@@ -49,26 +69,28 @@ export function useRunState() {
     setAnalysisStatus: (message: string | null) => {
       state.analysisStatus = message;
     },
-    /** Append a sidecar message to the console with a client timestamp. */
-    pushLog: (msg: SidecarMessage) => {
-      state.logs.push({ ts: Date.now(), msg });
-    },
+    clearSummary,
+    /** Update run state and append a sidecar message with a client timestamp. */
+    handleMessage,
+    pushLog: handleMessage,
     /** Mark the run complete with an optional summary. */
     finishRun: (status: "success" | "error" | "cancelled", summary?: RunSummary) => {
       state.status = status;
       state.summary = summary ?? state.summary;
+      state.progress = null;
       state.currentPid = null;
     },
     /** Empty the console without changing status. */
     clearLogs: () => {
       state.logs = [];
     },
-    /** Reset back to idle (used by ActionBar's "Reset" affordance). */
+    /** Reset back to idle (used by AutoCuePanel's reset flow). */
     reset: () => {
       state.status = "idle";
       state.analysisStatus = null;
       state.logs = [];
       state.summary = null;
+      state.progress = null;
       state.startedAt = null;
       state.currentPid = null;
     },

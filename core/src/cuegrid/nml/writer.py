@@ -20,6 +20,9 @@ import shutil
 import time
 import xml.etree.ElementTree as ET
 import datetime
+import copy
+import re
+import uuid
 from pathlib import Path
 
 from cuegrid.nml.models import CuePoint
@@ -30,6 +33,45 @@ from cuegrid.nml.parser import NmlParser
 _XML_DECLARATION = b'<?xml version="1.0" encoding="UTF-8" standalone="no" ?>\n'
 _MIN_BPM = 50.0
 _MAX_BPM = 200.0
+_PLAYLIST_UUID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def generate_playlist_uuid() -> str:
+    """Return a Traktor-compatible, lowercase 32-hex-character UUID."""
+    return uuid.uuid4().hex
+
+
+def build_playlist_node(
+    name: str, track_keys: list[str], *, playlist_uuid: str | None = None
+) -> ET.Element:
+    """Build one standard Traktor ``NODE TYPE=PLAYLIST`` XML element.
+
+    ``track_keys`` must already be Traktor ``PRIMARYKEY`` path values, not
+    normalized filesystem paths. Keeping construction independent of a parser
+    makes the exact XML shape directly unit-testable.
+    """
+    playlist_name = name.strip()
+    if not playlist_name:
+        raise ValueError("playlist name must be non-empty")
+    if any(not isinstance(key, str) or not key for key in track_keys):
+        raise ValueError("playlist track keys must be non-empty strings")
+
+    playlist_uuid = playlist_uuid or generate_playlist_uuid()
+    if not _PLAYLIST_UUID_RE.fullmatch(playlist_uuid):
+        raise ValueError("playlist UUID must be 32 lowercase hexadecimal characters")
+
+    node = ET.Element("NODE", TYPE="PLAYLIST", NAME=playlist_name)
+    playlist = ET.SubElement(
+        node,
+        "PLAYLIST",
+        ENTRIES=str(len(track_keys)),
+        TYPE="LIST",
+        UUID=playlist_uuid,
+    )
+    for key in track_keys:
+        entry = ET.SubElement(playlist, "ENTRY")
+        ET.SubElement(entry, "PRIMARYKEY", TYPE="TRACK", KEY=key)
+    return node
 
 
 class HotcueSlotConflictError(Exception):
@@ -254,6 +296,255 @@ class NmlWriter:
                 else:
                     tempo_el.set("BPM", original_bpm)
             raise
+
+    def write_metadata_batch(
+        self, updates: list[tuple[ET.Element, dict[str, str | int | None]]]
+    ) -> None:
+        """Apply metadata patches to live entries and atomically write once.
+
+        All payload validation and track resolution are performed by the
+        caller before this method is invoked. A deep snapshot keeps the
+        parser usable if the one batch write fails after the XML tree has
+        been mutated.
+        """
+        if not updates:
+            return
+
+        snapshot = copy.deepcopy(self._parser.tree)
+        try:
+            for entry_el, fields in updates:
+                self.apply_metadata_to_element(entry_el, fields)
+            self._backup_if_needed()
+            self._write_atomic()
+        except Exception:
+            self._parser.restore_tree(snapshot)
+            raise
+
+    def write_batch_save(
+        self,
+        updates: list[
+            tuple[
+                ET.Element,
+                list[dict] | None,
+                float | None,
+                float | None,
+                dict[str, str | int | None] | None,
+            ]
+        ],
+        playlist_updates: list[tuple[ET.Element, str, str | None, list[str] | None]] | None = None,
+    ) -> None:
+        """Apply final GUI track and playlist state and persist exactly once.
+
+        Callers resolve entries and validate the full payload before invoking
+        this method. A tree snapshot makes the all-or-nothing NML transaction
+        recoverable when serialization or replacement fails.
+        """
+        snapshot = copy.deepcopy(self._parser.tree)
+        try:
+            for entry_el, cues, grid_anchor_ms, bpm, metadata in updates:
+                if cues is not None:
+                    self._replace_standard_hotcues(
+                        entry_el, self._validate_manual_cues(cues)
+                    )
+                if grid_anchor_ms is not None:
+                    if not math.isfinite(grid_anchor_ms) or grid_anchor_ms < 0:
+                        raise ValueError("grid anchor must be finite and non-negative")
+                    grids = [cue for cue in entry_el.findall("CUE_V2") if cue.get("TYPE") == "4"]
+                    if len(grids) != 1:
+                        raise ValueError("cannot update grid anchor without exactly one Grid marker")
+                    grids[0].set("START", f"{grid_anchor_ms:.6f}")
+                normalized_bpm = self._validate_bpm(bpm)
+                if normalized_bpm is not None:
+                    tempo = entry_el.find("TEMPO")
+                    if tempo is None:
+                        raise ValueError("cannot update BPM: no TEMPO element found")
+                    tempo.set("BPM", f"{normalized_bpm:.6f}")
+                if metadata is not None:
+                    self.apply_metadata_to_element(entry_el, metadata)
+            for playlist_node, action, name, entry_keys in playlist_updates or []:
+                if action == "delete":
+                    parent = self._find_parent(playlist_node)
+                    if parent is None:
+                        raise ValueError("cannot delete playlist without a parent node")
+                    parent.remove(playlist_node)
+                    if parent.tag == "SUBNODES":
+                        parent.set("COUNT", str(sum(1 for child in parent if child.tag == "NODE")))
+                    continue
+                if action != "update" or name is None or entry_keys is None:
+                    raise ValueError("invalid playlist mutation")
+                playlist_el = playlist_node.find("PLAYLIST")
+                if playlist_el is None:
+                    raise ValueError("playlist node has no PLAYLIST element")
+                playlist_node.set("NAME", name)
+                for entry in list(playlist_el.findall("ENTRY")):
+                    playlist_el.remove(entry)
+                for key in entry_keys:
+                    entry = ET.SubElement(playlist_el, "ENTRY")
+                    ET.SubElement(entry, "PRIMARYKEY", TYPE="TRACK", KEY=key)
+                playlist_el.set("ENTRIES", str(len(entry_keys)))
+            self._backup_if_needed()
+            self._write_atomic()
+        except Exception:
+            self._parser.restore_tree(snapshot)
+            raise
+
+    def _find_parent(self, child: ET.Element) -> ET.Element | None:
+        """Return the live tree parent for a direct child element."""
+        for parent in self._parser.tree.getroot().iter():
+            if child in parent:
+                return parent
+        return None
+
+    @staticmethod
+    def _replace_standard_hotcues(
+        entry_el: ET.Element, cues: list[tuple[int, float]]
+    ) -> None:
+        """Replace only standard HotCues, preserving grid/load markers."""
+        NmlWriter._clear_hotcues(entry_el)
+        for hotcue, start_ms in cues:
+            cue_el = ET.SubElement(entry_el, "CUE_V2")
+            cue_el.set("NAME", f"Cue {hotcue + 1}")
+            cue_el.set("DISPL_ORDER", "0")
+            cue_el.set("TYPE", "0")
+            cue_el.set("START", f"{start_ms:.6f}")
+            cue_el.set("LEN", "0.000000")
+            cue_el.set("REPEATS", "-1")
+            cue_el.set("HOTCUE", str(hotcue))
+
+    def write_smart_playlist(self, name: str, matched_entries: list[ET.Element]) -> str:
+        """Compile matching collection entries into a static playlist and persist it.
+
+        The playlist is placed directly in the ``$ROOT`` folder's ``SUBNODES``
+        container. An existing same-name playlist is replaced in place, so the
+        writer never creates duplicate names during a refresh.
+        """
+        track_keys = [self._entry_to_primary_key(entry) for entry in matched_entries]
+        playlist_node = build_playlist_node(name, track_keys)
+        playlist_uuid = playlist_node.find("PLAYLIST").get("UUID")
+        snapshot = copy.deepcopy(self._parser.tree)
+        try:
+            subnodes = self._root_playlist_subnodes()
+            same_name = [
+                node
+                for node in list(subnodes)
+                if node.tag == "NODE"
+                and node.get("TYPE") == "PLAYLIST"
+                and node.get("NAME") == playlist_node.get("NAME")
+            ]
+            if same_name:
+                insertion_index = list(subnodes).index(same_name[0])
+                for node in same_name:
+                    subnodes.remove(node)
+                subnodes.insert(insertion_index, playlist_node)
+            else:
+                subnodes.append(playlist_node)
+            subnodes.set("COUNT", str(sum(1 for node in subnodes if node.tag == "NODE")))
+            self._backup_if_needed()
+            self._write_atomic()
+        except Exception:
+            self._parser.restore_tree(snapshot)
+            raise
+        return playlist_uuid
+
+    def write_static_playlist(self, name: str, entries: list[ET.Element]) -> str:
+        """Persist an ordered regular playlist from validated collection entries.
+
+        Reuses the Smart Playlist transaction because both produce the same
+        standard Traktor playlist node, including its atomic write guarantees.
+        Repeated elements are intentionally retained as repeated playlist rows.
+        """
+        return self.write_smart_playlist(name, entries)
+
+    def _root_playlist_subnodes(self) -> ET.Element:
+        root = self._parser.tree.getroot()
+        playlists = root.find("PLAYLISTS")
+        if playlists is None:
+            playlists = ET.SubElement(root, "PLAYLISTS")
+        root_folder = next(
+            (
+                node
+                for node in playlists.findall("NODE")
+                if node.get("TYPE") == "FOLDER" and node.get("NAME") == "$ROOT"
+            ),
+            None,
+        )
+        if root_folder is None:
+            root_folder = ET.SubElement(playlists, "NODE", TYPE="FOLDER", NAME="$ROOT")
+        subnodes = root_folder.find("SUBNODES")
+        if subnodes is None:
+            subnodes = ET.SubElement(root_folder, "SUBNODES", COUNT="0")
+        return subnodes
+
+    @staticmethod
+    def _entry_to_primary_key(entry_el: ET.Element) -> str:
+        location = entry_el.find("LOCATION")
+        if location is None:
+            raise ValueError("Smart Playlist entry has no LOCATION element")
+        volume = location.get("VOLUME", "")
+        directory = location.get("DIR", "")
+        file_name = location.get("FILE", "")
+        if not volume or not directory or not file_name:
+            raise ValueError("Smart Playlist entry has incomplete LOCATION data")
+        return f"{volume}{directory}{file_name}"
+
+    @staticmethod
+    def apply_metadata_to_element(
+        entry_el: ET.Element, fields: dict[str, str | int | None]
+    ) -> None:
+        """Apply one validated partial metadata patch without writing XML."""
+        entry_attributes = {"title": "TITLE", "artist": "ARTIST"}
+        album_attributes = {"release": "TITLE"}
+        info_attributes = {
+            "remixer": "REMIXER",
+            "producer": "PRODUCER",
+            "genre": "GENRE",
+            "label": "LABEL",
+            "comment": "COMMENT",
+            "comment2": "RATING",
+            "lyrics": "KEY_LYRICS",
+            "mix": "MIX",
+        }
+
+        album_el: ET.Element | None = None
+        info_el: ET.Element | None = None
+        for field, value in fields.items():
+            if field in entry_attributes:
+                NmlWriter._set_or_remove_attribute(
+                    entry_el, entry_attributes[field], value
+                )
+            elif field in album_attributes:
+                if album_el is None:
+                    album_el = entry_el.find("ALBUM")
+                    if album_el is None and value is not None:
+                        album_el = ET.SubElement(entry_el, "ALBUM")
+                if album_el is not None:
+                    NmlWriter._set_or_remove_attribute(
+                        album_el, album_attributes[field], value
+                    )
+            elif field in info_attributes or field == "rating":
+                if info_el is None:
+                    info_el = entry_el.find("INFO")
+                    if info_el is None and value is not None:
+                        info_el = ET.SubElement(entry_el, "INFO")
+                if info_el is not None:
+                    if field == "rating":
+                        value = None if value is None else str(int(value) * 51)
+                        NmlWriter._set_or_remove_attribute(info_el, "RANKING", value)
+                    else:
+                        NmlWriter._set_or_remove_attribute(
+                            info_el, info_attributes[field], value
+                        )
+            else:
+                raise ValueError(f"unsupported metadata field: {field}")
+
+    @staticmethod
+    def _set_or_remove_attribute(
+        element: ET.Element, attribute: str, value: str | int | None
+    ) -> None:
+        if value is None:
+            element.attrib.pop(attribute, None)
+        else:
+            element.set(attribute, str(value))
 
     @staticmethod
     def _validate_bpm(bpm: float | None) -> float | None:

@@ -1,6 +1,6 @@
 # Spec: CueGrid GUI (Phase 2 — Tauri + Vue 3)
 
-Status: Current implementation synchronized 2026-07-16 (Vue/Tauri shell, Peaks.js player, library browser, and Python sidecar flow).
+Status: Current implementation synchronized 2026-07-22 (Vue/Tauri shell, Peaks.js player, library browser, modal Auto Cue flow, and Python sidecar flow). Smart Playlist architecture added 2026-07-21.
 
 Historical revision notes below are retained only where they describe still-visible UI behavior; they do not indicate pending implementation. The core sidecar contract is defined by `2-core-spec.md`. Active analysis is master-track HPSS analysis and has no Stem/source-selection mode; NML `FLAGS` may still be displayed as UI metadata.
 (v1.7 adds the single-track context-menu interaction, conditional player teardown, and reactive analysis status messages; v1.5 adds dynamic Stem availability badges in the track list and
@@ -31,10 +31,10 @@ the historical sections below. The current source of truth is:
 - `App.vue` owns a strict `h-screen w-screen overflow-hidden` dark root. The
   HTML/body/#app ancestor chain is also overflow-hidden. Its inner rack is a
   bounded `flex-1 min-h-0 flex flex-col overflow-hidden` stack containing a
-  fixed-height `AudioPlayer` card, a flexible `LibraryBrowser` card, and a
-  fixed-height configuration card. `ActionBar` is not mounted by the current
-  `App.vue`; the Library Browser footer owns the active playlist/current-track
-  analysis controls.
+  fixed-height `AudioPlayer` card and a flexible `LibraryBrowser` card. There
+  is no persistent **AUTO CUE** card, bottom bar, or mounted `AutoCuePanel`.
+  `LibraryBrowser` consumes all remaining height above the fixed workspace
+  footer, so its table extends to the bottom of the window.
 - Scrolling is delegated to internal containers. `LibraryBrowser.vue` keeps
   separate `min-h-0 overflow-y-auto scrollbar-amber` containers for playlists
   and the track table; `AudioPlayer.vue` owns its own vertical overflow. No
@@ -45,19 +45,73 @@ the historical sections below. The current source of truth is:
   teal as the brand accent are legacy terminology, not current visual rules.
 - `AudioPlayer.vue` uses Peaks.js, a local `TrackData`/`cueState`
   model, custom grid/cue markers, eight computed pad slots, custom wheel
-  handling, BPM adjustment state, and a local dirty/save boundary. `CueContextMenu.vue` owns the
-  cue deletion menu shell and emits only `close` and `delete` events.
+  handling, and BPM adjustment state. Persistence dirtiness is global and
+  owned by `useSaveStore`; `CueContextMenu.vue` owns the cue deletion menu
+  shell and emits only `close` and `delete` events.
 - The sidecar name is `binaries/cuegrid-core`. `useCueGridSidecar.ts` builds
-  playlist or single-track analysis arguments, includes the in-memory
+  playlist or selected-track Auto Cue arguments, includes the in-memory
   `nmlPathOverride` when applicable, parses NDJSON for analysis, and exposes
-  `updateTrackCues` (including optional grid anchor and BPM), `deleteCue`, and
-  `discoverAndSetDefaultNml`. The player persists manual create/delete edits
-  through `updateTrackCues` on explicit Save Changes; `deleteCue` remains a
-  bridge capability and is not the player interaction path. Metadata and
-  playlist queries are one-shot JSON sidecar calls.
+  `batchSave` and `discoverAndSetDefaultNml`. `batchSave` is invoked only by
+  `useSaveStore.saveAll()` and calls Core's `--batch-save` endpoint. Metadata
+  and playlist queries remain one-shot JSON sidecar reads; no component-level
+  track persistence method exists.
+- Batch metadata editing is a library-level operation. `MetadataEditModal.vue`
+  owns the edit form, mutates loaded library state in memory, and marks each
+  affected track dirty. It makes no sidecar write when the modal applies.
+- Smart Playlist creation is a library-level operation. `LibraryBrowser.vue`
+  renders the dedicated add button above the playlist selector and opens
+  `SmartPlaylistModal.vue`; the modal delegates compilation to the Python
+  sidecar and reloads the library only after a successful NML mutation.
+
+### Session-history playlist import revision
+
+The Session History view is read-only except for its explicit **Import as
+Playlist** command, whose detailed interaction and parsing contract is in
+`5-history-spec.md` sections 9–14. It follows the Smart Playlist persistence
+pattern: `SessionHistoryView.vue` calls a dedicated sidecar mutation, waits for
+the NML write to succeed, then reloads the library. It must not create a
+provisional `useLibraryState` leaf, mark a playlist dirty, or use
+`useSaveStore.saveAll()`. A failure leaves both library and global dirty state
+unchanged and preserves the import-modal draft for correction/retry.
+
+### Batch-saving architecture
+
+All GUI track edits—metadata, cues, grid anchor, and BPM—are in-memory changes
+until the user explicitly saves them. The GUI must not submit a persistence
+request for an individual track edit. On an explicit save it submits one batch
+to the core, which atomically persists the final set of modified tracks as
+defined by `2-core-spec.md`. Discarding unsaved work or closing without saving
+clears only the GUI batch and makes no NML mutation. Smart Playlist compilation
+is a distinct playlist operation and remains outside the track batch payload.
+
+`gui/src/stores/useSaveStore.ts` is the global Pinia state boundary for this
+workflow. Its state is `isSaving: boolean`, `modifiedTracks: Set<string>`,
+`modifiedPlaylists: Set<string>`, and `writeMetadataToFiles: boolean` (default
+`false`). `isDirty` is true when either modified-entity set is non-empty.
+`markTrackDirty(path)` and `markPlaylistDirty(id)` record a changed entity;
+`setWriteMetadataToFiles(value)` controls the next track batch's optional
+physical-file write; and `clearDirtyState()` clears both sets and resets the
+option. `saveAll()` is the sole trigger for a track write: it serializes the
+current final in-memory state of every modified track as the `--batch-save`
+payload, awaits the sidecar result, then clears dirty state only after the NML
+transaction succeeds.
+
+`main.ts` installs Pinia before mounting the app. `App.vue` renders the global
+**Save Changes** control in the app chrome only when `isDirty` is true. The
+button invokes `saveAll()`, is disabled while a save is in progress, and reads
+**Saving...** during that operation. It has an accessible name and a visible
+keyboard focus state.
+
+`App.vue` also registers the Tauri current-window close-request listener. A
+clean window closes normally. When dirty, the listener prevents the default
+close, shows the native warning **You have unsaved changes. Do you want to save
+them before exiting?**, and handles three outcomes: save waits for `saveAll()`
+then force-closes the window; discard force-closes the window; cancel leaves
+the window open. The listener is removed when the app shell unmounts.
 
 Any older section that prescribes a three-block resizable rack, a mounted
-`ActionBar`, Wavesurfer APIs, or blue/green marker stages is historical and is
+`AutoCuePanel`, or Auto Cue controls/status embedded in a persistent layout
+region is historical and is
 superseded by this synchronization section and the more detailed current
 contracts in `3-player-spec.md` and `4-library-spec.md`.
 
@@ -67,10 +121,9 @@ contracts in `3-player-spec.md` and `4-library-spec.md`.
 App.vue (h-screen w-screen overflow-hidden)
 ├── AppHeader
 ├── AudioPlayer card (fixed 320px region)
-├── LibraryBrowser card (flexible region; two internal scroll columns)
-├── Config card (fixed 210px region; ConfigPanel)
-├── SummaryBadge
-└── fixed Export button + TelemetryToggleButton / TelemetryConsole overlay
+├── LibraryBrowser card (flexible region; minimum 280px / four visible rows;
+│   extends to the workspace footer)
+└── fixed 48px footer: Export button + TelemetryToggleButton / TelemetryConsole overlay
 ```
 
 The semantic color roles are:
@@ -85,6 +138,166 @@ The semantic color roles are:
 The root layout must preserve `min-h-0` through every flex ancestor. A child
 that owns a list or waveform may scroll inside its own bounded box, but the
 document, body, and application shell must remain fixed to the viewport.
+`LibraryBrowser` has a hard 280px minimum, sufficient for its header, table
+header, and at least four 40px track rows. `WorkspaceFooter` is a
+non-shrinking 48px block and may not be compressed or clipped by flexbox
+shrinking. `AudioPlayer` remains a fixed 320px block. The Tauri window
+defaults to 1120×970 client pixels and enforces a 970px minimum client height
+so the player, library, and footer are all visible without compressing any
+region.
+
+### Auto Cue selection and execution
+
+`useLibraryState()` owns `selectedLibraryPaths: string[]`, containing the
+`location_path` values of the rows selected for Auto Cue. This selection is
+entirely independent of `useConfigState().selectedTrackPath`, which remains
+the Audio Player preview target only.
+
+### Current library metadata contract
+
+At application boot, the Library Browser receives the relational
+`--get-library` payload specified in `2-core-spec.md` section 7.3. Its
+`CollectionTrack` model must preserve the complete editable metadata dictionary
+without optional properties:
+
+```ts
+export interface CollectionTrack {
+  title: string;
+  artist: string;
+  album: string;
+  remixer: string;
+  producer: string;
+  genre: string;
+  label: string;
+  comment: string;
+  comment2: string;
+  lyrics: string;
+  mix: string;
+  rating: number;
+  location_path: string;
+  bpm: number | null;
+  grid_anchor_ms: number | null;
+  key: string | null;
+  duration_ms: number | null;
+  is_flex_grid: boolean;
+  existing_cues: ExistingCue[];
+  collection_index: number;
+}
+```
+
+The string metadata properties use `""` for an absent NML value and `rating`
+uses `0` for an absent or invalid NML value. The GUI must install this complete
+dictionary from the single boot-time response before rendering track rows; it
+must not issue per-track requests to fill metadata cells.
+
+In the track table, a standard click replaces the Auto Cue selection, Ctrl/Cmd
+click toggles a row, and Shift-click selects the contiguous visible range. A
+double-click alone calls `selectTrackForPreview`; it must not alter the Auto
+Cue target. Changing library context clears `selectedLibraryPaths` but does not
+unload the player preview.
+
+### Auto Cue modal architecture (current)
+
+`AutoCueModal.vue` is the sole Auto Cue configuration and execution surface.
+It is mounted by `LibraryBrowser.vue`, rather than by `App.vue`, and is shown
+only while `LibraryBrowser`'s local reactive `isAutoCueModalOpen` state is
+true. Closing the modal, including **Cancel**, sets that state to `false` and
+does not mutate configuration or start analysis.
+
+`LibraryBrowser.vue` remains the feature-composition owner. It must render a
+primary **Auto Cue (X)** button next to **Edit Metadata** in the top-right
+library header, where `X` is the current `selectedLibraryPaths.length`. This
+button opens the modal. The enabled/disabled target guard is unchanged: Auto
+Cue is available only when one or more tracks are selected or an active
+playlist provides a valid target; it is unavailable while analysis is active.
+
+The existing **Auto Cue Selected** track-context action and **Auto Cue
+Playlist** playlist-context action must no longer invoke the sidecar directly.
+Each sets the appropriate existing library target/selection context, then opens
+the same modal. This preserves the target semantics while giving every entry
+point one explicit configuration-and-confirmation step.
+
+`AutoCueModal.vue` binds directly to the existing global `useConfigState()`;
+it does not own a duplicate draft or a second configuration store. It renders
+exactly these analysis settings:
+
+- Toggle: **Clear current cues**, bound to the existing clear-cues setting.
+- Button group: **Sensitivity** — **Granular**, **Balanced**, and **Strict**.
+- Button group: **Max Cues** — integer choices **1** through **8**.
+
+Its actions are **Cancel** and primary **Run Analysis**. **Run Analysis**
+resolves the current selection/playlist target from `useLibraryState()`, closes
+the modal, then invokes `useCueGridSidecar().runSelectedTracks(tracks)` for
+the resolved tracks. It must not construct a second argument path or duplicate
+sidecar validation. The sidecar's global blocking behavior, cancellation,
+NDJSON telemetry, progress text (for example, **1 of 3 analyzing**),
+completion behavior, and post-analysis synchronization remain unchanged and
+continue to be owned by `useCueGridSidecar` and its existing run state.
+
+The modal contract is props/events-based for visibility only: `LibraryBrowser`
+provides the open state and receives a close event (or uses an equivalent typed
+`v-model` contract). Configuration remains global in `useConfigState`, and
+execution remains delegated to the sidecar composable. This keeps the modal
+presentationally focused and avoids copying shared state into the library view.
+
+`AutoCuePanel.vue` is removed from the active component tree. Any older
+`AutoCuePanel` references concerning layout, execution, progress display,
+cancellation, or telemetry export are superseded by this section. Existing
+global run-state UI and the fixed footer's telemetry/export affordances remain
+unchanged; this revision moves only Auto Cue configuration and execution
+initiation into the modal.
+
+### Smart Playlist creation
+
+The Collection View's playlist column must render one compact, accessible `+`
+button directly above the playlist selector/list. Its accessible name is
+**Create Smart Playlist**. Clicking it opens `SmartPlaylistModal.vue`; it does
+not create or mutate a playlist until the user submits a valid modal form.
+
+The modal contains all of the following controls:
+
+- **Playlist Name**: a required trimmed non-empty text input.
+- **Match ALL rules** / **Match ANY rule**: a mutually exclusive global
+  toggle, represented in the request as `match: "all"` or `match: "any"`.
+- **Rule rows**: one initially visible row and a dynamic list of rows, each
+  with `[Field] [Operator] [Value]` controls. The operator selector and value
+  input must change to the selected field's contract.
+- Per-row `-` button and an `+ Add rule` button. The modal must not allow the
+  final remaining rule row to be removed.
+- Cancel and **Create Smart Playlist** actions. Cancel, Escape, and backdrop
+  dismissal discard the draft without invoking the sidecar.
+
+The GUI supports exactly these rule-builder options and must serialize their
+canonical field/operator identifiers unchanged to the core contract in
+`2-core-spec.md` section 7.5:
+
+| Field label | `field` | Allowed operator labels / identifiers | Value control |
+|---|---|---|---|
+| BPM | `bpm` | Equals / `equals`; Greater Than / `greater_than`; Less Than / `less_than`; Between / `between` | number, or min/max numbers for Between |
+| Playcount | `playcount` | Equals / `equals`; Greater Than / `greater_than`; Less Than / `less_than`; Between / `between` | non-negative integer, or min/max integers |
+| Genre | `genre` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
+| Label | `label` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
+| Comment | `comment` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
+| Key | `key` | Exact Match / `is_exactly` | key text, for example `8A` |
+| Import Date | `import_date` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
+| Last Played | `last_played` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
+| Rating | `rating` | Greater than or equal / `greater_than_or_equal`; Less than or equal / `less_than_or_equal`; Equals / `equals` | integer star rating 1–5 |
+
+`SmartPlaylistModal.vue` receives the current playlist names as an
+`existingPlaylists: string[]` prop from the Collection View's playlist owner.
+It must derive `isNameTaken` in real time by comparing the trimmed playlist
+name case-insensitively with that array. When the name is taken, the modal must
+show the warning **A playlist with this name already exists.** immediately
+below the name input and must not permit submission.
+
+The submit action is disabled while any row is incomplete or invalid, when the
+playlist name is empty or already taken, or while the Smart Playlist mutation
+is in flight. The frontend must not translate star ratings to NML ranking
+values: it submits the selected integer 1–5 and the core performs the required
+conversion. On a successful response, the GUI closes the modal, reloads the
+on-disk library, and selects or reveals the compiled playlist by name. On
+failure, including a zero-match response, it preserves the draft, shows the
+returned error, and does not optimistically alter the playlist list.
 
 ## 1. Scope
 
@@ -143,16 +356,15 @@ graph TD
     A[App.vue] --> R[PlayerRack block — Block 1]
     R --> P[AudioPlayer.vue lazy]
     R --> LB[LibraryBrowser.vue]
+    A --> MEM[MetadataEditModal.vue floating]
     A --> B[AppHeader.vue]
     A --> C[ConfigRack block — Block 2]
-    C --> C0[ConfigPanel.vue]
-    C --> D[ActionBar.vue]
+    C --> C0[AutoCuePanel.vue]
     A --> TB[TelemetryToggleButton.vue new]
     A --> E[TelemetryConsole.vue floating overlay]
     C0 --> C3[SensitivitySelect.vue]
     C0 --> C4[ClearExistingSwitch.vue]
     E --> E1[LogLine.vue]
-    E --> E2[SummaryBadge.vue]
 ```
 
 This supersedes every prior incremental diagram in this document, in
@@ -164,15 +376,35 @@ changes from the prior tree:
 
 1. `LibraryBrowser.vue` is now a child of the **PlayerRack** block
    (Block 1), stacked directly underneath `AudioPlayer.vue`, not a
-   sibling of `ConfigPanel.vue` inside the Config block. It no longer
-   shares a scroll/resize region with `ConfigPanel.vue`/`ActionBar.vue`
+   sibling of `AutoCuePanel.vue` inside the Config block. It no longer
+   shares a scroll/resize region with `AutoCuePanel.vue`
    at all.
 2. `TelemetryConsole.vue` is no longer a fixed rack block. It renders
    as a floating overlay, toggled by a new sibling component,
    `TelemetryToggleButton.vue` — see section 4 for the exact
    positioning and interaction contract.
 
-### 3.2 File layout (`gui/src/`)
+### 3.2 Navigation architecture
+
+CueGrid uses a horizontal, two-tab navigation system to preserve the full
+workspace width for audio analysis. Sidebars are explicitly out of scope.
+
+- `AppHeader.vue` remains the fixed top header and contains the CueGrid title,
+  branding, and `collection.nml` indicator.
+- Immediately below the header, `App.vue` renders a Tab Navigation Bar with
+  exactly two tabs: **Collection** and **Session History**.
+- `App.vue` owns the minimal local navigation state (`activeTab`), initially
+  `"collection"`, and selects the active view component from that state.
+- **Collection** renders `CollectionView.vue`, which owns the existing player,
+  library, configuration, summary, and telemetry workspace unchanged.
+- **Session Histori** renders `SessionHistoryView.vue`. Its initial scope
+  is an empty-state scaffold only; the four-deck timeline is intentionally not
+  implemented until its detailed interaction specification exists.
+- The tab bar uses semantic `role="tablist"` / `role="tab"` controls, a
+  visible keyboard focus state, and the existing dark amber theme. The active
+  tab has the accent indicator; inactive tabs expose a muted hover state.
+
+### 3.3 File layout (`gui/src/`)
 
 ```
 src/
@@ -180,15 +412,15 @@ src/
   main.ts                       # createApp bootstrap
   components/
     AppHeader.vue                # title/branding, NML path indicator
-    ConfigPanel.vue              # composes the four config controls
+    AutoCuePanel.vue             # config controls + Auto Cue actions/status
     TargetSelector.vue           # Track / Track Title / Playlist + text input(s)
     SensitivitySelect.vue        # soft | medium | hard
     ClearExistingSwitch.vue      # boolean toggle
-    ActionBar.vue                 # "Analyze & Inject" button + reactive analysis status
     TrackContextMenu.vue           # native-looking single-track "Analyze track" menu
+    MetadataEditModal.vue          # batch metadata form; shown over the library workspace
+    SmartPlaylistModal.vue         # Smart Playlist rule builder; shown over the library workspace
     TelemetryConsole.vue          # scrolling log viewer
     LogLine.vue                   # single telemetry row (level-colored)
-    SummaryBadge.vue               # final tally chip (e.g. "4/5 tracks, 12 cues")
   composables/
     useConfigState.ts             # §4 configuration state
     useRunState.ts                # §4 run/telemetry state
@@ -213,16 +445,16 @@ of any component.
 |---|---|---|---|
 | `App.vue` | Layout grid (header / config / action / console) | — | — |
 | `AudioPlayer.vue` | Waveform player + transport (Play/Stop) + 8 virtual HotCue pads + global keyboard shortcuts. **The pad row, snapped empty-pad creation, momentary cue behavior, local deletion, keyboard shortcut mapping, beat-jump mechanics, and explicit-save synchronization are specified in full in `3-player-spec.md` §3.9–§3.13 and §3.4/§4.2–§4.4** — that document owns the binding and lifecycle contract for this component's transport layer; this table lists it only for architectural placement. | `useConfigState()` (trackPath/targetType), `useRunState()` (post-operation sync), `usePlayerState()` (§3.7 concurrency lock, shared with `LibraryBrowser.vue`) | calls `wavesurfer` play/pause/setTime and `resetPlayerState()`; emits nothing (state is private to `usePlayerState`) |
-| `ConfigPanel.vue` | Groups the 4 config controls, shows validation state | `useConfigState()` | mutates config state directly (v-model into composable refs) |
 | `TargetSelector.vue` | Radio group for target type + the matching text input(s) (path / title / playlist), each with an `artist` disambiguator field mirroring `cli.py`'s mutually-exclusive group | `useConfigState()` | updates `targetType`, `trackPath`, `trackTitle`, `playlistName`, `artist` |
 | `SensitivitySelect.vue` | 3-way segmented control; selects the complete core sensitivity preset | `sensitivity` | updates `sensitivity` |
 | `MaxCuesSelect.vue` | Compact integer selector with values 1–8 | `maxCues` | updates `maxCues` |
 | `ClearExistingSwitch.vue` | Boolean switch with a short warning tooltip ("removes existing HotCues before writing") | `clearExisting` | updates `clearExisting` |
-| `ActionBar.vue` | Primary CTA button; shows running (spinner + "Cancel") / success / error states and the reactive `analysisStatus` text | `useRunState().analysisStatus`, `useRunState().status`, `useConfigState()` validity | calls `useCueGridSidecar().run()` / `.cancel()` |
-| `TrackContextMenu.vue` | Native-looking context menu for exactly one track row; exposes only `Analyze track` and passes that row's absolute `path` to the single-track sidecar flow | selected row and `useRunState().status` | calls the single-track analysis action; never accepts a multi-selection |
+| `AutoCuePanel.vue` | Owns tuning controls, validation, Auto Cue execution, cancellation, the live analysis progress indicator, and the final prominent summary display | `useConfigState()`, `useLibraryState()`, `useRunState()` | mutates configuration and calls `useCueGridSidecar().run()` / `.runSelectedTracks()` / `.cancel()` |
+| `TrackContextMenu.vue` | Native-looking track-row context menu. It provides the single-track `Analyze track` action and the selection-aware `Edit Metadata` entry point defined in §5.9. | selected row, `useLibraryState().selectedLibraryPaths`, and `useRunState().status` | calls the single-track analysis action or opens the metadata modal; never converts metadata selection into a batch analysis request |
+| `MetadataEditModal.vue` | Centered floating batch metadata editor. Derives field display state from selected library rows and applies explicit field changes to their in-memory `CollectionTrack` objects. | `useLibraryState().selectedLibraryPaths`, loaded `CollectionTrack` metadata, `useSaveStore()` | mutates only the captured tracks in memory and calls `markTrackDirty(path)` for each; never calls the sidecar |
+| `SmartPlaylistModal.vue` | Centered floating Smart Playlist creator with a validated rule builder. | local draft, `useRunState().status`, mutation state | calls `useCueGridSidecar().compileSmartPlaylist()` and requests a library reload after success |
 | `TelemetryConsole.vue` | Auto-scrolling, monospace log viewer; virtualizes if log count is large | `useRunState().logs` | "Clear" / "Copy" toolbar actions |
 | `LogLine.vue` | Renders one `SidecarMessage`, color-coded by level/type | prop: single log entry | — |
-| `SummaryBadge.vue` | Final "N/M tracks, K cues written" chip once status is `success`/`error` | `useRunState().summary` | — |
 
 ### 3.4 Props/emits convention
 
@@ -240,18 +472,20 @@ defineEmits<{ (e: "update:modelValue", value: T): void }>()
 ```
 
 `disabled` is driven by `useRunState().status === "running"` — the
-entire `ConfigPanel` is locked while a sidecar run is active, since the
+entire `AutoCuePanel` is locked while a sidecar run is active, since the
 CLI's `AppConfig` (per `2-core-spec.md` §2.2) is immutable for the
 duration of one process invocation.
 
 ### 3.5 Track-list context menu and Stem availability badge
 
 Right-clicking a track row in `LibraryBrowser.vue` must open a native-looking
-context menu for that row. The menu contains exactly one action:
-**Analyze track**. The interaction is strictly single-track: the selected row
-must provide one absolute filesystem `path`, no multi-selection state may be
-accepted or converted into a batch request, and the action must invoke the
-single-track sidecar contract in `2-core-spec.md` §8.6.
+context menu for that row. Its first action is **Select All Songs**, which
+selects every track in the active library context. It also contains **Analyze track** and the metadata
+action defined in §5.9. **Analyze track** remains strictly single-track: the
+selected row must provide one absolute filesystem `path`, no multi-selection
+state may be accepted or converted into a batch analysis request, and the
+action must invoke the single-track sidecar contract in `2-core-spec.md`
+§8.6.
 
 For rows whose playlist-query payload has `is_flex_grid: true`, this action is
 unavailable. The row follows the disabled lock/warning and tooltip contract in
@@ -281,6 +515,13 @@ replace or alter the track title text.
 
 ## 4. UI Layout
 
+The window starts with `AppHeader.vue`, followed immediately by the horizontal
+Tab Navigation Bar. The navigation bar is outside the active workspace and
+does not consume a lateral column: selecting **Collection** shows the existing
+analysis workspace, while selecting **Session History** shows the
+session-history view. This preserves the full horizontal span for both the
+waveform/grid workspace and the future multi-track timeline.
+
 Single-page, single-window (per `tauri.conf.json`'s existing one-window
 config), vertically stacked, fixed dark theme (proposal explicitly calls
 for dark-mode; no light-mode toggle in scope). The layout is
@@ -301,15 +542,13 @@ floating overlay that is no longer part of the resizable stack at all:
 │  │  (1/3)     │ (2/3, scrolls independently)             │ │    (Block 1 filler)
 │  └──────────────────────────────────────────────────────┘ │
 ├──────────────────────────────────────────────────────────┤  ← Splitter (only one left)
-│  Sensitivity    ( Soft ) ( Medium ) ( Hard )               │  ← ConfigPanel + ActionBar
+│  Sensitivity    ( Soft ) ( Medium ) ( Hard )               │  ← AutoCuePanel
 │  Max Cues       [ 1 ][ 2 ][ 3 ] ... [ 8 ]                 │
 │  Clear Existing  [ ⏻ off ]                                │    (Block 2, min-height enforced)
 │               ┌──────────────────────────┐                │
 │               │   ▶  Analyze & Inject     │                │
 │               └──────────────────────────┘                │
 ├──────────────────────────────────────────────────────────┤
-│  4/4 tracks · 12 cues written                    [success] │  ← SummaryBadge
-└──────────────────────────────────────────────────────────┘
   [⧉]  ← TelemetryToggleButton.vue, fixed bottom-left,
          opens TelemetryConsole.vue as a floating overlay
          (not part of the flow above; drawn on top of it)
@@ -317,11 +556,10 @@ floating overlay that is no longer part of the resizable stack at all:
 
 Layout notes:
 - `App.vue`'s root is still a flex column chassis (`AppHeader` pinned
-  at the top, `SummaryBadge` pinned at the bottom, both outside the
-  resizable stack). Between them now sits a `flex-1 min-h-0 flex
+  at the top). Below it sits a `flex-1 min-h-0 flex
   flex-col` rack of exactly **two** blocks — the **PlayerRack** (Block
   1: `AudioPlayer.vue` stacked above `LibraryBrowser.vue`) and the
-  **ConfigRack** (Block 2: `ConfigPanel.vue` + `ActionBar.vue`) —
+  **ConfigRack** (Block 2: `AutoCuePanel.vue`) —
   separated by a single horizontal splitter handle. `TelemetryConsole`
   is removed from this rack entirely; it is no longer a third block.
 - **Block 1 (PlayerRack) internal composition:** `AudioPlayer.vue`
@@ -338,7 +576,7 @@ Layout notes:
   owns a reactive pixel height (`configHeight`, a `ref` bound via
   `:style="{ height: ... + 'px' }"`), resized by the single splitter
   between Block 1 and Block 2. Its minimum (`CONFIG_MIN`) is a
-  **hard, non-negotiable floor** — large enough that `ActionBar.vue`'s
+  **hard, non-negotiable floor** — large enough that `AutoCuePanel.vue`'s
   primary CTA button and its status line are *always* fully visible
   and unclipped, even when the splitter is dragged as aggressively as
   possible toward Block 1. This supersedes every prior `CONFIG_MIN`
@@ -347,7 +585,7 @@ Layout notes:
   visible — which no longer applies now that `LibraryBrowser` has
   moved out of this block); the exact new pixel floor is an
   implementation-time tuning decision, but it must be measured against
-  `ConfigPanel.vue` + `ActionBar.vue`'s actual rendered height at the
+  `AutoCuePanel.vue`'s actual rendered height at the
   smallest supported window size, not an arbitrary round number.
 - Only **one** splitter handle remains (`h-1 cursor-ns-resize`,
   highlighting `bg-teal-500/60` on hover), between Block 1 and Block
@@ -369,15 +607,15 @@ Layout notes:
 - **`TelemetryToggleButton.vue` (new component):** a small,
   unobtrusive, fixed-position button anchored to the **bottom-left**
   corner of the main app view (`fixed bottom-3 left-3`-style
-  positioning, outside the flex flow entirely, sitting on top of
-  `SummaryBadge`/the rack). It toggles `telemetryOpen`. It should
+  positioning, outside the flex flow entirely, sitting on top of the
+  rack). It toggles `telemetryOpen`. It should
   visually recede when idle (e.g. a small icon-only button at reduced
   opacity, `text-muted`, brightening on hover) and may show a subtle
   indicator (e.g. a dot or count badge) when new log lines have
   arrived while the console is closed, so a running/finished job is
   never silently invisible. Exact icon/badge treatment is an
   implementation-time design decision, not fixed by this spec.
-- `ActionBar`'s button remains the visually most prominent element in
+- `AutoCuePanel`'s button remains the visually most prominent element in
   Block 2 (per proposal): full-width or large centered button, accent
   color, with a spinner + elapsed-time counter replacing the icon
   while `status === "running"`, and a secondary "Cancel" text button
@@ -398,7 +636,7 @@ Layout notes:
 
 ## 5. State Management
 
-### 5.1 Approach: module-scoped composables, no external store library
+### 5.1 Approach: module-scoped composables plus the global save store
 
 Given the proposal's "lightweight" requirement and that this is a single
 route/single window app with exactly two logical state slices
@@ -418,6 +656,11 @@ export function useConfigState() {
   }
 }
 ```
+
+The former prohibition on an external store library is superseded for this
+revision. Configuration and run/telemetry remain module-scoped composables,
+but the shared persistence boundary uses the Pinia `useSaveStore` described in
+the batch-saving architecture above.
 
 Because the object is created once at module scope and every importer
 gets the same reactive proxy, this behaves like a minimal singleton
@@ -494,7 +737,7 @@ complete row and ensuring the three modes remain behaviorally distinct.
 - `maxCues` must always be an integer in the inclusive range 1–8. The
   default is 8; values outside this range are invalid and must not be sent
   to the sidecar.
-- The Action button (`ActionBar.vue`) is disabled whenever `!isValid`
+- The Auto Cue button (`AutoCuePanel.vue`) is disabled whenever `!isValid`
   or `useRunState().status === "running"`.
 
 ### 5.4 `useRunState.ts` (run/telemetry state shape)
@@ -519,23 +762,16 @@ export interface RunSummary {
 }
 ```
 
-`analysisStatus` is the only status text rendered below or beside the main
-execution control. The former static `status: idle` label is permanently
-removed; the idle state renders no static status label. The field is reactive
-and may show transient running/error text, but on successful sidecar
-resolution it must use exactly these English typography strings:
-
-- Single track: `[Track Title] analyzed successfully`
-- Playlist batch: `[Playlist Name] analyzed successfully`
-
-`[Track Title]` is the resolved track title, and `[Playlist Name]` is the
-requested playlist name. The strings are case-sensitive and must not be
-replaced with synonyms, prefixes, or the old `status: idle` label.
+`analysisStatus` is the reactive status text rendered below or beside the main
+execution control for transient running and error feedback. The former static
+`status: idle` label is permanently removed; the idle state renders no static
+status label. On successful sidecar resolution, `AutoCuePanel.vue` hides this
+field and renders its prominent completion summary as the sole completion
+feedback.
 
 `logs` is cleared at the start of each run (not across runs), so the
-console always reflects the most recent invocation; `SummaryBadge.vue`
-reads `summary` and disappears (or is replaced by a "no summary yet"
-placeholder) until a run completes.
+console always reflects the most recent invocation. `AutoCuePanel.vue`
+uses `summary` for its prominent completion display.
 
 ### 5.5 Persistence
 
@@ -555,9 +791,9 @@ store is authoritative for all three. `AudioPlayer.vue` owns a mandatory
 `resetPlayerState()` utility, defined in `3-player-spec.md` §3.4, and all
 track reloads and NML-mutating operation completions must use it.
 
-Any asynchronous backend operation that modifies the `.nml` — including a
-completed analysis run or a successful explicit manual-cue save —
-MUST trigger this strict, sequential three-step chain:
+Any asynchronous backend operation that modifies the `.nml`—including a
+completed analysis run or a successful `useSaveStore.saveAll()` batch—MUST
+trigger this strict, sequential three-step chain:
 
 1. **TEARDOWN:** call `resetPlayerState()`. It must use the Wavesurfer
    plugin API's `clearRegions()` to remove every active region and reset
@@ -571,11 +807,12 @@ MUST trigger this strict, sequential three-step chain:
    result, derive the pad bindings from that result, and perform a clean
    Wavesurfer marker repaint from scratch.
 
-When `hasUnsavedChanges` results from a grid-anchor edit (with or without
-linked cue movement), the explicit save call must pass the player's current
-finite, non-negative `grid_anchor_ms` as `gridAnchorMs` to
-`updateTrackCues`. A cue-only save passes no grid anchor. A successful manual
-cue or grid save must use the same synchronization chain above.
+`AudioPlayer.vue` treats cues, grid anchor, and BPM as in-memory edits. Every
+such edit mutates the loaded `CollectionTrack`/player model and calls
+`useSaveStore().markTrackDirty(path)`. When `saveAll()` succeeds, it runs the
+chain above only for loaded tracks included in the committed batch. A cue-only
+edit, grid-only edit, BPM-only edit, or combined edit is serialized together
+in that track's one `--batch-save` entry.
 
 The sidecar's successful exit code only permits this chain to begin; it
 is not permission to skip the force-read step. The chain must be awaited
@@ -608,13 +845,10 @@ playlist merely to obtain this fallback behavior.
 ### 5.7 Dynamic analysis status messages
 
 The main execution control must not render a permanent static `status: idle`
-label. `useRunState().analysisStatus` is the reactive text field replacing
-that idle state and is the sole source for the ActionBar's analysis status
-copy. On sidecar resolution, set it to exactly `[Track Title] analyzed
-successfully` for a single-track run or exactly `[Playlist Name] analyzed
-successfully` for a playlist batch run, as defined in §5.4. A failed or
-cancelled run may set an appropriate error/cancellation message, but must not
-restore the removed idle label.
+label. `useRunState().analysisStatus` supplies transient running, error, and
+cancellation copy. Successful completion is rendered only by the prominent
+summary in `AutoCuePanel.vue`; a failed or cancelled run may set an appropriate
+error/cancellation message, but must not restore the removed idle label.
 
 ## 5.8 Phase 1 GUI Audio Player Contract
 
@@ -630,10 +864,12 @@ obligations and prevents later component work from weakening that contract:
 - Hotcues use bottom-anchored custom HTML markers. Valid cues are brand-color
   and draggable; gray off-grid cues are locked. Valid cue drags snap to the
   nearest one-beat interval derived from BPM and grid anchor.
-- Cue movement is local GUI state, not a live Rust/backend disk write. The
-  shared player state exposes `hasUnsavedChanges`; when it is true, the UI
-  renders a prominent **Save Changes** action. Save is explicit and clears
-  the flag only after backend confirmation.
+- Cue movement is local GUI state, not a live Rust/backend disk write. Each
+  create, move, or delete operation updates the matching in-memory
+  `CollectionTrack`, calls `useSaveStore().markTrackDirty(trackPath)`, and
+  never invokes a sidecar method. The global **Save Changes** action invokes
+  `useSaveStore.saveAll()`; only its successful `--batch-save` transaction
+  clears the dirty state.
 - Grid correction is an explicit local **Grid Edit Mode** governed by
   `3-player-spec.md` §0.5.1/§3.14: its draggable Grid Anchor, 30%-opacity
   HotCues, **Grid Only** versus **Grid + Cues** shift modes, non-negative
@@ -643,6 +879,122 @@ obligations and prevents later component work from weakening that contract:
 - The frontend is a renderer, not an audio-analysis engine. It consumes the
   Python/librosa frequency map defined in `2-core-spec.md` §2.3.1 and must
   not run real-time FFT or heavy frequency analysis in JavaScript.
+
+### 5.9 Batch Metadata Editing (authoritative)
+
+This section defines the GUI contract for batch metadata editing. It
+supersedes the “exactly one action” limitation in §3.5, but does not change
+the single-track-only scope of **Analyze track**.
+
+#### 5.9.1 Entry point and selection
+
+- `LibraryBrowser.vue` must expose an **Edit Metadata** action in the track-row
+  right-click context menu.
+- The action is enabled only when one or more library rows are selected and
+  visibly shaded (`useLibraryState().selectedLibraryPaths`). It is disabled
+  when the selection is empty.
+- Invoking the action opens `MetadataEditModal.vue` for the current shaded-row
+  selection. Opening the row menu must not silently replace, add, or remove
+  that selection.
+- The edit target is the selected `location_path` list captured when the modal
+  opens. The modal must not submit a different set of tracks if table
+  selection changes underneath it; a selection change requires closing and
+  reopening the modal.
+
+#### 5.9.2 `MetadataEditModal.vue` presentation and controls
+
+`MetadataEditModal.vue` is a floating, centered modal rendered above the
+application workspace. While open, it must provide a dark backdrop that
+visually separates the form from the UI beneath it and prevents interaction
+with the underlying library. `Escape`, Cancel, and the close affordance dismiss
+the modal without invoking a metadata mutation.
+
+The form must visibly provide inputs for all of the following editable fields:
+
+| UI label | Metadata payload key | Loaded-library source key | Input kind |
+|---|---|---|---|
+| Title | `title` | `title` | text |
+| Release (Album) | `release` | `album` | text |
+| Artist | `artist` | `artist` | text |
+| Remixer | `remixer` | `remixer` | text |
+| Producer | `producer` | `producer` | text |
+| Genre | `genre` | `genre` | text |
+| Label | `label` | `label` | text |
+| Comment | `comment` | `comment` | text |
+| Comment 2 | `comment2` | `comment2` | text |
+| Lyrics | `lyrics` | `lyrics` | multi-line text |
+| Mix | `mix` | `mix` | text |
+| Rating | `rating` | `rating` | bounded rating control (0–5) |
+
+The modal must also contain a visible boolean toggle labeled exactly **Write
+changes to physical audio files**. It defaults to off. When on, it authorizes
+the optional `--write-to-files` argument for the next global `saveAll()` batch;
+it does not alter which NML fields are patched or invoke a write from the
+modal.
+
+#### 5.9.3 Initial values and explicit-edit tracking
+
+On every modal open, the frontend must evaluate each listed metadata field
+across the loaded `CollectionTrack` objects whose `location_path` is in the
+captured selection:
+
+1. If every selected track has the same value for a field, render that value
+   in the corresponding input/control.
+2. If one or more selected values differ, render the placeholder
+   `(multiple values)` for that input/control. This is display-only and must
+   never be submitted as a literal metadata value.
+3. A field is included in the mutation only after the user explicitly changes
+   that field. Fields left untouched, including fields showing a common value
+   or `(multiple values)`, must be omitted.
+4. Clearing an input is an explicit change and must be represented according
+   to the core metadata contract (an empty string remains an intentional
+   value; an explicit clear-to-null control, if provided, sends `null`).
+5. For Rating, equal values render the shared numeric rating; differing values
+   render the same `(multiple values)` placeholder/state. Selecting a rating
+   is an explicit change and applies that single 0–5 value to every target.
+
+The **Apply** control is disabled until at least one field has been explicitly
+modified and no entered value violates the field constraints. Cancel remains
+available while the operation is not running. While Apply is running, the
+modal must prevent duplicate submissions.
+
+#### 5.9.4 Apply in-memory metadata changes
+
+On **Apply**, `MetadataEditModal.vue` MUST mutate only the captured selected
+`CollectionTrack` objects. For every explicitly edited field it assigns the
+new value locally (mapping `release` to the track's `album` field), preserves
+all untouched fields, and calls `useSaveStore().markTrackDirty(locationPath)`
+for each changed track. It closes after those in-memory updates; it MUST NOT
+call `useCueGridSidecar`, reload the library, invoke Mutagen, or write NML.
+
+The **Write changes to physical audio files** choice becomes a pending batch
+option. `useSaveStore.saveAll()` includes `--write-to-files` only when that
+option is active and the serialized batch includes metadata. It is consumed by
+the one global batch save, not by this modal.
+
+The authoritative payload is the per-track `--batch-save` object in
+`2-core-spec.md` section 7.4. No legacy metadata payload or direct sidecar
+invocation remains part of the GUI contract.
+
+#### 5.9.5 Batch-save synchronization
+
+After `saveAll()` receives a successful `--batch-save` completion, it must
+issue one fresh `--get-library` read and replace the library's in-memory
+collection before treating the save as complete. The metadata modal itself
+does not read or write disk; its optimistic in-memory edits remain pending
+until this successful batch boundary.
+
+If the track currently loaded by `AudioPlayer.vue` is among the committed
+batch tracks, the frontend must additionally await the existing player lifecycle:
+
+```text
+resetPlayerState() -> Force Read -> Rebuild
+```
+
+The fresh library read and this player chain must finish before the operation
+is presented as synchronized. A non-zero exit must leave the current loaded
+library/player data intact, surface the failure, and keep the modal available
+for correction or cancellation.
 
 ## 6. Tauri Core Resource Architecture
 
@@ -690,7 +1042,7 @@ paths resolve the executable only through the packaged resource directory.
 ```mermaid
 graph LR
     subgraph "Tauri WebView (Vue 3)"
-        UI[ConfigPanel / ActionBar]
+        UI[AutoCuePanel]
         RS[useRunState]
         SC[useCueGridSidecar]
     end
@@ -768,27 +1120,21 @@ the unified Master-track pipeline defined in `2-core-spec.md` §9.
 The current implementation uses `selectedPlaylist` for the main batch run
 and `selectedTrackPath` for the single-track row action. It invokes the
 packaged binary as `binaries/cuegrid-core` and adds `--nml` whenever the
-discovered/overridden `nmlPathOverride` is available. Manual player saves use
-the separate argv shape
-`[trackPath, "--update-cues", JSON.stringify(cues), "--grid-anchor", String(gridAnchorMs), "--bpm", String(newBpm), "--nml", nmlPath]`
-when Grid Edit and BPM edits changed the local state, with each optional flag
-omitted when its corresponding value is unchanged. A BPM-only save still
-passes the complete current cue payload. Creation, deletion, grid, and BPM
-edits mutate local state only; the subsequent explicit save is the sole
-player-side NML write and resolves completion from the process exit code.
+discovered/overridden `nmlPathOverride` is available. Track editing has a
+separate unified argv shape, built exclusively by `useSaveStore.saveAll()`:
+`["--batch-save", JSON.stringify({ tracks }), "--nml", nmlPath]`, with
+`--write-to-files` included only for the pending physical-metadata option.
+`tracks` is derived from the current final in-memory `CollectionTrack`/player
+models for every path in `modifiedTracks`. Creation, deletion, cue movement,
+grid, BPM, and metadata edits never invoke the sidecar; they mutate memory and
+call `markTrackDirty(path)`. The global save resolves completion from the batch
+process exit code.
 
 ```ts
-async function updateTrackCues(
-  trackPath: string,
-  cues: CuePointPayload[],
-  newGridAnchorMs?: number,
-  newBpm?: number,
-): Promise<{ ok: boolean; error?: string }> {
-  const args = [trackPath, "--update-cues", JSON.stringify(cues)]
-  if (newGridAnchorMs !== undefined) {
-    args.push("--grid-anchor", String(newGridAnchorMs))
-  }
-  if (newBpm !== undefined) args.push("--bpm", String(newBpm))
+async function saveAll(): Promise<{ ok: boolean; error?: string }> {
+  const tracks = buildBatchSaveTracks(modifiedTracks)
+  const args = ["--batch-save", JSON.stringify({ tracks })]
+  if (writeMetadataToFiles.value) args.push("--write-to-files")
   if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value)
   return invoke("call_cuegrid_core", { args })
     .then(() => ({ ok: true }))
@@ -817,9 +1163,10 @@ function buildArgs(cfg: CueGridConfig): string[] {
 
 The current `cli.py` implements `--json` and emits newline-delimited JSON
 (NDJSON: one JSON object per line, flushed eagerly) for the analysis sidecar.
-This is an implemented interface, not a pending dependency. The one-shot
-metadata, playlist, discovery, update, and delete operations intentionally
-use their own JSON or exit-code contracts and do not enter the NDJSON stream.
+This is an implemented interface, not a pending dependency. Playlist and
+discovery operations retain their own JSON contracts. All track persistence
+uses `--batch-save --json`, so the Telemetry Console can display one NML
+transaction and optional physical-file-write progress.
 
 Per `CLAUDE.md`, this should be raised as an addition to
 `2-core-spec.md` before implementation — it is called out here only to
@@ -838,6 +1185,12 @@ export type SidecarMessage =
   | { type: "cue_written"; hotcue: number; name: string; start_ms: number }
   | { type: "track_complete"; artist: string; title: string; event_count: number; cue_count: number; error: string | null }
   | { type: "summary"; total: number; succeeded: number; skipped: number }
+  | { type: "batch_save_validated"; requested: number }
+  | { type: "batch_save_nml_committed"; requested: number }
+  | { type: "batch_save_track_complete"; path: string; nml_updated: true }
+  | { type: "batch_save_physical_status"; path: string; success: boolean; error: string | null }
+  | { type: "batch_save_summary"; requested: number; nml_updated: number; physical_file_updated: number; errors: number }
+  | { type: "smart_playlist_compiled"; name: string; matched: number; uuid: string }
   | { type: "fatal_error"; message: string }
 ```
 
@@ -845,6 +1198,12 @@ Every message carries only primitive/serializable fields already
 present on the core's existing dataclasses, so the eventual core-side
 `--json` implementation is a straight `json.dumps(asdict(...))`-style
 serialization, not a new data model.
+
+`--batch-save --json` uses this same event stream. `LogLine.vue` renders
+`batch_save_validated`, `batch_save_nml_committed`,
+`batch_save_track_complete`, `batch_save_physical_status`, and
+`batch_save_summary`. `useSaveStore.saveAll()` must use the streaming resource
+command so physical-file errors are displayed before the process exits.
 
 ### 6.6 Frontend consumption: spawning, buffering, and parsing
 
@@ -913,7 +1272,7 @@ Key points enforced by the current implementation:
   partial output still resolves to a terminal state rather than hanging
   in `"running"` forever.
 - **Cancellation**: `child.pid` is retained in `runState` specifically
-  so `ActionBar.vue`'s "Cancel" button can call `child.kill()`
+  so `AutoCuePanel.vue`'s "Cancel" button can call `child.kill()`
   (`@tauri-apps/plugin-shell`'s `Child.kill()`), transitioning `status`
   to `"cancelled"`. Since `run_batch_pipeline` writes each track's cues
   immediately after that track succeeds (`2-core-spec.md` §8.3),
@@ -943,7 +1302,7 @@ stateDiagram-v2
 
 ### 7.1 Export control
 
-`ActionBar.vue` must render a secondary action button labeled exactly
+`AutoCuePanel.vue` must render a secondary action button labeled exactly
 **Export telemetry** (sentence case) next to the dynamic `analysisStatus`
 message display. This control is subordinate to the primary analysis action
 and must remain hidden or disabled whenever `analysisStatus` is `null`. It

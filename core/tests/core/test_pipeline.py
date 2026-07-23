@@ -173,6 +173,33 @@ class TestRunBatchPipeline:
         with pytest.raises(TrackNotFoundError):
             run_batch_pipeline(SAMPLE_COLLECTION, track_title="Nonexistent")
 
+    def test_processes_explicit_paths_and_skips_unresolved_ones(self, caplog):
+        entry = TrackEntry(
+            title="Resolved",
+            artist="Test",
+            location_path="/music/resolved.flac",
+            tempo=TempoInfo(bpm=120.0),
+            cues=[],
+            grid_anchor_ms=0.0,
+            duration_ms=100_000.0,
+        )
+        with patch(
+            "cuegrid.core.pipeline.NmlParser.find_entry",
+            side_effect=[TrackNotFoundError("missing"), entry],
+        ) as mock_find_entry, patch(
+            "cuegrid.core.pipeline.NmlParser.find_entry_element",
+            return_value=MagicMock(),
+        ), patch("cuegrid.core.pipeline.detect_events", return_value=[]):
+            result = run_batch_pipeline(
+                SAMPLE_COLLECTION,
+                track_paths=["/music/missing.flac", "/music/resolved.flac"],
+            )
+
+        assert mock_find_entry.call_count == 2
+        assert len(result.results) == 1
+        assert result.results[0].entry is entry
+        assert "Skipping unresolved track path" in caplog.text
+
     def test_processes_playlist_by_name(self):
         """Successful batch processing of a playlist."""
         with patch("cuegrid.core.pipeline.detect_events") as mock_detect:

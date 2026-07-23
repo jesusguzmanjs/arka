@@ -3,9 +3,8 @@ defineProps<{
   hasTrack: boolean;
   trackHeaderLabel: string;
   bpmLabel: string;
+  keyLabel?: string;
   remainingLabel: string;
-  cueCount: number;
-  validCueCount: number;
 }>();
 </script>
 
@@ -17,8 +16,8 @@ defineProps<{
     <div class="flex-1" />
     <div class="flex items-center gap-3 text-xs font-mono text-zinc-400">
       <span v-if="bpmLabel"><span class="text-zinc-500">BPM</span> <span class="text-accent">{{ bpmLabel }}</span></span>
-      <span v-if="remainingLabel"><span class="text-zinc-500">LEN</span> <span class="text-zinc-100">{{ remainingLabel }}</span></span>
-      <span v-if="hasTrack"><span class="text-zinc-500">CUES</span> <span class="text-zinc-100">{{ cueCount }}</span><span class="text-zinc-500">/</span><span class="text-accent">{{ validCueCount }} valid</span></span>
+      <span v-if="keyLabel"><span class="text-zinc-500">KEY</span> <span class="text-accent">{{ keyLabel }}</span></span>
+      <span v-if="remainingLabel"><span class="text-zinc-500">TIME</span> <span class="text-zinc-100">{{ remainingLabel }}</span></span>
     </div>
   </div>
 </template>

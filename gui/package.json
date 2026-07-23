@@ -14,9 +14,12 @@
     "@tanstack/vue-virtual": "^3.13.32",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@vue/devtools-api": "^8.1.5",
     "konva": "^9.3.22",
     "peaks.js": "^4.0.0",
+    "pinia": "^4.0.2",
     "vue": "^3.5.13",
     "waveform-data": "^4.5.2",
     "wavesurfer.js": "^7.12.10"

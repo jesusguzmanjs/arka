@@ -17,15 +17,27 @@ from __future__ import annotations
 
 import json
 import logging
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from cuegrid.audio.detector import DetectedEvent, detect_events
+from cuegrid.audio.metadata import (
+    MetadataWriteError,
+    UnsupportedAudioFormatError,
+    write_metadata_to_file,
+)
 from cuegrid.config import AppConfig
 from cuegrid.core.mapping import map_events_to_cues
 from cuegrid.nml.models import CuePoint, TrackEntry
-from cuegrid.nml.parser import BatchTrackRef, NmlParser
+from cuegrid.nml.parser import (
+    AmbiguousTrackError,
+    BatchTrackRef,
+    NmlParser,
+    TrackNotFoundError,
+)
 from cuegrid.nml.writer import NmlWriter
 from cuegrid.telemetry import reset_telemetry_cache
 
@@ -123,6 +135,329 @@ class BatchResult:
     def skipped_count(self) -> int:
         """Count of tracks skipped (detected_events is None)."""
         return sum(1 for r in self.results if r.detected_events is None)
+
+
+_METADATA_TEXT_FIELDS = {
+    "title",
+    "release",
+    "artist",
+    "remixer",
+    "producer",
+    "genre",
+    "label",
+    "comment",
+    "comment2",
+    "lyrics",
+    "mix",
+}
+_METADATA_FIELDS = _METADATA_TEXT_FIELDS | {"rating"}
+
+
+@dataclass
+class MetadataTrackResult:
+    """Outcome of one track in a standalone metadata batch."""
+
+    path: str
+    nml_updated: bool = False
+    physical_file_updated: bool = False
+    error: dict[str, str] | None = None
+
+
+@dataclass
+class MetadataBatchResult:
+    """Ordered outcomes for one metadata batch request."""
+
+    results: list[MetadataTrackResult]
+
+    @property
+    def nml_updated_count(self) -> int:
+        return sum(result.nml_updated for result in self.results)
+
+    @property
+    def physical_file_updated_count(self) -> int:
+        return sum(result.physical_file_updated for result in self.results)
+
+    @property
+    def error_count(self) -> int:
+        return sum(result.error is not None for result in self.results)
+
+
+@dataclass
+class BatchSaveTrackResult:
+    """Outcome for one committed track in a unified GUI save."""
+
+    path: str
+    nml_updated: bool = False
+    physical_file_updated: bool = False
+    error: dict[str, str] | None = None
+
+
+@dataclass
+class BatchSaveResult:
+    results: list[BatchSaveTrackResult]
+
+    @property
+    def nml_updated_count(self) -> int:
+        return sum(result.nml_updated for result in self.results)
+
+    @property
+    def physical_file_updated_count(self) -> int:
+        return sum(result.physical_file_updated for result in self.results)
+
+    @property
+    def error_count(self) -> int:
+        return sum(result.error is not None for result in self.results)
+
+
+def validate_batch_save_payload(
+    payload: object,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Validate the complete final-state track and playlist payload."""
+    if not isinstance(payload, dict) or set(payload) - {"tracks", "playlists"}:
+        raise ValueError("--batch-save must contain only tracks and/or playlists")
+    tracks = payload.get("tracks", [])
+    playlists = payload.get("playlists", [])
+    if not isinstance(tracks, list) or not isinstance(playlists, list) or not (tracks or playlists):
+        raise ValueError("tracks and playlists must be arrays with at least one mutation")
+
+    normalized: list[dict[str, object]] = []
+    paths: set[str] = set()
+    allowed = {"path", "cues", "grid_anchor_ms", "bpm", "metadata"}
+    for item in tracks:
+        if not isinstance(item, dict) or set(item) - allowed or "path" not in item:
+            raise ValueError("every batch track must contain path and only supported fields")
+        path = item["path"]
+        if not isinstance(path, str) or not path.strip() or path in paths:
+            raise ValueError("track paths must be distinct non-empty strings")
+        paths.add(path)
+        if not any(key in item for key in allowed - {"path"}):
+            raise ValueError("every batch track must update at least one field")
+
+        output: dict[str, object] = {"path": path}
+        if "cues" in item:
+            output["cues"] = NmlWriter._validate_manual_cues(item["cues"])
+        if "grid_anchor_ms" in item:
+            grid = item["grid_anchor_ms"]
+            if isinstance(grid, bool) or not isinstance(grid, (int, float)) or grid < 0:
+                raise ValueError("grid_anchor_ms must be finite and non-negative")
+            if not float("-inf") < float(grid) < float("inf"):
+                raise ValueError("grid_anchor_ms must be finite and non-negative")
+            output["grid_anchor_ms"] = float(grid)
+        if "bpm" in item:
+            bpm = item["bpm"]
+            if isinstance(bpm, bool) or not isinstance(bpm, (int, float)):
+                raise ValueError("bpm must be a finite number")
+            output["bpm"] = NmlWriter._validate_bpm(float(bpm))
+        if "metadata" in item:
+            metadata = item["metadata"]
+            if not isinstance(metadata, dict) or not metadata:
+                raise ValueError("metadata must be a non-empty object")
+            _, fields = validate_metadata_update_payload(
+                {"track_paths": [path], "fields": metadata}
+            )
+            output["metadata"] = fields
+        normalized.append(output)
+    normalized_playlists: list[dict[str, object]] = []
+    playlist_uuids: set[str] = set()
+    for item in playlists:
+        if not isinstance(item, dict) or "uuid" not in item or "action" not in item:
+            raise ValueError("every playlist mutation must contain uuid and action")
+        uuid = item["uuid"]
+        action = item["action"]
+        if not isinstance(uuid, str) or not uuid.strip() or uuid in playlist_uuids:
+            raise ValueError("playlist UUIDs must be distinct non-empty strings")
+        if action not in {"update", "delete"}:
+            raise ValueError("playlist action must be update or delete")
+        allowed = {"uuid", "action"} if action == "delete" else {"uuid", "action", "name", "entries"}
+        if set(item) != allowed:
+            raise ValueError(f"playlist {action} mutation has unsupported or missing fields")
+        output: dict[str, object] = {"uuid": uuid, "action": action}
+        if action == "update":
+            name = item["name"]
+            entries = item["entries"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("playlist name must be a non-empty string")
+            if (not isinstance(entries, list) or any(not isinstance(path, str) or not path.strip() for path in entries)
+                    or len(set(entries)) != len(entries)):
+                raise ValueError("playlist entries must be distinct non-empty strings")
+            output["name"] = name.strip()
+            output["entries"] = entries
+        playlist_uuids.add(uuid)
+        normalized_playlists.append(output)
+    return normalized, normalized_playlists
+
+
+def run_batch_save_pipeline(
+    nml_path: str | Path,
+    payload: object,
+    write_to_files: bool = False,
+) -> BatchSaveResult:
+    """Commit all final GUI track state in one NML transaction."""
+    tracks, playlists = validate_batch_save_payload(payload)
+    parser = NmlParser(nml_path)
+    updates: list[tuple[ET.Element, list[dict] | None, float | None, float | None, dict[str, str | int | None] | None]] = []
+    results: list[BatchSaveTrackResult] = []
+    for track in tracks:
+        path = cast(str, track["path"])
+        element = parser.find_entry_element(path)
+        cues = track.get("cues")
+        updates.append((
+            element,
+            [{"hotcue": hotcue, "start_ms": start_ms} for hotcue, start_ms in cast(list[tuple[int, float]], cues)] if cues is not None else None,
+            cast(float | None, track.get("grid_anchor_ms")),
+            cast(float | None, track.get("bpm")),
+            cast(dict[str, str | int | None] | None, track.get("metadata")),
+        ))
+        results.append(BatchSaveTrackResult(path=path))
+
+    playlist_updates: list[tuple[ET.Element, str, str | None, list[str] | None]] = []
+    playlist_nodes = {
+        playlist_el.get("UUID"): node
+        for node in parser.tree.getroot().iter("NODE")
+        if node.get("TYPE") == "PLAYLIST"
+        for playlist_el in [node.find("PLAYLIST")]
+        if playlist_el is not None and playlist_el.get("UUID")
+    }
+    if len(playlist_nodes) != sum(
+        1 for node in parser.tree.getroot().iter("NODE")
+        if node.get("TYPE") == "PLAYLIST" and node.find("PLAYLIST") is not None and node.find("PLAYLIST").get("UUID")
+    ):
+        raise ValueError("playlist UUIDs must be unique in collection.nml")
+    for playlist in playlists:
+        uuid = cast(str, playlist["uuid"])
+        node = playlist_nodes.get(uuid)
+        if node is None:
+            raise ValueError(f"playlist UUID not found: {uuid}")
+        action = cast(str, playlist["action"])
+        entry_keys: list[str] | None = None
+        if action == "update":
+            entry_keys = [NmlWriter._entry_to_primary_key(parser.find_entry_element(path)) for path in cast(list[str], playlist["entries"])]
+        playlist_updates.append((node, action, cast(str | None, playlist.get("name")), entry_keys))
+
+    NmlWriter(parser).write_batch_save(updates, playlist_updates)
+    for result in results:
+        result.nml_updated = True
+
+    if write_to_files:
+        for track, result in zip(tracks, results, strict=True):
+            metadata = cast(dict[str, str | int | None] | None, track.get("metadata"))
+            if metadata is None:
+                continue
+            try:
+                write_metadata_to_file(result.path, metadata)
+            except UnsupportedAudioFormatError as exc:
+                result.error = {"code": "unsupported_audio_format", "message": str(exc)}
+            except MetadataWriteError as exc:
+                result.error = {"code": "physical_write_failed", "message": str(exc)}
+            except Exception as exc:  # Mutagen and filesystem errors must not undo the committed NML.
+                logger.exception("Unexpected physical metadata write failure for %r", result.path)
+                result.error = {"code": "physical_write_failed", "message": str(exc)}
+            else:
+                result.physical_file_updated = True
+    return BatchSaveResult(results=results)
+
+
+def validate_metadata_update_payload(
+    payload: object,
+) -> tuple[list[str], dict[str, str | int | None]]:
+    """Validate the complete JSON contract before any NML mutation."""
+    if not isinstance(payload, dict):
+        raise ValueError("--update-metadata must be a JSON object")
+    if set(payload) != {"track_paths", "fields"}:
+        raise ValueError("metadata payload must contain only track_paths and fields")
+
+    track_paths = payload["track_paths"]
+    if (
+        not isinstance(track_paths, list)
+        or not track_paths
+        or any(not isinstance(path, str) or not path.strip() for path in track_paths)
+    ):
+        raise ValueError("track_paths must be a non-empty array of non-empty strings")
+    if len(set(track_paths)) != len(track_paths):
+        raise ValueError("track_paths must not contain duplicates")
+
+    fields = payload["fields"]
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("fields must be a non-empty object")
+    unknown = set(fields) - _METADATA_FIELDS
+    if unknown:
+        raise ValueError(f"unsupported metadata field(s): {', '.join(sorted(unknown))}")
+
+    normalized: dict[str, str | int | None] = {}
+    for name, value in fields.items():
+        if name == "rating":
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 5
+            ):
+                raise ValueError("rating must be null or an integer between 0 and 5")
+        elif value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string or null")
+        normalized[name] = value
+    return track_paths, normalized
+
+
+def run_metadata_update_pipeline(
+    nml_path: str | Path,
+    payload: object,
+    write_to_files: bool = False,
+    on_track_start: Callable[[MetadataTrackResult, int, int], None] | None = None,
+    on_nml_status: Callable[[MetadataTrackResult], None] | None = None,
+    on_mutagen_status: Callable[[MetadataTrackResult], None] | None = None,
+) -> MetadataBatchResult:
+    """Update NML metadata atomically, then optionally mirror tags to files.
+
+    The NML operation is the source of truth and is committed once for all
+    resolved tracks. Physical tag writes occur only after that commit and are
+    deliberately isolated so an OS file lock cannot roll back or stop the
+    batch.
+    """
+    track_paths, fields = validate_metadata_update_payload(payload)
+    parser = NmlParser(nml_path)
+    results = [MetadataTrackResult(path=path) for path in track_paths]
+    updates: list[tuple[ET.Element, dict[str, str | int | None]]] = []
+
+    for index, result in enumerate(results, start=1):
+        if on_track_start is not None:
+            on_track_start(result, index, len(results))
+        try:
+            element = parser.find_entry_element(result.path)
+        except (TrackNotFoundError, AmbiguousTrackError) as exc:
+            result.error = {"code": "nml_resolution_failed", "message": str(exc)}
+            continue
+        updates.append((element, fields))
+
+    if updates:
+        writer = NmlWriter(parser)
+        writer.write_metadata_batch(updates)
+        for result in results:
+            if result.error is None:
+                result.nml_updated = True
+                if on_nml_status is not None:
+                    on_nml_status(result)
+
+    if not write_to_files:
+        return MetadataBatchResult(results=results)
+
+    for result in results:
+        if not result.nml_updated:
+            continue
+        try:
+            write_metadata_to_file(result.path, fields)
+        except UnsupportedAudioFormatError as exc:
+            result.error = {"code": "unsupported_audio_format", "message": str(exc)}
+            if on_mutagen_status is not None:
+                on_mutagen_status(result)
+        except MetadataWriteError as exc:
+            logger.warning("Physical metadata write failed for %r: %s", result.path, exc)
+            result.error = {"code": "physical_write_failed", "message": str(exc)}
+            if on_mutagen_status is not None:
+                on_mutagen_status(result)
+        else:
+            result.physical_file_updated = True
+            if on_mutagen_status is not None:
+                on_mutagen_status(result)
+
+    return MetadataBatchResult(results=results)
 
 
 def run_pipeline(
@@ -237,6 +572,7 @@ def run_batch_pipeline(
     config: AppConfig | None = None,
     playlist: str | None = None,
     track_title: str | None = None,
+    track_paths: list[str] | None = None,
     artist: str | None = None,
     clear_existing: bool = False,
     on_track_complete: Callable[[BatchTrackResult], None] | None = None,
@@ -244,9 +580,9 @@ def run_batch_pipeline(
     """Run the Grid-Guided Phrase Analysis pipeline for multiple tracks.
 
     Implements ``.openspec/2-spec.md`` section 8.3: batch processing with
-    error isolation. Exactly one of `playlist` or `track_title` must be
-    given. Processes each resolved track sequentially, writing cues
-    immediately after each track succeeds.
+    error isolation. Exactly one of `playlist`, `track_title`, or
+    `track_paths` must be given. Processes each resolved track sequentially,
+    writing cues immediately after each track succeeds.
 
     Args:
         nml_path: Path to the Traktor ``collection.nml`` to read from and
@@ -255,6 +591,9 @@ def run_batch_pipeline(
         playlist: Batch select by Traktor playlist name (spec section 8.1).
         track_title: Batch select by track TITLE (spec section 8.2),
             optionally narrowed by `artist`.
+        track_paths: Batch select by explicit audio paths. Each path is
+            independently resolved, so an unresolved path is logged and does
+            not stop the remaining batch.
         artist: Optional artist filter to narrow `track_title` search
             (spec section 8.2); not allowed together with `playlist`.
         clear_existing: If ``True``, clear existing standard HotCues from
@@ -265,8 +604,8 @@ def run_batch_pipeline(
         No exception from any single track's processing propagates out.
 
     Raises:
-        ValueError: if neither or both of `playlist`/`track_title` are given,
-            or if `artist` is given together with `playlist`.
+        ValueError: if exactly one selection mode is not given, or if `artist`
+            is given together with `playlist`.
         PlaylistNotFoundError: if the playlist name does not exist.
         AmbiguousPlaylistError: if the playlist name matches multiple playlists.
         TrackNotFoundError: if `track_title` matches no entries.
@@ -274,11 +613,15 @@ def run_batch_pipeline(
     config = config or AppConfig()
     reset_telemetry_cache()
 
-    # Validation: exactly one selection mode
-    if (playlist is None and track_title is None) or (
-        playlist is not None and track_title is not None
-    ):
-        raise ValueError("Exactly one of 'playlist' or 'track_title' must be given")
+    # Validation: exactly one selection mode.
+    selection_count = sum(
+        bool(value) if value is track_paths else value is not None
+        for value in (playlist, track_title, track_paths)
+    )
+    if selection_count != 1:
+        raise ValueError(
+            "Exactly one of 'playlist', 'track_title', or 'track_paths' must be given"
+        )
 
     if playlist is not None and artist is not None:
         raise ValueError("'artist' is not allowed together with 'playlist'")
@@ -289,9 +632,19 @@ def run_batch_pipeline(
     batch_refs: list[BatchTrackRef]
     if playlist is not None:
         batch_refs = parser.find_entries_by_playlist(playlist)
-    else:
-        assert track_title is not None
+    elif track_title is not None:
         batch_refs = parser.find_entries_by_title(track_title, artist=artist)
+    else:
+        assert track_paths is not None
+        batch_refs = []
+        for track_path in track_paths:
+            try:
+                entry = parser.find_entry(track_path, artist=artist)
+                element = parser.find_entry_element(track_path, artist=artist)
+            except (TrackNotFoundError, AmbiguousTrackError) as exc:
+                logger.error("Skipping unresolved track path %r: %s", track_path, exc)
+                continue
+            batch_refs.append(BatchTrackRef(entry=entry, element=element))
 
     logger.info("Resolved %d track(s) for batch processing", len(batch_refs))
 

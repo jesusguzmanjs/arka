@@ -70,6 +70,7 @@ const playerState = reactive<PlayerState>({
  * stale Stage 1 muted markers underneath Stage 2's active ones (§4.2 step 4).
  */
 let analysisTeardown: ((targetPath: string | null, force: boolean) => void) | null = null;
+let metadataRefresh: ((editedPaths: readonly string[]) => Promise<void>) | null = null;
 
 /** Register the mounted AudioPlayer's teardown routine for sidecar runs. */
 export function registerAnalysisTeardown(
@@ -87,6 +88,24 @@ export function preparePlayerForAnalysis(
   force: boolean,
 ): void {
   analysisTeardown?.(targetPath, force);
+}
+
+/** Register the mounted player's reset → force-read → rebuild metadata chain. */
+export function registerMetadataRefresh(
+  refresh: (editedPaths: readonly string[]) => Promise<void>,
+): () => void {
+  metadataRefresh = refresh;
+  return () => {
+    if (metadataRefresh === refresh) metadataRefresh = null;
+  };
+}
+
+/** Refresh only when the currently loaded preview was changed by a metadata batch. */
+export async function syncPlayerAfterMetadataMutation(
+  editedPaths: readonly string[],
+): Promise<void> {
+  if (!playerState.loadedTrackPath || !editedPaths.includes(playerState.loadedTrackPath)) return;
+  await metadataRefresh?.(editedPaths);
 }
 
 export function usePlayerState() {

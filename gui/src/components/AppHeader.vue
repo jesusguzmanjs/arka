@@ -18,25 +18,23 @@ const isAuto = computed(() => nmlLabel.value === "auto-discover");
 
 <template>
   <header
-    class="flex items-center justify-between px-6 py-3 bg-panel border-b border-border"
+      class="flex items-center justify-between px-6 py-3 bg-panel border-b border-border select-none"
   >
     <div class="flex items-center gap-2">
       <span class="text-accent text-lg font-semibold tracking-wide">CueGrid</span>
       <span class="text-xs text-dim uppercase tracking-widest">v2.0</span>
     </div>
-    <div class="flex items-center gap-2 text-xs">
-      <span class="text-muted">collection.nml:</span>
-      <span
-        class="flex items-center gap-1.5 font-mono"
-        :class="isAuto ? 'text-warn' : 'text-success'"
+
+    <div
+        class="flex items-center gap-2 px-2.5 py-1 rounded border border-border text-xs font-mono text-muted cursor-help transition-colors hover:bg-white/5"
         :title="isAuto ? 'Path will be auto-discovered at run time' : nmlLabel"
-      >
-        <span
+    >
+      <span
           class="inline-block w-2 h-2 rounded-full"
-          :class="isAuto ? 'bg-warn' : 'bg-success'"
-        />
-        <span class="max-w-[280px] truncate">{{ nmlLabel }}</span>
-      </span>
+          :class="isAuto ? 'bg-warn shadow-[0_0_5px_var(--tw-shadow-color)] shadow-warn/50' : 'bg-success shadow-[0_0_5px_var(--tw-shadow-color)] shadow-success/50'"
+          aria-hidden="true"
+      />
+      <span>Traktor NML</span>
     </div>
   </header>
 </template>

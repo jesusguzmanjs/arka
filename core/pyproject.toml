@@ -9,6 +9,7 @@ description = "Grid-Guided Phrase Analysis: analyzes audio and injects automated
 requires-python = ">=3.10"
 dependencies = [
     "librosa>=0.10",
+    "mutagen>=1.47",
     "numpy>=1.24",
     "soundfile>=0.12",
 ]

@@ -8,6 +8,18 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "dialog:default"
+    "dialog:default",
+    "fs:read-files",
+    "fs:read-dirs",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        {
+          "path": "$DOCUMENT/**"
+        }
+      ]
+    }
   ]
 }

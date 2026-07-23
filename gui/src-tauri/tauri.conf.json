@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "CueGrid",
-        "width": 1024,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 800,
+        "width": 1120,
+        "height": 970,
+        "minWidth": 1024,
+        "minHeight": 970,
         "resizable": true
       }
     ],

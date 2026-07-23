@@ -5,6 +5,12 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use tauri::{Emitter, Manager};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 fn telemetry_cache_path() -> PathBuf {
     std::env::temp_dir()
         .join("cuegrid")
@@ -33,6 +39,15 @@ fn get_core_executable_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 // ----------------------------------------------
 
+fn core_command(core_exe: PathBuf) -> Command {
+    let mut command = Command::new(core_exe);
+
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    command
+}
+
 #[tauri::command]
 async fn cancel_analysis() -> Result<(), String> {
     if let Ok(mut guard) = get_active_process().lock() {
@@ -48,7 +63,7 @@ async fn start_analysis_stream(app: tauri::AppHandle, args: Vec<String>) -> Resu
     // Usamos la función auxiliar
     let core_exe = get_core_executable_path(&app)?;
 
-    let mut child = Command::new(core_exe)
+    let mut child = core_command(core_exe)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -136,7 +151,7 @@ async fn load_track_for_player(
     let core_exe = get_core_executable_path(&app)?;
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(core_exe)
+        core_command(core_exe)
             .arg(track_path)
             .arg("--export-gui")
             .output()
@@ -167,7 +182,7 @@ async fn call_cuegrid_core(app: tauri::AppHandle, args: Vec<String>) -> Result<S
     let core_exe = get_core_executable_path(&app)?;
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(core_exe)
+        core_command(core_exe)
             .args(args) // Inyectamos dinámicamente los argumentos que mande Vue
             .output()
     })
@@ -209,6 +224,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             greet,
             export_last_run_telemetry,

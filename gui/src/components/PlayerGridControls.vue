@@ -5,7 +5,6 @@ defineProps<{
   isGridEditMode: boolean;
   dynamicLabel: string;
   dynamicStepMs: number;
-  hasUnsavedChanges: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -13,8 +12,6 @@ const emit = defineEmits<{
   setToPlayhead: [];
   multiplyBpm: [];
   divideBpm: [];
-  save: [];
-  discard: [];
 }>();
 </script>
 
@@ -25,11 +22,5 @@ const emit = defineEmits<{
     <button type="button" class="text-xs font-semibold px-2 h-full rounded border bg-zinc-800 text-zinc-200 border-zinc-700 hover:bg-zinc-700" title="Sets the grid anchor at the current playhead position." @click="emit('setToPlayhead')">Set to Playhead</button>
     <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Halve BPM" title="Halves the track BPM." @click="emit('divideBpm')">/2</button>
     <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Double BPM" title="Doubles the track BPM." @click="emit('multiplyBpm')">x2</button>
-
-<!--    <template v-if="hasUnsavedChanges">
-      <span class="h-4 w-px bg-zinc-800 mx-0.5" aria-hidden="true" />
-      <button type="button" class="text-xs font-semibold uppercase px-2 h-full rounded bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700" @click="emit('discard')">Discard</button>
-      <button type="button" class="text-xs font-semibold uppercase px-2 h-full rounded bg-primary text-zinc-950 border border-primary hover:bg-accent" @click="emit('save')">Save</button>
-    </template>-->
   </div>
 </template>

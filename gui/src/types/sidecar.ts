@@ -23,6 +23,17 @@ export type SidecarMessage =
       error: string | null;
     }
   | { type: "summary"; total: number; succeeded: number; skipped: number }
+  | { type: "metadata_track_start"; path: string; index: number; total: number }
+  | { type: "metadata_nml_status"; path: string; success: boolean }
+  | { type: "metadata_mutagen_status"; path: string; success: boolean; error: string | null }
+  | {
+      type: "metadata_track_complete";
+      path: string;
+      nml_updated: boolean;
+      physical_file_updated: boolean;
+      error: { code: string; message: string } | null;
+    }
+  | { type: "metadata_summary"; requested: number; nml_updated: number; physical_file_updated: number; errors: number }
   | { type: "fatal_error"; message: string };
 
 // A log entry as stored in useRunState: the original message plus a

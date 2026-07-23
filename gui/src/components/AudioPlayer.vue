@@ -4,13 +4,17 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import Peaks from "peaks.js";
 import { useConfigState } from "../composables/useConfigState";
 import { useLibraryState } from "../composables/useLibraryState";
-import { fetchTrackMetadata, usePlayerState } from "../composables/useTrackMetadata";
+import {
+  fetchTrackMetadata,
+  registerMetadataRefresh,
+  usePlayerState,
+} from "../composables/useTrackMetadata";
 import { useRunState } from "../composables/useRunState";
-import { useCueGridSidecar, type CuePointPayload } from "../composables/useCueGridSidecar";
 import { beatMs, snapToGrid, type GridTrackData } from "../composables/useGridMath";
 import { usePeaksMarkers, type PlayerCue } from "../composables/usePeaksMarkers";
 import { useWaveformSync } from "../composables/useWaveformSync";
 import { usePlayerKeyboard } from "../composables/usePlayerKeyboard";
+import { useSaveStore } from "../stores/useSaveStore";
 import type { SuperJSON } from "../types/trackMetadata";
 import CueContextMenu from "./CueContextMenu.vue";
 import PlayerHeader from "./PlayerHeader.vue";
@@ -25,11 +29,11 @@ const props = defineProps<{ trackPath?: string | null; disabled?: boolean }>();
 const { selectedTrackPath, clearExisting } = useConfigState();
 const { collection, patchTrackInCollection } = useLibraryState();
 const { status, logs } = useRunState();
-const { updateTrackCues } = useCueGridSidecar();
-const { previewCache, isLoadingTrack, setLoadingTrack } = usePlayerState();
+const saveStore = useSaveStore();
+const { previewCache, isLoadingTrack, setLoadingTrack, setLoadedMetadata } = usePlayerState();
 const { createPointMarker, paintAllMarkers, notifyGridAnchorDrag, getGridLines } = usePeaksMarkers(handleGridAnchorDrag);
 
-const EMPTY_TRACK: TrackData = { track_path: "", bpm: 0, grid_anchor_ms: 0, duration_ms: 0, cues: [] };
+const EMPTY_TRACK: TrackData = { track_path: "", bpm: 0, key: "", grid_anchor_ms: 0, duration_ms: 0, cues: [] };
 const MIN_BPM = 50;
 const MAX_BPM = 200;
 const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096];
@@ -49,16 +53,12 @@ const audioRef = ref<HTMLAudioElement | null>(null);
 const waveformRef = ref<WaveformShell | null>(null);
 const currentTime = ref(0);
 const isPlaying = ref(false);
-const isSaving = ref(false);
 const loadError = ref<string | null>(null);
-const hasUnsavedChanges = ref(false);
 const isGridEditMode = ref(false);
 const activeZoomLevelIndex = ref(0);
 const activeCue = ref<PlayerCue | null>(null);
 const activePad = ref<number | null>(null);
 const isAnalysisRunning = computed(() => status.value === "running");
-const hasBpmChanges = computed(() => trackData.value.bpm !== savedBpm.value);
-const hasGridAnchorChanges = computed(() => trackData.value.grid_anchor_ms !== savedGridAnchorMs.value);
 const contextMenu = ref({ visible: false, x: 0, y: 0, cue: null as PlayerCue | null });
 let loadToken = 0;
 let peaksInitToken = 0;
@@ -77,6 +77,21 @@ function finiteNumber(value: unknown): value is number { return typeof value ===
 function isPadIndex(value: number): boolean { return Number.isInteger(value) && value >= 0 && value < PAD_COUNT; }
 function createPeaksWaveformData(data: number[]) { return { json: { version: 2, channels: 1, sample_rate: 11025, samples_per_pixel: 64, bits: 8, length: Math.floor(data.length / 2), data } }; }
 function toCueId(value: unknown): number | null { if (value === null || value === undefined || value === "") return null; const numberValue = Number(value); return Number.isFinite(numberValue) && Number.isInteger(numberValue) ? numberValue : null; }
+function markCurrentTrackDirty(): void {
+  const path = trackData.value.track_path;
+  if (!path) return;
+  patchTrackInCollection(path, {
+    bpm: trackData.value.bpm,
+    grid_anchor_ms: trackData.value.grid_anchor_ms,
+    existing_cues: cueState.value.map((cue) => ({
+      name: `Cue ${cue.id + 1}`,
+      type: "CUE",
+      start_ms: cue.position_ms,
+      hotcue: cue.id,
+    })),
+  });
+  saveStore.markTrackDirty(path);
+}
 watch(isAnalysisRunning, (running) => {
   if (running && isPlaying.value) {
     peaks.value?.player.pause();
@@ -104,23 +119,6 @@ function metadataCuesForTrack(metadata: Awaited<ReturnType<typeof fetchTrackMeta
     return [{ id, position_ms: positionMs, is_valid: Math.abs(positionMs - nearest) <= 1 }];
   });
 }
-function toCuePointPayload(cues: readonly PlayerCue[]): CuePointPayload[] {
-  return cues
-    .filter((cue) => isPadIndex(cue.id) && finiteNumber(cue.position_ms))
-    .map((cue) => {
-      const padNumber = cue.id + 1;
-      return {
-        name: `Cue ${padNumber}`,
-        type: 0,
-        start_ms: Number(cue.position_ms),
-        len_ms: 0.0,
-        repeats: -1,
-        hotcue: padNumber - 1,
-        displ_order: 0,
-      };
-    });
-}
-
 const currentLibraryTrack = computed(() => {
   return trackData.value.track_path
     ? collection.value[trackData.value.track_path]
@@ -128,11 +126,13 @@ const currentLibraryTrack = computed(() => {
 });
 const trackHeaderLabel = computed(() => {
   const track = currentLibraryTrack.value;
-  return track ? `ARTIST: ${track.artist} | TITLE: ${track.title}` : "Track metadata unavailable";
+  return track ? `ARTIST: ${track.artist} - TITLE: ${track.title}` : "Track metadata unavailable";
 });
-const cueCount = computed(() => cueState.value.filter((cue) => cue.id !== undefined && cue.id !== null).length);
-const validCueCount = computed(() => cueState.value.filter((cue) => cue.id !== undefined && cue.id !== null && cue.is_valid).length);
 const bpmLabel = computed(() => trackData.value.bpm > 0 ? trackData.value.bpm.toFixed(1) : "");
+const keyLabel = computed(() => {
+  const track = currentLibraryTrack.value;
+  return track && track.key ? track.key : "";
+});
 const remainingLabel = computed(() => {
   if (!trackData.value.track_path || !trackData.value.duration_ms) return "";
   const remaining = Math.max(0, trackData.value.duration_ms / 1000 - currentTime.value);
@@ -179,7 +179,7 @@ function addCue(padIndex: number): void {
   ) return;
 
   cueState.value = [...cueState.value, { id: padIndex, position_ms: snappedMs, is_valid: true }];
-  hasUnsavedChanges.value = true;
+  markCurrentTrackDirty();
   paintMarkers();
 }
 function deleteCue(padIndex: number): void {
@@ -188,7 +188,7 @@ function deleteCue(padIndex: number): void {
   if (nextCues.length === cueState.value.length) return;
 
   cueState.value = nextCues;
-  hasUnsavedChanges.value = true;
+  markCurrentTrackDirty();
   paintMarkers();
 }
 function toggleGridEditMode(): void {
@@ -203,7 +203,7 @@ function multiplyBpm(): void {
   if (!finiteNumber(currentBpm) || !finiteNumber(nextBpm) || nextBpm < MIN_BPM || nextBpm > MAX_BPM) return;
 
   trackData.value.bpm = nextBpm;
-  hasUnsavedChanges.value = true;
+  markCurrentTrackDirty();
   paintMarkers();
 }
 function divideBpm(): void {
@@ -213,7 +213,7 @@ function divideBpm(): void {
   if (!finiteNumber(currentBpm) || !finiteNumber(nextBpm) || nextBpm < MIN_BPM || nextBpm > MAX_BPM) return;
 
   trackData.value.bpm = nextBpm;
-  hasUnsavedChanges.value = true;
+  markCurrentTrackDirty();
   paintMarkers();
 }
 function shiftGrid(deltaMs: number, dragStartAnchorMs: number | undefined = undefined, repaint = true): void {
@@ -236,7 +236,7 @@ function shiftGrid(deltaMs: number, dragStartAnchorMs: number | undefined = unde
 
   trackData.value.grid_anchor_ms += appliedDelta;
   cueState.value = cueState.value.map((cue) => ({ ...cue, position_ms: cue.position_ms + appliedDelta }));
-  hasUnsavedChanges.value = true;
+  markCurrentTrackDirty();
   if (repaint) paintMarkers();
 }
 function updateActiveZoomLevelIndex(currentZoom: number): void {
@@ -370,7 +370,7 @@ function wireDragEvents(): void {
     if (!cue || !cue.is_valid) return;
     const snapped = snap(event.point.time);
     instance.points.getPoint(event.point.id)?.update({ time: snapped / 1000 });
-    if (cue.position_ms !== snapped) { cue.position_ms = snapped; hasUnsavedChanges.value = true; }
+    if (cue.position_ms !== snapped) { cue.position_ms = snapped; markCurrentTrackDirty(); }
   });
 }
 
@@ -447,12 +447,12 @@ function handleZoomWheel(event: WheelEvent): void {
   view.setStartTime(Math.max(0, Math.min(timeAtCursor - ratio * actualSeconds, totalSeconds - actualSeconds)));
 }
 
-async function saveChanges(): Promise<void> {
+/* Historical note: local persistence is intentionally disabled; global save owns persistence.
   if (!trackData.value.track_path) return;
   isSaving.value = true; loadError.value = null;
   try {
     const cuePoints = toCuePointPayload(cueState.value);
-    const result = await updateTrackCues(
+    const result = await legacyCueCommit(
       trackData.value.track_path,
       cuePoints,
       hasGridAnchorChanges.value ? trackData.value.grid_anchor_ms : undefined,
@@ -463,7 +463,7 @@ async function saveChanges(): Promise<void> {
     trackData.value.cues = JSON.parse(JSON.stringify(cueState.value));
     savedBpm.value = trackData.value.bpm;
     savedGridAnchorMs.value = trackData.value.grid_anchor_ms;
-    hasUnsavedChanges.value = false;
+    legacyDirtyState.value = false;
 
     patchTrackInCollection(trackData.value.track_path, {
       bpm: trackData.value.bpm,
@@ -504,9 +504,9 @@ function discardChanges(): void {
   setCueState(trackData.value.cues);
   trackData.value.bpm = savedBpm.value;
   trackData.value.grid_anchor_ms = savedGridAnchorMs.value;
-  hasUnsavedChanges.value = false;
+  legacyDirtyState.value = false;
   try { paintMarkers(); } catch (error) { console.error("[AudioPlayer] marker repaint failed:", error); }
-}
+*/
 
 async function loadTrack(path: string): Promise<void> {
   const trimmed = path.trim(); if (!trimmed) return;
@@ -521,25 +521,40 @@ async function loadTrack(path: string): Promise<void> {
     const metadata = metadataResult.metadata;
     savedBpm.value = metadata.bpm;
     previewCache.value.set(trimmed, metadata);
+    setLoadedMetadata(trimmed, metadata);
     currentPreview.value = metadata;
     const metadataCues = metadataCuesForTrack(metadata);
     const metadataDuration = Number((metadata as unknown as { duration_ms?: unknown }).duration_ms) || 0;
-    trackData.value = { track_path: trimmed, bpm: metadata.bpm || 0, grid_anchor_ms: metadata.grid_anchor_ms || 0, duration_ms: metadataDuration, cues: metadataCues };
+    const metadataKey = typeof (metadata as unknown as { key?: unknown }).key === "string"
+      ? (metadata as unknown as { key: string }).key
+      : "";
+    trackData.value = { track_path: trimmed, bpm: metadata.bpm || 0, key: metadataKey, grid_anchor_ms: metadata.grid_anchor_ms || 0, duration_ms: metadataDuration, cues: metadataCues };
     savedGridAnchorMs.value = trackData.value.grid_anchor_ms;
-    setCueState(metadataCues); hasUnsavedChanges.value = false; isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
+    setCueState(metadataCues); isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
     await nextTick(); if (token !== loadToken) return;
     await initPeaks();
   } catch (error) {
     if (token !== loadToken) return;
     loadError.value = error instanceof Error ? error.message : String(error);
-    trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; currentPreview.value = null; cueState.value = []; hasUnsavedChanges.value = false; isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
+    trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; currentPreview.value = null; cueState.value = []; isGridEditMode.value = false; activeZoomLevelIndex.value = 0;
     await destroyPeaks();
   } finally { if (token === loadToken) setLoadingTrack(false); }
 }
 
-defineExpose({ loadTrack });
+async function resetPlayerState(): Promise<void> {
+  const currentPath = trackData.value.track_path || selectedTrackPath.value;
+  if (!currentPath) return;
+  previewCache.value.delete(currentPath);
+  await loadTrack(currentPath);
+}
+
+const unregisterMetadataRefresh = registerMetadataRefresh(async () => {
+  await resetPlayerState();
+});
+
+defineExpose({ loadTrack, resetPlayerState });
 onMounted(() => { const initialPath = props.trackPath ?? selectedTrackPath.value; if (initialPath) void loadTrack(initialPath); });
-onBeforeUnmount(() => { loadToken += 1; void destroyPeaks(); });
+onBeforeUnmount(() => { unregisterMetadataRefresh(); loadToken += 1; void destroyPeaks(); });
 
 watch(status, async (nextStatus, previousStatus) => {
   if (nextStatus !== "success" || previousStatus !== "running" || !trackData.value.track_path) return;
@@ -564,7 +579,6 @@ watch(status, async (nextStatus, previousStatus) => {
 
     trackData.value.cues = merged;
     setCueState(merged);
-    hasUnsavedChanges.value = false;
 
     // ACTUALIZACIÓN DE CACHÉ: Sobreescribimos la memoria de Vue en vivo
     // para que si el usuario redimensiona la ventana no reaparezcan los fantasmas
@@ -584,20 +598,20 @@ watch(status, async (nextStatus, previousStatus) => {
 watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
   if (next === previous) return;
   if (next) void loadTrack(next);
-  else { trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; cueState.value = []; hasUnsavedChanges.value = false; loadError.value = null; setLoadingTrack(false); void destroyPeaks(); }
+  else { trackData.value = { ...EMPTY_TRACK }; savedBpm.value = EMPTY_TRACK.bpm; savedGridAnchorMs.value = EMPTY_TRACK.grid_anchor_ms; cueState.value = []; loadError.value = null; setLoadingTrack(false); void destroyPeaks(); }
 });
 </script>
 
 <template>
   <section class="bg-zinc-900 border border-zinc-800 rounded-md p-2 flex flex-col gap-2 select-none overflow-y-auto">
-    <PlayerHeader :has-track="Boolean(trackData.track_path)" :track-header-label="trackHeaderLabel" :bpm-label="bpmLabel" :remaining-label="remainingLabel" :cue-count="cueCount" :valid-cue-count="validCueCount" />
+    <PlayerHeader :has-track="Boolean(trackData.track_path)" :track-header-label="trackHeaderLabel" :bpm-label="bpmLabel" :remaining-label="remainingLabel" :key-label="keyLabel"/>
     <div v-if="loadError" class="text-xs font-mono text-red-500 bg-zinc-950 border border-zinc-800 rounded px-2 py-1">{{ loadError }}</div>
     <audio ref="audioRef" class="hidden" preload="none" aria-hidden="true" />
     <div
         class="transition-opacity duration-300 flex-1 min-h-0 flex flex-col"
         :class="{ 'opacity-50 pointer-events-none grayscale': isAnalysisRunning }"
         >
-    <PlayerWaveform ref="waveformRef" :has-track="Boolean(trackData.track_path)" :is-loading="isLoadingTrack" :is-saving="isSaving" :track-css-gradient="trackCssGradient" @resize="handleWaveformResize" @wheel="handleZoomWheel" @zoom-in="zoomIn" @zoom-out="zoomOut" />
+    <PlayerWaveform ref="waveformRef" :has-track="Boolean(trackData.track_path)" :is-loading="isLoadingTrack" :is-saving="saveStore.isSaving" :track-css-gradient="trackCssGradient" @resize="handleWaveformResize" @wheel="handleZoomWheel" @zoom-in="zoomIn" @zoom-out="zoomOut" />
         </div>
     <div
         class="transition-opacity duration-300 shrink-0 flex items-center gap-2"
@@ -625,13 +639,10 @@ watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
           :is-grid-edit-mode="isGridEditMode"
           :dynamic-label="nudgeResolution.label"
           :dynamic-step-ms="dynamicNudgeMs"
-          :has-unsaved-changes="hasUnsavedChanges"
           @nudge="shiftGrid"
           @set-to-playhead="setGridToPlayhead"
           @multiply-bpm="multiplyBpm"
           @divide-bpm="divideBpm"
-          @save="saveChanges"
-          @discard="discardChanges"
       />
 
       <button
@@ -645,12 +656,6 @@ watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
       >
         {{ isGridEditMode ? 'Exit Grid Edit' : 'Edit Grid' }}
       </button>
-    </div>
-    <div class="flex items-center gap-2 px-1">
-      <span class="text-xs font-mono" :class="hasUnsavedChanges ? 'text-warning' : 'text-zinc-500'">{{ hasUnsavedChanges ? "● Unsaved changes" : "Synced" }}</span>
-      <div class="flex-1" />
-      <button v-if="hasUnsavedChanges" type="button" class="text-xs font-semibold uppercase px-3 py-1 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 hover:bg-zinc-700 cursor-pointer" @click="discardChanges">Discard</button>
-      <button v-if="hasUnsavedChanges" type="button" class="text-xs font-semibold uppercase px-3 py-1 rounded bg-primary text-zinc-950 border border-primary hover:bg-accent cursor-pointer" @click="saveChanges">Save Changes</button>
     </div>
     <CueContextMenu :x="contextMenu.x" :y="contextMenu.y" :visible="contextMenu.visible" @close="closeContextMenu" @delete="deleteSelectedCue" />
   </section>

@@ -240,6 +240,91 @@ class TestWriteCues:
         ET.parse(working_nml)
 
 
+class TestBatchMetadataUpdates:
+    def test_updates_standard_metadata_in_one_atomic_write(self, working_nml):
+        parser = NmlParser(working_nml)
+        entry = parser.find_entry_element(KNOWN_TRACK_PATH)
+
+        NmlWriter(parser).write_metadata_batch(
+            [
+                (
+                    entry,
+                    {
+                        "title": "Updated title",
+                        "release": "Updated release",
+                        "artist": "Updated artist",
+                        "remixer": "Remixer",
+                        "producer": "Producer",
+                        "genre": "Techno",
+                        "label": "Label",
+                        "comment": "Comment",
+                        "comment2": "Comment 2",
+                        "lyrics": "Lyrics",
+                        "mix": "Extended",
+                        "rating": 4,
+                    },
+                )
+            ]
+        )
+
+        updated = NmlParser(working_nml).find_entry(KNOWN_TRACK_PATH)
+        assert updated.title == "Updated title"
+        assert updated.artist == "Updated artist"
+        assert updated.album == "Updated release"
+        assert updated.remixer == "Remixer"
+        assert updated.producer == "Producer"
+        assert updated.comment2 == "Comment 2"
+        assert updated.rating == 4
+        assert len(_backup_files(working_nml)) == 1
+
+    def test_null_metadata_values_remove_existing_attributes(self, working_nml):
+        parser = NmlParser(working_nml)
+        entry = parser.find_entry_element(KNOWN_TRACK_PATH)
+        info = entry.find("INFO")
+        assert info is not None
+        info.set("GENRE", "Techno")
+        info.set("RANKING", "255")
+
+        NmlWriter(parser).write_metadata_batch(
+            [(entry, {"genre": None, "rating": None})]
+        )
+
+        reparsed_info = NmlParser(working_nml).find_entry_element(KNOWN_TRACK_PATH).find("INFO")
+        assert reparsed_info is not None
+        assert reparsed_info.get("GENRE") is None
+        assert reparsed_info.get("RANKING") is None
+
+
+class TestBatchPlaylistMutations:
+    def test_updates_and_deletes_playlists_in_one_atomic_write(self, working_nml):
+        parser = NmlParser(working_nml)
+        subnodes = NmlWriter(parser)._root_playlist_subnodes()
+        updated_node = ET.SubElement(subnodes, "NODE", TYPE="PLAYLIST", NAME="Before")
+        updated_playlist = ET.SubElement(
+            updated_node, "PLAYLIST", ENTRIES="0", TYPE="LIST", UUID="a" * 32
+        )
+        deleted_node = ET.SubElement(subnodes, "NODE", TYPE="PLAYLIST", NAME="Delete me")
+        ET.SubElement(deleted_node, "PLAYLIST", ENTRIES="0", TYPE="LIST", UUID="b" * 32)
+        entry_key = NmlWriter._entry_to_primary_key(parser.find_entry_element(KNOWN_TRACK_PATH))
+
+        NmlWriter(parser).write_batch_save(
+            [],
+            [
+                (updated_node, "update", "After", [entry_key]),
+                (deleted_node, "delete", None, None),
+            ],
+        )
+
+        tree = ET.parse(working_nml)
+        nodes = tree.getroot().findall(".//NODE[@TYPE='PLAYLIST']")
+        updated = next(node for node in nodes if node.get("NAME") == "After")
+        playlist = updated.find("PLAYLIST")
+        assert playlist is not None and playlist.get("ENTRIES") == "1"
+        assert playlist.find("./ENTRY/PRIMARYKEY").get("KEY") == entry_key
+        assert not any(node.get("NAME") == "Delete me" for node in nodes)
+        assert len(_backup_files(working_nml)) == 1
+
+
 class TestManualCueAndGridUpdates:
     def test_updates_hotcue_and_single_grid_anchor_atomically(self, working_nml):
         NmlWriter(NmlParser(working_nml)).update_track_hotcues(

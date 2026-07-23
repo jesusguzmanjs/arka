@@ -1366,9 +1366,20 @@ not part of the Library Browser data path.
 export interface CollectionTrack {
   artist: string;
   title: string;
+  album: string;
+  remixer: string;
+  producer: string;
+  genre: string;
+  label: string;
+  comment: string;
+  comment2: string;
+  lyrics: string;
+  mix: string;
+  rating: number;
   location_path: string;
   bpm: number | null;
   grid_anchor_ms: number | null;
+  key: string | null;
   duration_ms: number | null;
   is_flex_grid: boolean;
   existing_cues: ExistingCue[];
@@ -1400,6 +1411,22 @@ this declaration does not create a second cue representation. Runtime payload
 validation must reject a malformed payload or a `track_paths` reference that
 does not exist in `collection` rather than rendering partial, inconsistent
 library state.
+
+#### 9.1.1 Complete initial metadata payload
+
+The first successful `--get-library` response is the complete metadata source
+for the Library Browser. Each `CollectionTrack` must include all metadata
+properties declared in section 9.1, even when their NML source is absent. The
+eleven text properties (`artist`, `title`, `album`, `remixer`, `producer`,
+`genre`, `label`, `comment`, `comment2`, `lyrics`, and `mix`) are strings;
+absence is represented by `""`. `rating` is a number from `0` through `5`.
+
+The table model must read these fields directly from the installed collection
+dictionary. It must not make a per-track metadata request, derive a value from
+another field, or wait for track preview metadata before a column can display
+its value. Visible-column selection remains a presentation concern; this
+contract guarantees that every editable metadata column is available
+immediately after the initial library load.
 
 ### 9.2 Lookup-only view derivation
 
@@ -1438,3 +1465,79 @@ When a user selects a resolved track for preview, `selectedTrackPath` remains
 the normalized `location_path`. `AudioPlayer.vue` and mutation actions look up
 the authoritative metadata from `collection[selectedTrackPath]`; no change is
 made to their path-based bridge contract.
+
+### 9.4 Tracklist columns, sorting, and resizing (v1.3)
+
+This section supersedes the right-column table-column requirements in section
+3.5. The tracklist has six columns, in this order: the existing narrow,
+unlabelled **Action** column, then **Artist**, **Title**, **BPM**, **Key**, and
+**Duration**. `Key` renders `CollectionTrack.key`; an absent NML key renders
+as an empty cell. `Duration` renders the existing `duration_ms` value in a
+human-readable duration format. `Artist`, `Title`, `BPM`, `Key`, and
+`Duration` are visible metadata columns; `location_path` remains an internal
+bridge value and is never rendered.
+
+The obsolete **GRID** column is removed. Flex Grid status is already conveyed
+by the disabled-row treatment and the accessible tooltip defined in section
+3.3.1, so no separate Grid cell or header is rendered.
+
+#### 9.4.1 Local sorting
+
+Clicking a sortable metadata header (`Artist`, `Title`, `BPM`, `Key`, or
+`Duration`) anywhere within its header cell sorts the currently visible track
+rows locally by that field. The resize handle is the only excluded hit target.
+The first click selects that field in ascending order; clicking the active
+header cycles to descending order and then back to the unsorted source order.
+The Action column is not sortable. Sorting does not mutate the received
+collection, playlist `track_paths`, or selected row state.
+
+The chosen sort field and direction are browser-level table state, not
+playlist-local state: changing playlists, selecting Global Collection, or
+refreshing the visible source must preserve the active sort state and apply it
+to the new visible rows. When no header has been selected, rows retain the
+source ordering specified in section 9.2.
+
+#### 9.4.2 Resizable columns
+
+Each visible table column has a drag handle on its header boundary. Dragging a
+handle resizes the adjacent column width while retaining the table within its
+right-column container and respecting implementation-defined sensible minimum
+widths. The table remains `table-layout: fixed`; row content must truncate or
+otherwise overflow safely rather than forcing a resized column wider. Header
+and body cells use the same width model so alignment is maintained during and
+after a drag. Every resizable boundary is rendered as a persistently visible
+yellow separator; hover may strengthen the affordance but must not be required
+to reveal it. Column-width persistence beyond the mounted browser instance is
+not required by this version.
+
+#### 9.4.3 Alignment and header boundary
+
+All tracklist headers and their corresponding data cells use left alignment,
+including BPM and Duration. The header strip has a persistently visible
+top-and-bottom boundary treatment in the dark theme; its extent must remain
+clear without relying on hover state.
+
+### 9.5 Auto Cue row selection (current UI contract)
+
+`useLibraryState()` additionally owns `selectedLibraryPaths: string[]`. It is
+the complete set of selected table-row `location_path` values and is the sole
+source for selected-track Auto Cue processing. It is not derived from, copied
+to, or otherwise coupled with `selectedTrackPath`.
+
+`selectedTrackPath` continues to identify only the track loaded in
+`AudioPlayer.vue`; double-clicking a row calls `selectTrackForPreview` and
+does not change the Auto Cue selection. A single row click replaces the
+selection, Ctrl/Cmd-click toggles the clicked row, and Shift-click selects the
+inclusive range between the last selected row and the clicked row in the
+current visible track ordering. No checkbox selection UI is used.
+
+The table renders a standard selected-row highlight for paths in
+`selectedLibraryPaths`. Its styling is distinct from the preview/player
+indicator so a DJ can see both states at once. Context changes and library
+refreshes prune selected paths that are no longer valid; context changes clear
+the selection. They must not clear a valid player preview.
+
+The Library Browser footer contains no Auto Cue controls. `ActionBar` in the
+bottom **AUTO CUE** rack renders **Auto Cue Selected** whenever the selection
+is non-empty, otherwise **Auto Cue Playlist** for the active playlist. The
+control is disabled if neither target is available or while a run is active.

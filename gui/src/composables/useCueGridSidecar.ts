@@ -14,24 +14,22 @@ import { useAnalysisSession } from "./useAnalysisSession";
 import { preparePlayerForAnalysis } from "./useTrackMetadata";
 import type { CueGridConfig } from "../types/config";
 import type { SidecarMessage } from "../types/sidecar";
-
-export interface CuePointPayload {
-  name: string;
-  type: 0;
-  start_ms: number;
-  len_ms: 0.0;
-  repeats: -1;
-  hotcue: number;
-  displ_order: 0;
-}
+import type {
+  SmartPlaylistCompileResult,
+  SmartPlaylistPayload,
+} from "../types/smartPlaylist";
 
 /**
  * Builds the argv array for the sidecar directly from CueGridConfig.
  */
-function buildArgs(cfg: CueGridConfig, target: "track" | "playlist"): string[] {
+function buildArgs(
+  cfg: CueGridConfig,
+  target: "track" | "playlist",
+  selectedLibraryPaths: readonly string[] = [],
+): string[] {
   const args: string[] = [];
   if (target === "track") {
-    args.push(cfg.selectedTrackPath!);
+    args.push(...(selectedLibraryPaths.length > 0 ? selectedLibraryPaths : [cfg.selectedTrackPath!]));
   } else {
     args.push("--playlist", cfg.selectedPlaylist!);
   }
@@ -46,6 +44,7 @@ function buildArgs(cfg: CueGridConfig, target: "track" | "playlist"): string[] {
 
 // Almacena los des-registradores de eventos para limpiarlos al cerrar el proceso
 let unlistens: UnlistenFn[] = [];
+let resolveActiveRun: ((succeeded: boolean) => void) | null = null;
 
 function cleanupListeners() {
   unlistens.forEach((u) => u());
@@ -63,7 +62,7 @@ export function useCueGridSidecar() {
   } = useConfigState();
   const {
     startRun,
-    pushLog,
+    handleMessage,
     finishRun,
     currentPid,
     setAnalysisStatus,
@@ -80,11 +79,20 @@ export function useCueGridSidecar() {
     await runAnalysis("track", trackPath, trackTitle);
   }
 
+  async function runSelectedTracks(
+    tracks: readonly Pick<{ location_path: string; title: string }, "location_path" | "title">[],
+  ): Promise<void> {
+    if (tracks.length === 0) return;
+    const trackPaths = tracks.map((track) => track.location_path);
+    await runAnalysis("track", trackPaths[0], `${tracks.length} selected tracks`, trackPaths);
+  }
+
   async function runAnalysis(
     target: "track" | "playlist",
     targetValue: string,
     successLabel: string,
-  ): Promise<void> {
+    selectedLibraryPaths: readonly string[] = [],
+  ): Promise<boolean> {
     clearSession();
     preparePlayerForAnalysis(target === "track" ? targetValue : null, target === "playlist");
 
@@ -99,6 +107,9 @@ export function useCueGridSidecar() {
 
     cleanupListeners();
     let lastSummary: RunSummary | null = null;
+    const completion = new Promise<boolean>((resolve) => {
+      resolveActiveRun = resolve;
+    });
 
     // 1. Escuchar el STDOUT de Rust en tiempo real
     const unlistenStdout = await listen<string>("analysis-stdout", (event) => {
@@ -109,9 +120,9 @@ export function useCueGridSidecar() {
         if (msg.type === "summary") {
           lastSummary = { total: msg.total, succeeded: msg.succeeded, skipped: msg.skipped };
         }
-        pushLog(msg);
+        handleMessage(msg);
       } catch {
-        pushLog({ type: "log", level: "error", message: line });
+        handleMessage({ type: "log", level: "error", message: line });
       }
     });
     unlistens.push(unlistenStdout);
@@ -120,7 +131,7 @@ export function useCueGridSidecar() {
     const unlistenStderr = await listen<string>("analysis-stderr", (event) => {
       const text = event.payload.trim();
       if (!text) return;
-      pushLog({ type: "log", level: "error", message: text });
+      handleMessage({ type: "log", level: "error", message: text });
     });
     unlistens.push(unlistenStderr);
 
@@ -132,9 +143,11 @@ export function useCueGridSidecar() {
 
       if (succeeded) {
         captureRun(logSnapshot());
-        setAnalysisStatus(`${successLabel} analyzed successfully`);
+        setAnalysisStatus(`${successLabel} Auto Cue complete`);
       }
       finishRun(succeeded ? "success" : "error", lastSummary ?? undefined);
+      resolveActiveRun?.(succeeded);
+      resolveActiveRun = null;
     });
     unlistens.push(unlistenClose);
 
@@ -142,12 +155,15 @@ export function useCueGridSidecar() {
     try {
       startRun();
       currentPid.value = 99999; // Mock PID (la cancelación ahora va por backend)
-      await invoke("start_analysis_stream", { args: buildArgs(cfg, target) });
+      await invoke("start_analysis_stream", { args: buildArgs(cfg, target, selectedLibraryPaths) });
     } catch (err) {
       cleanupListeners();
-      pushLog({ type: "log", level: "error", message: `Failed to start stream: ${String(err)}` });
+      handleMessage({ type: "log", level: "error", message: `Failed to start stream: ${String(err)}` });
       finishRun("error");
+      resolveActiveRun?.(false);
+      resolveActiveRun = null;
     }
+    return completion;
   }
 
   /** Snapshot of the current run's full NDJSON log, for captureRun(). */
@@ -155,20 +171,17 @@ export function useCueGridSidecar() {
     return useRunState().logs.value.map((l) => l.msg);
   }
 
-  /**
-   * Actualiza los cues en lote usando el puente genérico call_cuegrid_core (one-shot).
-   */
-  async function updateTrackCues(
-    trackPath: string,
-    cues: CuePointPayload[],
-    newGridAnchorMs?: number,
-    newBpm?: number,
+  async function batchSave(
+    payload: {
+      tracks: readonly Record<string, unknown>[];
+      playlists: readonly Record<string, unknown>[];
+    },
+    writeToFiles: boolean,
   ): Promise<{ ok: boolean; error?: string }> {
-    const args = [trackPath, "--update-cues", JSON.stringify(cues)];
-    if (newGridAnchorMs !== undefined) args.push("--grid-anchor", String(newGridAnchorMs));
-    if (newBpm !== undefined) args.push("--bpm", String(newBpm));
+    const args = ["--batch-save", JSON.stringify(payload)];
+    if (writeToFiles) args.push("--write-to-files");
     if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
-
+    args.push("--json");
     try {
       await invoke("call_cuegrid_core", { args });
       return { ok: true };
@@ -177,23 +190,58 @@ export function useCueGridSidecar() {
     }
   }
 
-  /**
-   * Elimina un cue específico usando el puente genérico call_cuegrid_core (one-shot).
-   */
-  async function deleteCue(
-    trackPath: string,
-    hotcueIndex: number,
-    title?: string,
-    artist?: string,
-  ): Promise<{ ok: boolean; error?: string }> {
-    const args = [trackPath, "--delete-cue", String(hotcueIndex)];
+  async function compileSmartPlaylist(
+    payload: SmartPlaylistPayload,
+  ): Promise<{ ok: true; result: SmartPlaylistCompileResult } | { ok: false; error: string }> {
+    const args = ["--compile-smart-playlist", JSON.stringify(payload), "--json"];
     if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
-    if (title) args.push("--title", title);
-    if (artist) args.push("--artist", artist);
 
     try {
-      await invoke("call_cuegrid_core", { args });
-      return { ok: true };
+      const stdout = await invoke<string>("call_cuegrid_core", { args });
+      const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const response = JSON.parse(lines[lines.length - 1] ?? "") as {
+        ok?: boolean;
+        error?: unknown;
+        result?: Partial<SmartPlaylistCompileResult>;
+      } & Partial<SmartPlaylistCompileResult>;
+      if (response.ok === false) {
+        return {
+          ok: false,
+          error: typeof response.error === "string"
+            ? response.error
+            : "Core could not compile the Smart Playlist.",
+        };
+      }
+      const compiled = response.result ?? response;
+      if (
+        compiled.type !== "smart_playlist_compiled" ||
+        typeof compiled.name !== "string" ||
+        typeof compiled.matched !== "number" ||
+        typeof compiled.uuid !== "string"
+      ) {
+        return { ok: false, error: "Core returned an invalid Smart Playlist response." };
+      }
+      return { ok: true, result: compiled as SmartPlaylistCompileResult };
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  async function createStaticPlaylist(
+    payload: { name: string; entries: string[] },
+  ): Promise<{ ok: true; result: { type: "static_playlist_created"; name: string; entries: number; uuid: string } } | { ok: false; error: string }> {
+    const args = ["--create-static-playlist", JSON.stringify(payload), "--json"];
+    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
+    try {
+      const stdout = await invoke<string>("call_cuegrid_core", { args });
+      const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const response = JSON.parse(lines[lines.length - 1] ?? "") as unknown;
+      if (typeof response !== "object" || response === null) throw new Error("Core returned an invalid playlist response.");
+      const result = response as { type?: unknown; name?: unknown; entries?: unknown; uuid?: unknown; error?: unknown };
+      if (result.type !== "static_playlist_created" || typeof result.name !== "string" || typeof result.entries !== "number" || typeof result.uuid !== "string") {
+        return { ok: false, error: typeof result.error === "string" ? result.error : "Core could not create the playlist." };
+      }
+      return { ok: true, result: result as { type: "static_playlist_created"; name: string; entries: number; uuid: string } };
     } catch (error) {
       return { ok: false, error: String(error) };
     }
@@ -230,6 +278,8 @@ export function useCueGridSidecar() {
     } finally {
       cleanupListeners();
       finishRun("cancelled");
+      resolveActiveRun?.(false);
+      resolveActiveRun = null;
     }
   }
 
@@ -247,5 +297,5 @@ export function useCueGridSidecar() {
     useRunState().reset();
   }
 
-  return { run, runSingleTrack, deleteCue, cancel, exportTelemetry, resetRun, updateTrackCues, discoverAndSetDefaultNml, nmlPathOverride };
+  return { run, runSingleTrack, runSelectedTracks, batchSave, compileSmartPlaylist, createStaticPlaylist, cancel, exportTelemetry, resetRun, discoverAndSetDefaultNml, nmlPathOverride };
 }

@@ -48,6 +48,17 @@ class TrackEntry:
     duration_ms: float = (
         0.0  # from <INFO PLAYTIME_FLOAT="..."> * 1000; bounds candidate generation
     )
+    key: str | None = None  # from <INFO KEY="...">; None if absent or empty
+    album: str = ""  # from <ALBUM TITLE="...">
+    remixer: str = ""  # from <INFO REMIXER="...">
+    producer: str = ""  # from <INFO PRODUCER="...">
+    genre: str = ""  # from <INFO GENRE="...">
+    label: str = ""  # from <INFO LABEL="...">
+    comment: str = ""  # from <INFO COMMENT="...">
+    comment2: str = ""  # from <INFO RATING="..."> (Traktor Comment 2)
+    lyrics: str = ""  # from <INFO KEY_LYRICS="...">
+    mix: str = ""  # from <INFO MIX="...">
+    rating: int = 0  # from <INFO RANKING="..."> mapped from 0-255 to 0-5
     peak_db: float | None = None  # from <LOUDNESS PEAK_DB="...">; None if absent
     perceived_db: float | None = (
         None  # from <LOUDNESS PERCEIVED_DB="...">; None if absent
