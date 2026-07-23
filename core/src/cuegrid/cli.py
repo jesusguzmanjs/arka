@@ -1086,7 +1086,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         try:
-            payload = NmlParser(nml_path).get_library()
+            parser = NmlParser(nml_path)
+            NmlWriter(parser)._backup_if_needed()
+            payload = parser.get_library()
         except DuplicateLocationError as exc:
             print(
                 json.dumps(

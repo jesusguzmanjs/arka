@@ -7,6 +7,8 @@ import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from typing import Any, Mapping
 
+from cuegrid.nml.parser import TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY, normalize_to_open_key
+
 TrackData = Mapping[str, Any] | ET.Element
 Rule = Mapping[str, Any]
 
@@ -60,9 +62,9 @@ def matches_rule(track: TrackData, rule: Rule, *, today: date | None = None) -> 
     if field in _STRING_FIELDS:
         return _match_string(_text_value(track, field), operator, rule.get("value"))
     if field == "key":
-        if operator not in {"is_exactly", "equals"}:
-            raise ValueError("key supports only is_exactly or equals")
-        return _match_key(_text_value(track, field), rule.get("value"))
+        if operator not in {"is_exactly", "equals", "contains", "does_not_contain"}:
+            raise ValueError("unsupported key operator: %r" % operator)
+        return _match_key(_key_value(track), operator, rule.get("value"))
     if field in _DATE_FIELDS:
         return _match_date(_date_value(track, field), operator, rule.get("value"), today or date.today())
     return _match_rating(_numeric_value(track, "rating"), operator, rule.get("value"))
@@ -124,16 +126,18 @@ def _match_string(actual: str, operator: str, value: Any) -> bool:
     raise ValueError(f"unsupported string operator: {operator!r}")
 
 
-def _match_key(actual: str, value: Any) -> bool:
-    """Match one normalized NML key against comma-separated exact targets."""
+def _match_key(actual: str, operator: str, value: Any) -> bool:
+    """Evaluate a key rule after resolving both operands to Open Key."""
     targets = [
-        target.strip().casefold()
+        normalize_to_open_key(target)
         for target in _required_text(value).split(",")
         if target.strip()
     ]
-    if not targets:
-        raise ValueError("key value must contain at least one non-empty key")
-    return actual.strip().casefold() in targets
+    if not targets or any(not target for target in targets):
+        raise ValueError("key values must use valid Open Key notation")
+
+    matches = normalize_to_open_key(actual) in targets
+    return not matches if operator == "does_not_contain" else matches
 
 
 def _match_date(actual: date | None, operator: str, value: Any, today: date) -> bool:
@@ -178,6 +182,24 @@ def _numeric_value(track: TrackData, field: str) -> float:
 def _text_value(track: TrackData, field: str) -> str:
     raw = _attribute(track, field)
     return raw.strip() if isinstance(raw, str) else ""
+
+
+def _key_value(track: TrackData) -> str:
+    """Resolve a track key with the same native-first policy as ``NmlParser``."""
+    if isinstance(track, ET.Element):
+        musical_key_el = track.find("MUSICAL_KEY")
+        if musical_key_el is not None:
+            try:
+                resolved = TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY.get(
+                    int(musical_key_el.get("VALUE", "")), ""
+                )
+            except ValueError:
+                resolved = ""
+            if resolved:
+                return resolved
+        info_el = track.find("INFO")
+        return normalize_to_open_key(info_el.get("KEY", "") if info_el is not None else "")
+    return normalize_to_open_key(_text_value(track, "key"))
 
 
 def _date_value(track: TrackData, field: str) -> date | None:

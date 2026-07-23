@@ -883,11 +883,17 @@ class TestBuildConfigFromArgs:
 
 
 class TestGetLibrary:
-    def test_prints_compact_relational_json_and_exits_zero(self, capsys):
+    def test_prints_compact_relational_json_creates_backup_and_exits_zero(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        shutil.copy2(SAMPLE_COLLECTION, nml_path)
+        original_bytes = nml_path.read_bytes()
         with pytest.raises(SystemExit) as exc_info:
-            cli.main(["--nml", str(SAMPLE_COLLECTION), "--get-library"])
+            cli.main(["--nml", str(nml_path), "--get-library"])
 
         assert exc_info.value.code == 0
+        backups = list((tmp_path / "CueGrid Backups").glob("collection.nml.*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == original_bytes
         stdout = capsys.readouterr().out.strip()
         payload = json.loads(stdout)
         assert set(payload) == {"collection", "playlists"}

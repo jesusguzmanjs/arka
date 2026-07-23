@@ -1,7 +1,7 @@
 """Tests for ``cuegrid.core.pipeline``.
 
 Tests for batch processing (spec section 8.3), including error isolation
-and per-track immediate writes.
+and one in-memory NML commit per batch.
 """
 
 import json
@@ -220,6 +220,53 @@ class TestRunBatchPipeline:
             # Both tracks should be attempted
             assert result.succeeded_count == 2
             assert result.skipped_count == 0
+
+    def test_persists_all_batch_cues_with_one_backup_and_one_write(self):
+        """AutoCue batches mutate every entry before one final NML commit."""
+        first_entry = TrackEntry(
+            title="First",
+            artist="Test",
+            location_path="/music/first.flac",
+            tempo=TempoInfo(bpm=120.0),
+            cues=[],
+            grid_anchor_ms=0.0,
+            duration_ms=100_000.0,
+        )
+        second_entry = TrackEntry(
+            title="Second",
+            artist="Test",
+            location_path="/music/second.flac",
+            tempo=TempoInfo(bpm=120.0),
+            cues=[],
+            grid_anchor_ms=0.0,
+            duration_ms=100_000.0,
+        )
+        first_element = MagicMock()
+        second_element = MagicMock()
+        cue = CuePoint(name="Cue", type=CueType.CUE, start_ms=10_000.0, hotcue=0)
+
+        with patch("cuegrid.core.pipeline.NmlParser.find_entries_by_playlist") as mock_find, patch(
+            "cuegrid.core.pipeline.detect_events", return_value=[]
+        ), patch("cuegrid.core.pipeline.map_events_to_cues", return_value=[cue]), patch(
+            "cuegrid.core.pipeline.NmlWriter._backup_if_needed"
+        ) as mock_backup, patch(
+            "cuegrid.core.pipeline.NmlWriter.write_cues_to_element"
+        ) as mock_mutate, patch(
+            "cuegrid.core.pipeline.NmlWriter._write_atomic"
+        ) as mock_write:
+            mock_find.return_value = [
+                MagicMock(entry=first_entry, element=first_element),
+                MagicMock(entry=second_entry, element=second_element),
+            ]
+
+            result = run_batch_pipeline(SAMPLE_COLLECTION, playlist="test")
+
+        assert result.succeeded_count == 2
+        assert mock_backup.call_count == 1
+        assert mock_mutate.call_count == 2
+        assert mock_write.call_count == 1
+        assert mock_mutate.call_args_list[0].args[0] is first_element
+        assert mock_mutate.call_args_list[1].args[0] is second_element
 
     def test_skips_tracks_with_missing_bpm(self):
         """Spec section 8.3, step 1: skip if BPM <= 0."""

@@ -182,6 +182,11 @@ When BPM/grid information is available (the normal pipeline path), the mapper re
 - writes to `<collection.nml>.tmp` then atomically replaces the target;
 - validates the complete `--batch-save` payload before XML mutation and restores the in-memory tree if the write fails.
 
+AutoCue batch analysis also uses one retained parser tree: it creates one
+backup before processing the resolved batch, appends each successful track's
+new standard HotCue nodes in memory, and performs one atomic NML write after
+the complete processing loop only when at least one track produced cues.
+
 Flex Grid tracks are protected: single-track and batch analysis return a `flex_grid` skip before decoding. A batch-saved grid-anchor update requires exactly one Grid marker.
 
 ### 5.1 Smart Playlist compilation

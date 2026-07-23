@@ -16,7 +16,7 @@ def track() -> dict:
         "genre": "Deep Techno",
         "label": "Example Records",
         "comment": "Peak-time tool",
-        "key": "8A",
+        "key": "1m",
         "import_date": "2026/7/15",
         "last_played": "2026/7/20",
         "rating": 204,
@@ -37,7 +37,7 @@ def track() -> dict:
         ({"field": "genre", "operator": "contains", "value": "TECH"}, True),
         ({"field": "label", "operator": "is_exactly", "value": "example records"}, True),
         ({"field": "comment", "operator": "does_not_contain", "value": "warmup"}, True),
-        ({"field": "key", "operator": "is_exactly", "value": "8a"}, True),
+        ({"field": "key", "operator": "is_exactly", "value": "1m"}, True),
         ({"field": "rating", "operator": "equals", "value": 4}, True),
         ({"field": "rating", "operator": "greater_than_or_equal", "value": 4}, True),
         ({"field": "rating", "operator": "less_than_or_equal", "value": 3}, False),
@@ -76,15 +76,21 @@ def test_bpm_bounds_apply_the_same_float_tolerance():
     assert matches_rule(track, {"field": "bpm", "operator": "between", "value": {"min": 120, "max": 120}})
 
 
-def test_key_matches_any_trimmed_case_insensitive_comma_separated_value():
+def test_key_matches_normalized_open_key_values():
     assert matches_rule(
         {"key": "8A"},
-        {"field": "key", "operator": "is_exactly", "value": " 8a, 8b, 9a "},
+        {"field": "key", "operator": "is_exactly", "value": " 1d, 1m, 2m "},
     )
     assert matches_rule(
-        {"key": "8A"},
-        {"field": "key", "operator": "equals", "value": "8b, 8a"},
+        {"key": "A minor"},
+        {"field": "key", "operator": "contains", "value": "1m"},
     )
+
+
+def test_xml_key_rules_prefer_native_musical_key_value():
+    entry = ET.fromstring('<ENTRY><MUSICAL_KEY VALUE="0" /><INFO KEY="8A" /></ENTRY>')
+
+    assert matches_rule(entry, {"field": "key", "operator": "equals", "value": "1d"})
 
 
 def test_missing_attributes_default_to_zero_or_no_date_and_xml_elements_are_supported():

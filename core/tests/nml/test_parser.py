@@ -19,6 +19,7 @@ from cuegrid.nml.parser import (
     PlaylistNotFoundError,
     TrackNotFoundError,
     nml_location_to_path,
+    normalize_to_open_key,
     primary_key_to_normalized_path,
 )
 
@@ -488,8 +489,48 @@ class TestGlobalLibraryExport:
         entry = parser.find_entry("c:/music/keyed.flac")
         payload = parser.get_library()
 
-        assert entry.key == "8A"
-        assert payload["collection"]["c:/music/keyed.flac"]["key"] == "8A"
+        assert entry.key == "1m"
+        assert payload["collection"]["c:/music/keyed.flac"]["key"] == "1m"
+
+    def test_prefers_native_musical_key_over_info_key(self, tmp_path):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            """<NML><COLLECTION><ENTRY TITLE="Keyed" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="keyed.flac" />
+<MUSICAL_KEY VALUE="0" /><INFO KEY="8A" /><TEMPO BPM="120" />
+</ENTRY></COLLECTION><PLAYLISTS /></NML>""",
+            encoding="utf-8",
+        )
+
+        assert NmlParser(nml_file).find_entry("c:/music/keyed.flac").key == "1d"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        enumerate((
+            "1d", "8d", "3d", "10d", "5d", "12d", "7d", "2d", "9d", "4d", "11d", "6d",
+            "1m", "8m", "3m", "10m", "5m", "12m", "7m", "2m", "9m", "4m", "11m", "6m",
+        )),
+    )
+    def test_maps_every_native_musical_key_value_to_open_key(self, value, expected, tmp_path):
+        nml_file = tmp_path / f"key-{value}.nml"
+        nml_file.write_text(
+            f'''<NML><COLLECTION><ENTRY><LOCATION VOLUME="C:" DIR="/:Music/:" FILE="key-{value}.flac" />
+<MUSICAL_KEY VALUE="{value}" /></ENTRY></COLLECTION></NML>''',
+            encoding="utf-8",
+        )
+
+        assert NmlParser(nml_file).find_entry(f"c:/music/key-{value}.flac").key == expected
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("1D", "1d"), ("12m", "12m"), ("8A", "1m"), ("8B", "1d"),
+            ("1A", "6m"), ("1B", "6d"), ("C Major", "1d"), ("A minor", "1m"),
+            ("F♯m", "4m"), ("not a key", ""),
+        ],
+    )
+    def test_normalizes_legacy_key_labels_to_open_key(self, source, expected):
+        assert normalize_to_open_key(source) == expected
 
     def test_serializes_null_for_absent_musical_key(self, tmp_path):
         nml_file = tmp_path / "library.nml"

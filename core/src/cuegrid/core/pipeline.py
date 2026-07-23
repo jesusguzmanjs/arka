@@ -582,7 +582,8 @@ def run_batch_pipeline(
     Implements ``.openspec/2-spec.md`` section 8.3: batch processing with
     error isolation. Exactly one of `playlist`, `track_title`, or
     `track_paths` must be given. Processes each resolved track sequentially,
-    writing cues immediately after each track succeeds.
+    mutating the retained NML tree in memory, then commits all detected cues
+    with one backup and atomic write after the batch completes.
 
     Args:
         nml_path: Path to the Traktor ``collection.nml`` to read from and
@@ -650,9 +651,16 @@ def run_batch_pipeline(
 
     total_tracks = len(batch_refs)
 
-    # Process each track
+    # The backup captures the unmodified collection once for the complete
+    # batch.  Individual track processing only mutates the retained tree;
+    # writing inside the loop would rewrite the complete NML per track.
     writer = NmlWriter(parser)
+    if batch_refs:
+        writer._backup_if_needed()
+
+    # Process each track in memory.
     results: list[BatchTrackResult] = []
+    has_cue_mutations = False
 
     for i, batch_ref in enumerate(batch_refs, 1):
         entry = batch_ref.entry
@@ -745,9 +753,7 @@ def run_batch_pipeline(
             writer.write_cues_to_element(
                 element, new_cues, clear_existing=clear_existing
             )
-            writer._backup_if_needed()
-            writer._write_atomic()
-            logger.info("Wrote %d new CUE_V2 element(s) to %s", len(new_cues), nml_path)
+            has_cue_mutations = True
 
         # Record success (spec section 8.3, step 5)
         track_result = BatchTrackResult(
@@ -762,5 +768,9 @@ def run_batch_pipeline(
 
         if on_track_complete is not None:
             on_track_complete(track_result)
+
+    if has_cue_mutations:
+        writer._write_atomic()
+        logger.info("Wrote batch AutoCue updates to %s", nml_path)
 
     return BatchResult(results=results)

@@ -19,7 +19,7 @@ import math
 import shutil
 import time
 import xml.etree.ElementTree as ET
-import datetime
+from datetime import date
 import copy
 import re
 import uuid
@@ -652,7 +652,12 @@ class NmlWriter:
         cue_el.set("HOTCUE", str(cue.hotcue))
 
     def _backup_if_needed(self) -> None:
-        """Crea un backup diario (máximo 5) en una subcarpeta dedicada."""
+        """Create the daily backup and retain the five newest backups.
+
+        A pre-existing backup for today is preserved, but retention still
+        runs so an interrupted or older release cannot leave stale backups
+        beyond the documented limit.
+        """
         nml_path = Path(self._parser.nml_path)
 
         # 1. Definir y crear la subcarpeta "CueGrid Backups" junto al collection.nml
@@ -660,23 +665,19 @@ class NmlWriter:
         backup_dir.mkdir(parents=True, exist_ok=True)
 
         # 2. Generar el nombre del backup de hoy
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        today_str = date.today().strftime("%Y%m%d")
         backup_file_name = f"{nml_path.name}.{today_str}.bak"
         backup_path = backup_dir / backup_file_name
 
-        # 3. Si ya tenemos un backup de HOY, salimos inmediatamente.
-        if backup_path.exists():
-            return
+        # Preserve the first collection state seen on a given day.
+        if not backup_path.exists():
+            shutil.copy2(nml_path, backup_path)
 
-        # 4. Si no existe, copiamos el NML actual a la nueva carpeta
-        shutil.copy2(nml_path, backup_path)
-
-        # 5. Limpieza: mantener solo los 5 backups más recientes en esa carpeta
+        # Retain only the five most recent daily backups for this collection.
         all_backups = sorted(backup_dir.glob(f"{nml_path.name}.*.bak"))
 
-        if len(all_backups) > 5:
-            for old_backup in all_backups[:-5]:
-                old_backup.unlink(missing_ok=True)
+        for old_backup in all_backups[:-5]:
+            old_backup.unlink(missing_ok=True)
 
     def _write_atomic(self) -> None:
         start_time = time.time()

@@ -1541,3 +1541,29 @@ The Library Browser footer contains no Auto Cue controls. `ActionBar` in the
 bottom **AUTO CUE** rack renders **Auto Cue Selected** whenever the selection
 is non-empty, otherwise **Auto Cue Playlist** for the active playlist. The
 control is disabled if neither target is available or while a run is active.
+
+### 9.6 Musical key normalization and Smart Playlist filtering
+
+CueGrid uses Traktor's native **Open Key** notation as its sole key value:
+`1d`--`12d` for Major/Dur and `1m`--`12m` for Minor/Moll. Collection
+payloads, Library Browser cells, Smart Playlist rules, and filter controls
+must never surface Camelot notation as their canonical value.
+
+Key resolution occurs in two ordered stages for every collection `ENTRY`:
+
+1. **Native Traktor value (primary):** parse `<MUSICAL_KEY VALUE="0..23">`.
+   Values `0..11` map respectively to `1d, 8d, 3d, 10d, 5d, 12d, 7d, 2d,
+   9d, 4d, 11d, 6d`; values `12..23` map respectively to `1m, 8m, 3m,
+   10m, 5m, 12m, 7m, 2m, 9m, 4m, 11m, 6m`.
+2. **Legacy tag fallback:** only when `<MUSICAL_KEY>` is absent or invalid,
+   parse `<INFO KEY="...">` and normalize it to Open Key. This accepts
+   existing Open Key labels, Camelot labels (`8B` → `1d`, `8A` → `1m`,
+   `1B` → `6d`, `1A` → `6m`), and conventional key text such as `C Major`
+   or `A minor`. Empty or unrecognized values are represented as no key.
+
+Smart Playlist key comparisons normalize both the rule value and the source
+track before evaluation, including raw NML entries evaluated by the CLI. Key
+rules therefore operate only on valid Open Key values, regardless of a
+third-party tag's original notation. The Vue key-rule control is a fixed
+dropdown containing exactly `1d`--`12d` and `1m`--`12m`; it does not accept
+free-text Camelot input.

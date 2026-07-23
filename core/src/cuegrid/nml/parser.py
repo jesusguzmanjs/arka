@@ -28,9 +28,73 @@ from cuegrid.nml.models import CuePoint, TempoInfo, TrackEntry
 
 _WINDOWS_VOLUME_RE = re.compile(r"^[A-Za-z]:$")
 
+# Traktor stores its native key value as an integer in ``<MUSICAL_KEY>``.
+# The order is not chromatic-circle order, so retain the explicit mapping.
+TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY = {
+    0: "1d", 1: "8d", 2: "3d", 3: "10d", 4: "5d", 5: "12d",
+    6: "7d", 7: "2d", 8: "9d", 9: "4d", 10: "11d", 11: "6d",
+    12: "1m", 13: "8m", 14: "3m", 15: "10m", 16: "5m", 17: "12m",
+    18: "7m", 19: "2m", 20: "9m", 21: "4m", 22: "11m", 23: "6m",
+}
+
+_CAMELOT_TO_OPEN_KEY_NUMBER = {
+    1: 6, 2: 11, 3: 8, 4: 9, 5: 10, 6: 7,
+    7: 12, 8: 1, 9: 2, 10: 3, 11: 4, 12: 5,
+}
+_MAJOR_NOTE_TO_OPEN_KEY = {
+    "c": "1d", "c#": "8d", "db": "8d", "d": "3d", "d#": "10d",
+    "eb": "10d", "e": "5d", "f": "12d", "f#": "7d", "gb": "7d",
+    "g": "2d", "g#": "9d", "ab": "9d", "a": "4d", "a#": "11d",
+    "bb": "11d", "b": "6d",
+}
+_MINOR_NOTE_TO_OPEN_KEY = {
+    "g#": "6m", "ab": "6m", "d#": "11m", "eb": "11m", "a#": "8m",
+    "bb": "8m", "f": "9m", "c": "10m", "g": "7m", "d": "12m",
+    "a": "1m", "e": "2m", "b": "3m", "f#": "4m", "gb": "4m",
+    "c#": "5m", "db": "5m",
+}
+_OPEN_KEY_RE = re.compile(r"^(1[0-2]|[1-9])([dm])$", re.IGNORECASE)
+_CAMELOT_KEY_RE = re.compile(r"^(1[0-2]|[1-9])([ab])$", re.IGNORECASE)
+_LEGACY_KEY_RE = re.compile(
+    r"^([a-g])([#b♯♭]?)(?:\s*(major|maj|minor|min|m))?$", re.IGNORECASE
+)
+
 logger = logging.getLogger(__name__)
 
 TRAKTOR_SYSTEM_PLAYLISTS = ["_LOOPS", "_RECORDINGS"]
+
+
+def normalize_to_open_key(key_str: str) -> str:
+    """Normalize a Traktor, Camelot, or conventional key label to Open Key.
+
+    Valid results are always Traktor's native ``1d``--``12d`` (major/Dur) or
+    ``1m``--``12m`` (minor/Moll) labels. Empty or unrecognized input returns
+    an empty string so callers can represent an absent key without leaking a
+    non-Open-Key value into CueGrid.
+    """
+    if not isinstance(key_str, str):
+        return ""
+
+    value = key_str.strip()
+    if not value:
+        return ""
+
+    if open_match := _OPEN_KEY_RE.fullmatch(value):
+        return f"{open_match.group(1)}{open_match.group(2).lower()}"
+    if camelot_match := _CAMELOT_KEY_RE.fullmatch(value):
+        number = _CAMELOT_TO_OPEN_KEY_NUMBER[int(camelot_match.group(1))]
+        suffix = "m" if camelot_match.group(2).casefold() == "a" else "d"
+        return f"{number}{suffix}"
+
+    legacy_match = _LEGACY_KEY_RE.fullmatch(value)
+    if legacy_match is None:
+        return ""
+
+    note = f"{legacy_match.group(1).casefold()}{legacy_match.group(2)}"
+    note = note.replace("♯", "#").replace("♭", "b")
+    mode = legacy_match.group(3)
+    # A bare conventional note (for example, "C") conventionally means major.
+    return (_MINOR_NOTE_TO_OPEN_KEY if mode and mode.casefold() in {"minor", "min", "m"} else _MAJOR_NOTE_TO_OPEN_KEY).get(note, "")
 
 
 class TrackNotFoundError(Exception):
@@ -518,14 +582,23 @@ class NmlParser:
         # v2.0 stems: AUDIO_ID lives on <ENTRY> itself; FLAGS lives on <INFO>.
         audio_id = entry_el.get("AUDIO_ID") or None
         info_el = entry_el.find("INFO")
-        key: str | None = None
+        musical_key_el = entry_el.find("MUSICAL_KEY")
+        key = ""
+        if musical_key_el is not None:
+            try:
+                key = TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY.get(
+                    int(musical_key_el.get("VALUE", "")), ""
+                )
+            except ValueError:
+                pass
+        if not key and info_el is not None:
+            key = normalize_to_open_key(info_el.get("KEY", ""))
         flags: int | None = None
         album_el = entry_el.find("ALBUM")
         album = album_el.get("TITLE", "") if album_el is not None else ""
         remixer = producer = genre = label = comment = comment2 = lyrics = mix = ""
         rating = 0
         if info_el is not None:
-            key = info_el.get("KEY") or None
             remixer = info_el.get("REMIXER", "")
             producer = info_el.get("PRODUCER", "")
             genre = info_el.get("GENRE", "")
@@ -571,7 +644,7 @@ class NmlParser:
             grid_anchor_ms=grid_anchor_ms,
             is_flex_grid=grid_marker_count > 1,
             duration_ms=duration_ms,
-            key=key,
+            key=key or None,
             album=album,
             remixer=remixer,
             producer=producer,

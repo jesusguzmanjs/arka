@@ -60,6 +60,11 @@ const MATCH_OPTIONS = [
   { value: "any", label: "Match ANY" },
 ] as const;
 
+const OPEN_KEY_OPTIONS = [
+  "1d", "2d", "3d", "4d", "5d", "6d", "7d", "8d", "9d", "10d", "11d", "12d",
+  "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m",
+] as const;
+
 const FIELD_OPTIONS: readonly FieldOption[] = [
   { value: "bpm", label: "BPM", valueKind: "number", operators: NUMERIC_OPERATORS },
   { value: "key", label: "Key", valueKind: "key", operators: [{ value: "is_exactly", label: "Exact match" }] },
@@ -366,6 +371,10 @@ onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
                     <span class="text-xs text-dim" aria-hidden="true">to</span>
                     <input v-model="rule.max" type="number" inputmode="decimal" placeholder="Max" class="min-w-0 rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Maximum value for rule ${index + 1}`">
                   </div>
+                  <select v-else-if="valueKind(rule) === 'key'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Open Key value for rule ${index + 1}`">
+                    <option value="" disabled>Select an Open Key</option>
+                    <option v-for="key in OPEN_KEY_OPTIONS" :key="key" :value="key">{{ key }}</option>
+                  </select>
                   <select v-else-if="valueKind(rule) === 'rating'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Rating value for rule ${index + 1}`">
                     <option value="" disabled>Select a rating</option>
                     <option v-for="rating in 5" :key="rating" :value="String(rating)">{{ '★'.repeat(rating) }}{{ '☆'.repeat(5 - rating) }} · {{ rating }}</option>
@@ -378,7 +387,7 @@ onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
                       :step="['number', 'whole-number', 'days'].includes(valueKind(rule)) ? (valueKind(rule) === 'number' ? 'any' : '1') : undefined"
                       :min="valueKind(rule) === 'whole-number' ? '0' : (valueKind(rule) === 'days' ? '1' : undefined)"
                       :inputmode="['number', 'whole-number', 'days'].includes(valueKind(rule)) ? 'decimal' : undefined"
-                      :placeholder="valueKind(rule) === 'key' ? 'e.g. 8A, 9A' : (valueKind(rule) === 'days' ? 'Number of days' : 'Enter a value')"
+                      :placeholder="valueKind(rule) === 'days' ? 'Number of days' : 'Enter a value'"
                       class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
                       :aria-label="`Value for rule ${index + 1}`"
                   >

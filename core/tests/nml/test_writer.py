@@ -218,6 +218,23 @@ class TestWriteCues:
             path.name.rsplit(".", 2)[1] for path in backup_files
         } == {backup_date.strftime("%Y%m%d") for backup_date in expected_dates}
 
+    def test_rotates_backups_when_todays_backup_already_exists(self, working_nml):
+        backup_dir = _backup_dir(working_nml)
+        backup_dir.mkdir()
+        today = date.today()
+        existing_dates = [today - timedelta(days=age) for age in range(6, -1, -1)]
+        for backup_date in existing_dates:
+            (backup_dir / f"{working_nml.name}.{backup_date:%Y%m%d}.bak").write_text(
+                "backup", encoding="utf-8"
+            )
+
+        NmlWriter(NmlParser(working_nml))._backup_if_needed()
+
+        assert [path.name.rsplit(".", 2)[1] for path in _backup_files(working_nml)] == [
+            (today - timedelta(days=age)).strftime("%Y%m%d")
+            for age in range(4, -1, -1)
+        ]
+
     def test_raises_on_hotcue_slot_conflict(self, working_nml):
         # The second track has hotcue slots 0-3 occupied. Without
         # clear_existing, writing to an occupied slot must raise.
