@@ -63,7 +63,7 @@ const isAppBlocked = computed(() => isSystemBusy.value);
 const contextMenu = ref({ visible: false, x: 0, y: 0, cue: null as PlayerCue | null });
 let loadToken = 0;
 let peaksInitToken = 0;
-
+let isPlayPromisePending = false;
 const { trackCssGradient, startSyncLoop, stopSyncLoop } = useWaveformSync({
   peaks,
   trackData,
@@ -389,9 +389,9 @@ async function togglePlay(): Promise<void> { if (isAnalysisRunning.value) return
 function stop(): void { if (isAnalysisRunning.value) return; const instance = peaks.value; if (!instance) return; instance.player.pause(); instance.player.seek(0); isPlaying.value = false; }
 function jumpToCue(padIndex: number): void { if (isAnalysisRunning.value) return; const cue = padSlots.value[padIndex - 1]; if (peaks.value && cue) peaks.value.player.seek(cue.position_ms / 1000); }
 
-let isPlayPromisePending = false;
+
 async function startCuePreview(padIndex: number): Promise<void> {
-  if (isAnalysisRunning.value) return;
+  if (isAnalysisRunning.value || isPlayPromisePending) return;
   const cue = padSlots.value[padIndex - 1];
   const instance = peaks.value;
   if (!instance || !cue || activeCue.value) return;
@@ -414,7 +414,12 @@ async function startCuePreview(padIndex: number): Promise<void> {
       instance.player.pause();
       instance.player.seek(cue.position_ms / 1000);
     }
-  } catch (error: any) { activeCue.value = null; if (error.name !== "AbortError") loadError.value = `Cue preview failed: ${String(error)}`; }
+  } catch (error: any) {
+    activeCue.value = null;
+    if (error.name !== "AbortError") loadError.value = `Cue preview failed: ${String(error)}`;
+  } finally {
+    isPlayPromisePending = false;
+  }
 }
 function endCuePreview(padIndex: number): void {
   if (activePad.value !== padIndex) return;
