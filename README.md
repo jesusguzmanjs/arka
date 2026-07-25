@@ -1,114 +1,60 @@
-# CueGrid
+# Arka
 
-**CueGrid is an advanced preparation and library-management workspace for Traktor DJs.** It pairs intelligent, beatgrid-aware phrase analysis with a visual waveform player, native collection browsing, batch metadata editing, rule-based playlists, and session-history tools—so the work around a set happens in one focused desktop application.
+**Arka is an open-source preparation workspace for Traktor DJs.** It helps you analyse tracks, place and refine HotCues, correct beatgrids, organise metadata, and create rule-based playlists—while keeping Traktor's collection.nml as the source of truth.
 
-CueGrid works with Traktor's `collection.nml` as the source of truth. It helps you prepare more deliberately while keeping your grids, library structure, and DJ workflow familiar.
+Arka is currently preparing for its public Beta. It is built for DJs who want useful automation with clear review and control before changes are saved.
 
-## Why CueGrid
+## Core features
 
-Preparing a library should not mean choosing between automation and control. CueGrid uses Traktor's existing beatgrid to identify musically useful cue candidates, then gives you a full visual workspace to review, audition, edit, organize, and save those changes safely.
+### AutoCue
 
-- Find high-value phrase transitions without replacing the beatgrid you already trust.
-- Review and refine cues directly against an interactive waveform before committing changes.
-- Manage tracks, playlists, metadata, and past sessions without leaving the application.
-- Save related changes together through one validated, atomic update to your Traktor collection.
-
-## Highlights
-
-### Intelligent Auto Cue
-
-CueGrid's analysis is deliberately **grid-guided**. It generates candidates from the existing Traktor grid, then analyzes the master track with harmonic/percussive source separation (HPSS), structural energy contrast, and timbral change detection.
-
-- Respects the existing BPM and grid anchor; it does not estimate or replace your beatgrid.
-- Scores phrase-boundary candidates with Librosa HPSS and MFCC-based timbral contrast.
-- Uses a spatial plateau weighting that favors the central area of a track without flattening the whole arrangement.
-- Applies dynamic proximity suppression: cues too close together are rejected and nearby candidates progressively recover with distance, producing a more natural distribution.
-- Supports up to eight standard Traktor HotCues while preserving occupied slots and non-HotCue markers.
-- Protects Flex Grid tracks from automated analysis.
-
-### Integrated Waveform Player
-
-The built-in player is made for making confident decisions quickly, not just looking at audio.
-
-- **Peaks.js** zoom and overview waveforms with a custom CSS-mask HPSS color layer.
-- Visible beat and bar lines derived from the active grid, plus on-grid snapping for manual cue edits.
-- Eight fixed, Traktor-style virtual HotCue pads—use the mouse or keys `1`–`8` for momentary auditioning; use an empty pad to create a cue and `Shift` + number to remove one.
-- Relative `±8`-beat jumps for fast phrase navigation.
-- A dedicated **Grid Edit Mode** for nudging the phase/anchor, setting the grid to the playhead, optionally shifting cues with it, and halving or doubling BPM.
-- Manual edits remain local until you choose **Save Changes**, so you can review the complete result before anything touches the collection.
-
-### Native Library Browser and Metadata Workflow
-
-CueGrid provides a Traktor-style, two-column browser for working across your collection.
-
-- Playlist tree and tracklist in one native browser, with resizable and sortable columns.
-- Select one track or many, then apply batch metadata edits in a single operation.
-- Edit core library fields such as title, artist, release, remixer, producer, genre, label, comments, lyrics, mix, key, and rating.
-- Persist changes atomically to `collection.nml`; supported audio files can also receive matching ID3, Vorbis, or MP4 tag updates via Mutagen.
-- Keep edits staged until an explicit save, avoiding accidental partial updates.
+- Analyses the master track against its existing Traktor beatgrid to find musically useful phrase transitions.
+- Uses harmonic/percussive source separation (HPSS), structural energy contrast, and timbral change detection.
+- Adds up to eight standard Traktor HotCues while preserving occupied slots and non-HotCue markers.
+- Leaves Flex Grid tracks out of automated analysis and never replaces your beatgrid.
+- Provides an interactive waveform player for auditioning and editing cues before saving.
 
 ### Smart Playlists
 
-Build reusable selection logic, then compile it into regular static Traktor playlists.
+- Builds reusable rule sets with **match all** or **match any** logic, then compiles the results into normal Traktor playlists.
+- Filters by BPM, rating, play count, import date, last-played date, genre, label, comment, and musical key.
+- Includes a **Track Format** rule for **Stems**, covering Traktor 4 dynamic Stems as well as classic native .stem.mp4 files.
+- Shows a dedicated Stems icon in the library when Traktor reports native Stem availability.
 
-- Combine rules with **all** or **any** matching.
-- Filter by BPM, rating, import date, last played date, play count, genre, label, comment, and musical key.
-- BPM matching accounts for common half- and double-tempo library representations.
-- Re-running a Smart Playlist refreshes its generated Traktor playlist using the current collection.
+### Grid Fixer and library tools
 
-### Session History Timeline
+- Edit the beatgrid directly in the player: nudge its phase, set the anchor at the playhead, shift cues with the grid when needed, and halve or double BPM.
+- Browse playlists and tracks in a Traktor-style library, then batch-edit common metadata fields.
+- Browse session history in a four-deck timeline and import a session as a regular Traktor playlist.
+- Writes collection changes atomically and creates rotating daily backups in the adjacent CueGrid Backups folder.
 
-Turn past Traktor sessions into useful library context.
+## Designed for Traktor 4
 
-- Browse a visual, four-deck timeline of saved Traktor history sessions.
-- Compress global inactivity gaps longer than 15 minutes into clear timeline breaks, keeping the view readable while retaining real elapsed-time context.
-- Distinguish public playback from cue/monitor activity with separate visual treatment.
-- Import a session directly as a normal saved Traktor playlist, preserving chronological order and repeated plays.
+Arka recognises current **Traktor Pro 4** process naming conventions across Windows, macOS, and Linux. It watches for Traktor while it is running and blocks collection changes until it closes, helping prevent conflicting writes to collection.nml.
 
-## Built for Traktor, with Careful Writes
+The background monitor was rebuilt to reuse its system state, avoiding the CPU bottleneck previously seen on macOS.
 
-CueGrid does not treat `collection.nml` casually. GUI-originated track and playlist changes are assembled into one complete payload, validated before mutation, then written as one atomic operation. Each successful mutation creates a rotating daily backup alongside the collection in `CueGrid Backups`.
+## What's new in the Beta
 
-Automated cue writes preserve Grid, Load, and other non-standard cue markers. Use an independent backup of your Traktor collection as part of any production workflow.
+- Arka is the application's official name.
+- Stems detection is back in the library UI, alongside Smart Playlist filtering by track format.
+- Traktor Pro 4 detection is more robust across supported operating systems.
+- Waveform colour extraction has intentionally been removed. This reduces track-load overhead and keeps the Beta focused on responsive waveform, cue, grid, and library workflows.
 
-## Architecture
+## Installation and usage
 
-| Layer | Technology | Responsibility |
-| --- | --- | --- |
-| Desktop interface | Vue 3, Tailwind CSS, Peaks.js | Library workspace, waveform player, metadata and playlist workflows, session timeline |
-| Desktop shell | Tauri / Rust | Native desktop window, file/resource access, and the bridge to the Core sidecar |
-| Analysis and collection engine | Python, Librosa, NumPy, Mutagen | HPSS analysis, beatgrid math, metadata handling, NML parsing, validation, and atomic persistence |
+### Run from source
 
-For packaged builds, the Python engine is frozen with PyInstaller and shipped as a Tauri sidecar resource. The UI invokes it through the Tauri bridge rather than requiring a user-managed Python installation.
+Prerequisites:
 
-## Project Layout
-
-```text
-core/                   Python analysis and collection engine
-  src/cuegrid/          CLI, audio analysis, NML parser/writer, playlist logic
-  tests/                Core test suite
-gui/                    Vue 3 + Tauri desktop application
-  src/                  UI components, composables, stores, and types
-  src-tauri/            Rust shell, capabilities, and sidecar configuration
-.openspec/              Current implementation specifications
-build-win.ps1           Windows production build pipeline
-```
-
-## Run Locally
-
-### Prerequisites
-
-- Windows (the packaged build pipeline is currently PowerShell/Windows-oriented)
 - Python 3.10 or newer
 - Node.js and npm
-- Rust with the MSVC toolchain
-- A Traktor `collection.nml` and audio files for real-world testing
+- Rust toolchain (including the MSVC toolchain on Windows)
+- A Traktor collection.nml and audio files for real-world use
 
-For production packaging, install PyInstaller in the same Python environment as the Core dependencies.
+Install the Core and desktop dependencies:
 
-### Install development dependencies
-
-```powershell
+~~~
 # Python Core
 cd core
 python -m venv .venv
@@ -116,58 +62,75 @@ python -m venv .venv
 pip install -e ".[dev]"
 pip install pyinstaller
 
-# Vue / Tauri application
+# Vue + Tauri desktop app
 cd ..\gui
 npm install
-```
+~~~
 
-### Start the desktop app
+Start Arka in development mode:
 
-From the `gui` directory:
-
-```powershell
+~~~
+cd gui
 npm run tauri dev
-```
+~~~
 
-This starts the Vue development server and launches CueGrid through Tauri. For a UI-only browser development server, use `npm run dev` instead.
+Choose your Traktor collection.nml when prompted (or use the collection selector in the app), load a track, review AutoCue or manual edits in the player, and select **Save Changes** only when you are ready to write them.
 
-### Verify the project
+### Verify and build
 
-```powershell
+~~~
 # From the repository root
 pytest core
 
 # From gui
 npm run build
-```
+~~~
 
-`npm run build` performs Vue type-checking before producing the frontend bundle.
+The Windows production build is available from the repository root:
 
-## Build a Windows Release
-
-From the repository root, with the Core virtual environment activated:
-
-```powershell
+~~~
 .\build-win.ps1
-```
+~~~
 
-The script:
+It packages the Python Core as a Tauri sidecar and places installer artifacts under gui\src-tauri\target\release\bundle\.
 
-1. Builds and type-checks the Vue frontend.
-2. Freezes the Python Core with PyInstaller and places it in Tauri's target-specific sidecar location.
-3. Runs the Tauri production build.
+## Architecture
 
-The installer artifacts are produced beneath `gui\src-tauri\target\release\bundle\`.
+| Layer | Technology | Role |
+| --- | --- | --- |
+| Desktop interface | Vue 3, Tailwind CSS, Peaks.js | Library, waveform player, editing, playlist, and history workflows |
+| Desktop shell | Tauri / Rust | Native application, process safety monitoring, and Core bridge |
+| Analysis and collection engine | Python, Librosa, NumPy, Mutagen | Audio analysis, beatgrid logic, metadata, NML parsing, validation, and atomic writes |
+
+~~~
+core/                   Python analysis and collection engine
+  src/cuegrid/          CLI, analysis, NML parsing/writing, playlist logic
+  tests/                Core test suite
+gui/                    Vue 3 + Tauri desktop application
+  src/                  UI components, composables, stores, and types
+  src-tauri/            Rust shell and sidecar configuration
+.openspec/              Current implementation specifications
+build-win.ps1           Windows production build pipeline
+~~~
+
+## Privacy and telemetry
+
+On launch, Arka sends one anonymous background ping for basic Beta usage statistics. It does not store personal data, IP addresses, or information from your Traktor library. Local analysis telemetry can be viewed and exported from the app; it is separate from this anonymous Beta usage signal.
+
+## Safety
+
+Arka validates writes and saves them atomically, but a separate backup of your Traktor collection is still recommended before production use. Never edit the same collection in Arka while Traktor is open.
 
 ## Specifications
 
-The implementation contracts live in [`.openspec/`](.openspec/):
+The implementation contracts live in [.openspec/](.openspec/):
 
 - [Core engine](.openspec/2-core-spec.md)
+- [Desktop GUI](.openspec/3-gui-spec.md)
 - [Waveform player](.openspec/3-player-spec.md)
 - [Library and metadata workflows](.openspec/4-library-spec.md)
 - [Session history](.openspec/5-history-spec.md)
 
 ## License
 
-No license is currently declared for this repository.
+Arka is released under the [GNU General Public License v3.0](LICENSE) (GPLv3).
