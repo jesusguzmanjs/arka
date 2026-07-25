@@ -55,10 +55,20 @@ function validate(s: CueGridConfig): boolean {
 }
 
 export function useConfigState() {
+  const setCustomNmlPath = (path: string | null) => {
+    state.nmlPathOverride = path?.trim() || null;
+    persist(state);
+  };
+
   return {
     ...toRefs(state),
+    customNmlPath: computed<string | null>({
+      get: () => state.nmlPathOverride,
+      set: setCustomNmlPath,
+    }),
     isValid: computed(() => validate(state)),
     reset: () => Object.assign(state, defaultConfig),
+    setCustomNmlPath,
     update: <K extends keyof CueGridConfig>(key: K, value: CueGridConfig[K]) => {
       state[key] = value;
       persist(state);

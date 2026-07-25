@@ -429,12 +429,12 @@ onUnmounted(() => {
     </div>
 
     <div class="flex min-h-0 flex-1 overflow-hidden">
-      <aside class="flex w-64 min-h-0 shrink-0 flex-col overflow-y-auto border-r border-zinc-800 bg-zinc-950/35">
+      <aside class="flex w-64 min-h-0 shrink-0 flex-col overflow-hidden border-r border-zinc-800 bg-zinc-950/35">
         <div class="shrink-0 border-b border-zinc-800/80 px-4 py-2">
           <span class="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted">Navigate</span>
         </div>
 
-        <nav class="min-h-0 flex-1 p-2" aria-label="Library contexts">
+        <nav class="shrink-0 p-2" aria-label="Library contexts">
           <button
               type="button"
               class="mb-1 flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
@@ -450,20 +450,13 @@ onUnmounted(() => {
             <span class="truncate">All Tracks</span>
           </button>
 
-          <div class="mb-1 mt-4 flex items-center justify-between px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-dim">
-            <span>Playlists</span>
-            <button
-                type="button"
-                class="-mr-1 inline-flex h-6 w-6 items-center justify-center rounded text-base font-normal leading-none text-muted transition-colors hover:bg-primary/10 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-40"
-                aria-label="Create Smart Playlist"
-                title="Create Smart Playlist"
-                :disabled="props.disabled"
-                @click="isSmartPlaylistModalOpen = true"
-            >
-              <span aria-hidden="true">+</span>
-            </button>
-          </div>
+        </nav>
 
+        <div class="shrink-0 px-5 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-dim">
+          <span>Playlists</span>
+        </div>
+
+        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-2 scrollbar-amber" aria-label="Playlists">
           <div v-if="libraryLoading && playlistLeaves.length === 0" class="px-3 py-3 text-xs text-dim">
             Loading playlists…
           </div>
@@ -504,7 +497,18 @@ onUnmounted(() => {
               <span v-else class="pointer-events-none min-w-0 flex-1 truncate">{{ playlist.name }}</span>
             </div>
           </div>
-        </nav>
+        </div>
+
+        <div class="shrink-0 border-t border-zinc-800/80 p-2">
+          <button
+              type="button"
+              class="w-full rounded border border-primary/50 text-primary bg-zinc-900/70 px-3 py-2 text-left text-xs font-semibold  transition-colors hover:border-primary/50 hover:bg-primary/10 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-40"
+              :disabled="props.disabled"
+              @click="isSmartPlaylistModalOpen = true"
+          >
+            Create Smart Playlist
+          </button>
+        </div>
       </aside>
 
       <main class="flex min-w-0 min-h-0 flex-1 flex-col bg-zinc-900">
@@ -580,7 +584,7 @@ onUnmounted(() => {
           {{ searchQuery ? "No tracks match your search." : (selectedContext === ALL_TRACKS_CONTEXT ? "No tracks found in collection.nml." : "This playlist is empty.") }}
         </div>
         <div ref="trackTableContainer" v-else class="flex min-h-0 flex-1 flex-col">
-          <table class="w-full table-fixed border-collapse border-y border-zinc-700/90 bg-zinc-950/70 text-[10px] font-semibold uppercase tracking-[0.14em] text-dim shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+          <table class="w-full table-fixed border-collapse border-y border-zinc-700/90 bg-zinc-950/30 text-[10px] font-semibold uppercase tracking-[0.14em] text-dim shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
             <colgroup>
               <col v-for="column in TRACK_COLUMNS" :key="column" :style="{ width: columnWidth(column) }" />
             </colgroup>
@@ -636,7 +640,7 @@ onUnmounted(() => {
                   :key="String(virtualRow.key)"
                   role="row"
                   tabindex="0"
-                  class="absolute left-0 top-0 grid w-full select-none items-center border-b border-zinc-800/50 px-2 text-left text-sm transition-colors focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
+                  class="absolute left-1 top-0 grid w-full select-none items-center border-b border-zinc-800/50 text-left text-sm transition-colors focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
                   :class="[
                   selectedLibraryPaths.includes(sortedTracks[virtualRow.index].location_path)
                     ? 'bg-secondary/20 text-zinc-100 ring-1 ring-inset ring-secondary/50'

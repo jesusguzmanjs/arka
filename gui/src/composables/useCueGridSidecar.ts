@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { ref, watch } from "vue";
 import { useConfigState } from "./useConfigState";
 import { useRunState, type RunSummary } from "./useRunState";
 import { useAnalysisSession } from "./useAnalysisSession";
@@ -33,7 +34,6 @@ function buildArgs(
   } else {
     args.push("--playlist", cfg.selectedPlaylist!);
   }
-  if (cfg.nmlPathOverride) args.push("--nml", cfg.nmlPathOverride);
   args.push("--mode", cfg.sensitivity);
   args.push("--max-cues", String(cfg.maxCues));
   if (cfg.clearExisting) args.push("--clear-existing");
@@ -45,6 +45,30 @@ function buildArgs(
 // Almacena los des-registradores de eventos para limpiarlos al cerrar el proceso
 let unlistens: UnlistenFn[] = [];
 let resolveActiveRun: ((succeeded: boolean) => void) | null = null;
+const analyzedTrackPaths = ref<readonly string[]>([]);
+
+const { selectedTrackPath } = useConfigState();
+const { status, awaitPlayerLoad, releaseSystemBusy } = useRunState();
+
+watch(status, (nextStatus, previousStatus) => {
+  if (
+    previousStatus === "running"
+    && nextStatus === "success"
+    && analyzedTrackPaths.value.length === 1
+  ) {
+    const analyzedTrackPath = analyzedTrackPaths.value[0];
+    if (selectedTrackPath.value === analyzedTrackPath) {
+      releaseSystemBusy();
+    } else {
+      awaitPlayerLoad();
+      selectedTrackPath.value = analyzedTrackPath;
+    }
+  } else if (nextStatus === "success") {
+    releaseSystemBusy();
+  }
+
+  if (nextStatus !== "running") analyzedTrackPaths.value = [];
+});
 
 function cleanupListeners() {
   unlistens.forEach((u) => u());
@@ -69,14 +93,21 @@ export function useCueGridSidecar() {
   } = useRunState();
   const { clearSession, captureRun } = useAnalysisSession();
 
+  function callCueGridCore(args: string[]): Promise<string> {
+    return invoke<string>("call_cuegrid_core", {
+      args,
+      nmlPath: nmlPathOverride.value,
+    });
+  }
+
   async function run(): Promise<void> {
     if (!isValid.value) return;
-    await runAnalysis("playlist", selectedPlaylist.value!, selectedPlaylist.value!);
+    await runAnalysis("playlist", selectedPlaylist.value!, selectedPlaylist.value!, []);
   }
 
   async function runSingleTrack(trackPath: string, trackTitle: string): Promise<void> {
     if (!trackPath) return;
-    await runAnalysis("track", trackPath, trackTitle);
+    await runAnalysis("track", trackPath, trackTitle, [trackPath]);
   }
 
   async function runSelectedTracks(
@@ -93,6 +124,7 @@ export function useCueGridSidecar() {
     successLabel: string,
     selectedLibraryPaths: readonly string[] = [],
   ): Promise<boolean> {
+    analyzedTrackPaths.value = [...selectedLibraryPaths];
     clearSession();
     preparePlayerForAnalysis(target === "track" ? targetValue : null, target === "playlist");
 
@@ -155,7 +187,10 @@ export function useCueGridSidecar() {
     try {
       startRun();
       currentPid.value = 99999; // Mock PID (la cancelación ahora va por backend)
-      await invoke("start_analysis_stream", { args: buildArgs(cfg, target, selectedLibraryPaths) });
+      await invoke("start_analysis_stream", {
+        args: buildArgs(cfg, target, selectedLibraryPaths),
+        nmlPath: nmlPathOverride.value,
+      });
     } catch (err) {
       cleanupListeners();
       handleMessage({ type: "log", level: "error", message: `Failed to start stream: ${String(err)}` });
@@ -180,10 +215,9 @@ export function useCueGridSidecar() {
   ): Promise<{ ok: boolean; error?: string }> {
     const args = ["--batch-save", JSON.stringify(payload)];
     if (writeToFiles) args.push("--write-to-files");
-    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
     args.push("--json");
     try {
-      await invoke("call_cuegrid_core", { args });
+      await callCueGridCore(args);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: String(error) };
@@ -194,10 +228,8 @@ export function useCueGridSidecar() {
     payload: SmartPlaylistPayload,
   ): Promise<{ ok: true; result: SmartPlaylistCompileResult } | { ok: false; error: string }> {
     const args = ["--compile-smart-playlist", JSON.stringify(payload), "--json"];
-    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
-
     try {
-      const stdout = await invoke<string>("call_cuegrid_core", { args });
+      const stdout = await callCueGridCore(args);
       const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const response = JSON.parse(lines[lines.length - 1] ?? "") as {
         ok?: boolean;
@@ -231,9 +263,8 @@ export function useCueGridSidecar() {
     payload: { name: string; entries: string[] },
   ): Promise<{ ok: true; result: { type: "static_playlist_created"; name: string; entries: number; uuid: string } } | { ok: false; error: string }> {
     const args = ["--create-static-playlist", JSON.stringify(payload), "--json"];
-    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
     try {
-      const stdout = await invoke<string>("call_cuegrid_core", { args });
+      const stdout = await callCueGridCore(args);
       const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const response = JSON.parse(lines[lines.length - 1] ?? "") as unknown;
       if (typeof response !== "object" || response === null) throw new Error("Core returned an invalid playlist response.");
@@ -254,11 +285,11 @@ export function useCueGridSidecar() {
     if (nmlPathOverride.value) return;
 
     try {
-      const stdoutText = await invoke<string>("call_cuegrid_core", { args: ["--discover-nml"] });
+      const stdoutText = await callCueGridCore(["--discover-nml"]);
       if (stdoutText.trim()) {
         const result = JSON.parse(stdoutText);
         if (result.path) {
-          nmlPathOverride.value = result.path;
+          useConfigState().setCustomNmlPath(result.path);
           console.log("[Boot] Auto-descubierto NML por defecto:", result.path);
         }
       }
@@ -297,5 +328,5 @@ export function useCueGridSidecar() {
     useRunState().reset();
   }
 
-  return { run, runSingleTrack, runSelectedTracks, batchSave, compileSmartPlaylist, createStaticPlaylist, cancel, exportTelemetry, resetRun, discoverAndSetDefaultNml, nmlPathOverride };
+  return { run, runSingleTrack, runSelectedTracks, batchSave, compileSmartPlaylist, createStaticPlaylist, cancel, exportTelemetry, resetRun, discoverAndSetDefaultNml, nmlPathOverride, callCueGridCore };
 }

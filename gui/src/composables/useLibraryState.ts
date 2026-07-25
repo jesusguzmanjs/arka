@@ -1,5 +1,4 @@
 import { computed, nextTick, reactive, toRefs } from "vue";
-import { invoke } from "@tauri-apps/api/core";
 import { useConfigState } from "./useConfigState";
 import { useCueGridSidecar } from "./useCueGridSidecar";
 import type {
@@ -156,7 +155,7 @@ function parseLibraryPayload(raw: unknown): LibraryPayload {
 
 export function useLibraryState() {
   const { update, selectedTrackPath } = useConfigState();
-  const { nmlPathOverride } = useCueGridSidecar();
+  const { callCueGridCore } = useCueGridSidecar();
 
   const currentViewTracks = computed<TrackMetadata[]>(() => {
     if (state.selectedContext === ALL_TRACKS_CONTEXT) {
@@ -181,10 +180,9 @@ export function useLibraryState() {
     state.libraryError = null;
 
     const args = ["--get-library"];
-    if (nmlPathOverride.value) args.push("--nml", nmlPathOverride.value);
 
     try {
-      const raw = await invoke<string>("call_cuegrid_core", { args });
+      const raw = await callCueGridCore(args);
       const payload = parseLibraryPayload(raw);
 
       if (myToken !== loadToken) return;

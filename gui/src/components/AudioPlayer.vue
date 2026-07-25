@@ -28,7 +28,7 @@ interface WaveformShell { zoomviewElement: HTMLDivElement | null; overviewElemen
 const props = defineProps<{ trackPath?: string | null; disabled?: boolean }>();
 const { selectedTrackPath, clearExisting } = useConfigState();
 const { collection, patchTrackInCollection } = useLibraryState();
-const { status, logs } = useRunState();
+const { status, logs, isSystemBusy, completePlayerLoad } = useRunState();
 const saveStore = useSaveStore();
 const { previewCache, isLoadingTrack, setLoadingTrack, setLoadedMetadata } = usePlayerState();
 const { createPointMarker, paintAllMarkers, notifyGridAnchorDrag, getGridLines } = usePeaksMarkers(handleGridAnchorDrag);
@@ -59,6 +59,7 @@ const activeZoomLevelIndex = ref(0);
 const activeCue = ref<PlayerCue | null>(null);
 const activePad = ref<number | null>(null);
 const isAnalysisRunning = computed(() => status.value === "running");
+const isAppBlocked = computed(() => isSystemBusy.value);
 const contextMenu = ref({ visible: false, x: 0, y: 0, cue: null as PlayerCue | null });
 let loadToken = 0;
 let peaksInitToken = 0;
@@ -92,11 +93,15 @@ function markCurrentTrackDirty(): void {
   });
   saveStore.markTrackDirty(path);
 }
-watch(isAnalysisRunning, (running) => {
-  if (running && isPlaying.value) {
+watch(isAppBlocked, (blocked) => {
+  if (blocked && isPlaying.value) {
     peaks.value?.player.pause();
     isPlaying.value = false;
   }
+});
+
+watch(isLoadingTrack, (loading) => {
+  if (!loading) completePlayerLoad();
 });
 
 function mergeCues(...sources: ReadonlyArray<PlayerCue>[]): PlayerCue[] {
@@ -305,8 +310,8 @@ async function initPeaks(): Promise<void> {
   audio.load();
   const initToken = ++peaksInitToken;
   Peaks.init({
-    zoomview: { container: zoomview, waveformColor: "#ffffff", playedWaveformColor: "#636368", playheadColor: HEX_ACCENT, showPlayheadTime: true, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
-    overview: { container: overview, highlightOffset: 0, waveformColor: HEX_GRAY, playedWaveformColor: HEX_SECONDARY, highlightColor: HEX_PRIMARY, highlightStrokeColor: HEX_ACCENT, highlightOpacity: 0.15, playheadColor: HEX_ACCENT, showPlayheadTime: false, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
+    zoomview: { container: zoomview, waveformColor: "#ffffff", playedWaveformColor: HEX_SECONDARY, playheadColor: HEX_ACCENT, showPlayheadTime: true, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
+    overview: { container: overview, highlightOffset: 0, waveformColor: HEX_GRAY, playedWaveformColor: HEX_SECONDARY, highlightColor: HEX_PRIMARY, highlightStrokeColor: HEX_ACCENT, highlightOpacity: 0.10, playheadColor: HEX_ACCENT, showPlayheadTime: false, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true },
     mediaElement: audio, waveformData: createPeaksWaveformData(preview.waveform_peaks), webAudio: false as never, zoomLevels: ZOOM_LEVELS, keyboard: false, pointMarkerColor: HEX_ACCENT, createPointMarker,
   }, (error: Error | null, instance: unknown) => {
     if (initToken !== peaksInitToken) { try { (instance as any)?.destroy?.(); } catch { /* stale Peaks callback */ } return; }
@@ -317,6 +322,12 @@ async function initPeaks(): Promise<void> {
       wirePlayerEvents();
       const waveformCanvas = zoomview.querySelector("canvas");
       if (waveformCanvas) { waveformCanvas.style.backgroundColor = "#18181b"; waveformCanvas.style.mixBlendMode = "darken"; }
+      const overviewCanvas = overview.querySelector("canvas");
+      if (overviewCanvas) {
+        // Aquí pones el color de fondo que quieras para la pequeña
+        overviewCanvas.style.backgroundColor = "#17171a";
+        // overviewCanvas.style.mixBlendMode = "darken"; // Descomenta esto si quieres el mismo efecto de fusión
+      }
       if (view) {
         if (!trackData.value.duration_ms) trackData.value.duration_ms = peaks.value.player.getDuration() * 1000;
         view.setZoom({ seconds: trackData.value.duration_ms / 1500 });
@@ -377,6 +388,8 @@ function wireDragEvents(): void {
 async function togglePlay(): Promise<void> { if (isAnalysisRunning.value) return; const instance = peaks.value; if (!instance) return; if (isPlaying.value) { instance.player.pause(); return; } try { await instance.player.play(); } catch (error) { loadError.value = `Playback failed: ${String(error)}`; } }
 function stop(): void { if (isAnalysisRunning.value) return; const instance = peaks.value; if (!instance) return; instance.player.pause(); instance.player.seek(0); isPlaying.value = false; }
 function jumpToCue(padIndex: number): void { if (isAnalysisRunning.value) return; const cue = padSlots.value[padIndex - 1]; if (peaks.value && cue) peaks.value.player.seek(cue.position_ms / 1000); }
+
+let isPlayPromisePending = false;
 async function startCuePreview(padIndex: number): Promise<void> {
   if (isAnalysisRunning.value) return;
   const cue = padSlots.value[padIndex - 1];
@@ -384,14 +397,34 @@ async function startCuePreview(padIndex: number): Promise<void> {
   if (!instance || !cue || activeCue.value) return;
   activePad.value = padIndex;
   activeCue.value = cue;
+  if (isPlaying.value) {
+    instance.player.pause();
+  }
   instance.player.seek(cue.position_ms / 1000);
-  try { await instance.player.play(); if (activeCue.value?.id !== cue.id) { instance.player.pause(); instance.player.seek(cue.position_ms / 1000); } }
-  catch (error: any) { activeCue.value = null; if (error.name !== "AbortError") loadError.value = `Cue preview failed: ${String(error)}`; }
+  try {
+    isPlayPromisePending = true; // Bloquea nuevas solicitudes
+    // WebKit workaround: Micro-pausa para permitir que el buffer asimile el 'seek' antes de 'play'
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (activeCue.value?.id !== cue.id) {
+      isPlayPromisePending = false;
+      return;
+    }
+    await instance.player.play();
+    if (activeCue.value?.id !== cue.id) {
+      instance.player.pause();
+      instance.player.seek(cue.position_ms / 1000);
+    }
+  } catch (error: any) { activeCue.value = null; if (error.name !== "AbortError") loadError.value = `Cue preview failed: ${String(error)}`; }
 }
 function endCuePreview(padIndex: number): void {
   if (activePad.value !== padIndex) return;
   const cue = padSlots.value[padIndex - 1];
-  if (peaks.value && cue && activeCue.value?.id === cue.id) { peaks.value.player.pause(); peaks.value.player.seek(cue.position_ms / 1000); }
+  if (peaks.value && cue && activeCue.value?.id === cue.id) {
+    peaks.value.player.pause();
+    setTimeout(() => {
+      peaks.value?.player.seek(cue.position_ms / 1000);
+    }, 15);
+  }
   activeCue.value = null; activePad.value = null; isPlaying.value = false;
 }
 function skipBeats(beatsToSkip: number): void {
@@ -609,13 +642,13 @@ watch(() => props.trackPath ?? selectedTrackPath.value, (next, previous) => {
     <audio ref="audioRef" class="hidden" preload="none" aria-hidden="true" />
     <div
         class="transition-opacity duration-300 flex-1 min-h-0 flex flex-col"
-        :class="{ 'opacity-50 pointer-events-none grayscale': isAnalysisRunning }"
+        :class="{ 'opacity-50 pointer-events-none grayscale': isAppBlocked }"
         >
     <PlayerWaveform ref="waveformRef" :has-track="Boolean(trackData.track_path)" :is-loading="isLoadingTrack" :is-saving="saveStore.isSaving" :track-css-gradient="trackCssGradient" @resize="handleWaveformResize" @wheel="handleZoomWheel" @zoom-in="zoomIn" @zoom-out="zoomOut" />
         </div>
     <div
         class="transition-opacity duration-300 shrink-0 flex items-center gap-2"
-        :class="{ 'opacity-50 pointer-events-none grayscale': isAnalysisRunning }"
+        :class="{ 'opacity-50 pointer-events-none grayscale': isAppBlocked }"
     >
       <div class="flex-1 min-w-0">
         <PlayerTransport

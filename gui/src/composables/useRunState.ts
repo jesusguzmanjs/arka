@@ -23,6 +23,8 @@ export interface RunProgress {
 
 interface RunState {
   status: RunStatus;
+  isSystemBusy: boolean;
+  awaitingPlayerLoad: boolean;
   analysisStatus: string | null;
   logs: LogEntry[]; // append-only for the current run
   startedAt: number | null;
@@ -33,6 +35,8 @@ interface RunState {
 
 const state = reactive<RunState>({
   status: "idle",
+  isSystemBusy: false,
+  awaitingPlayerLoad: false,
   analysisStatus: null,
   logs: [],
   startedAt: null,
@@ -40,6 +44,20 @@ const state = reactive<RunState>({
   progress: null,
   currentPid: null,
 });
+
+let playerLoadTimeout: ReturnType<typeof setTimeout> | null = null;
+
+function clearPlayerLoadTimeout(): void {
+  if (playerLoadTimeout === null) return;
+  clearTimeout(playerLoadTimeout);
+  playerLoadTimeout = null;
+}
+
+function releaseSystemBusy(): void {
+  clearPlayerLoadTimeout();
+  state.awaitingPlayerLoad = false;
+  state.isSystemBusy = false;
+}
 
 function handleMessage(msg: SidecarMessage): void {
   if (msg.type === "track_start") {
@@ -58,12 +76,14 @@ export function useRunState() {
     ...toRefs(state),
     /** Clear logs and mark a run as started. */
     startRun: () => {
+      releaseSystemBusy();
       state.logs = [];
       state.analysisStatus = null;
       state.summary = null;
       state.progress = null;
       state.startedAt = Date.now();
       state.status = "running";
+      state.isSystemBusy = true;
     },
     /** Update the user-facing, reactive analysis status text. */
     setAnalysisStatus: (message: string | null) => {
@@ -79,13 +99,27 @@ export function useRunState() {
       state.summary = summary ?? state.summary;
       state.progress = null;
       state.currentPid = null;
+      if (status !== "success") releaseSystemBusy();
     },
+    /** Hold the global interaction lock while an auto-loaded player mounts. */
+    awaitPlayerLoad: () => {
+      clearPlayerLoadTimeout();
+      state.awaitingPlayerLoad = true;
+      state.isSystemBusy = true;
+      playerLoadTimeout = setTimeout(releaseSystemBusy, 5_000);
+    },
+    /** Release a single-track auto-load lock after the player reaches a terminal state. */
+    completePlayerLoad: () => {
+      if (state.awaitingPlayerLoad) releaseSystemBusy();
+    },
+    releaseSystemBusy,
     /** Empty the console without changing status. */
     clearLogs: () => {
       state.logs = [];
     },
     /** Reset back to idle (used by AutoCuePanel's reset flow). */
     reset: () => {
+      releaseSystemBusy();
       state.status = "idle";
       state.analysisStatus = null;
       state.logs = [];

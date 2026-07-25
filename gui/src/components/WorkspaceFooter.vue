@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import TelemetryToggleButton from "./TelemetryToggleButton.vue";
 import { useRunState } from "../composables/useRunState";
+import { useCueGridSidecar } from "../composables/useCueGridSidecar";
 
 defineProps<{
   telemetryAvailable: boolean;
@@ -13,6 +14,11 @@ const emit = defineEmits<{
 }>();
 
 const { status, analysisStatus, progress } = useRunState();
+const { cancel } = useCueGridSidecar();
+
+async function cancelAnalysis(): Promise<void> {
+  await cancel();
+}
 </script>
 
 <template>
@@ -27,6 +33,13 @@ const { status, analysisStatus, progress } = useRunState();
         <circle class="opacity-25" cx="10" cy="10" r="8" stroke="currentColor" stroke-width="2" />
         <path class="opacity-90" d="M18 10a8 8 0 0 1-8 8" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
       </svg>
+      <button
+        type="button"
+        class="shrink-0 rounded border border-warn/70 px-2 py-0.5 text-xs font-semibold text-warn transition-colors hover:border-warn hover:bg-warn/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-warn"
+        @click="cancelAnalysis"
+      >
+        Cancel
+      </button>
       <span class="truncate">
         {{ progress ? `Analyzing track ${progress.current} of ${progress.total}…` : (analysisStatus ?? "Analyzing…") }}
       </span>

@@ -23,7 +23,13 @@ export function useWaveformSync(options: WaveformSyncOptions) {
   let syncRaf: number | null = null;
   const trackCssGradient = computed(() => {
     const colorMap = options.preview.value?.color_map;
-    if (!colorMap?.length || !options.trackData.value.duration_ms) return "none";
+    if (!options.trackData.value.duration_ms) return "none";
+
+    // V1.0 Fallback: Si el backend envía el array de espectro vacío,
+    // rellenamos la onda entera con el amarillo corporativo de CueGrid.
+    if (!colorMap || colorMap.length === 0) {
+      return "linear-gradient(to right, #ada17b, #ada17b)";
+    }
 
     // 1. Corregido el # en los Hex
     const low = hexToRgb("#E01622"); // Rojo/Rosa Neón (Kicks)

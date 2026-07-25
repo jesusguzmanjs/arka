@@ -14,10 +14,10 @@ const props = defineProps<{
 
 const { sensitivity, maxCues, clearExisting, isValid, selectedPlaylist, update } = useConfigState();
 const { collection, currentViewTracks, selectedLibraryPaths } = useLibraryState();
-const { status, analysisStatus, progress, summary, logs, clearSummary } = useRunState();
+const { status, isSystemBusy, analysisStatus, progress, summary, logs, clearSummary } = useRunState();
 const { run, runSelectedTracks, cancel, resetRun } = useCueGridSidecar();
 
-const locked = computed(() => props.disabled || status.value === "running");
+const locked = computed(() => props.disabled || isSystemBusy.value);
 const selectedTracks = computed(() =>
   selectedLibraryPaths.value
     .map((path) => collection.value[path])
@@ -126,11 +126,11 @@ async function onPrimary(): Promise<void> {
                   @click="onPrimary"
                 >
                   <span
-                    v-if="status === 'running'"
+                    v-if="isSystemBusy"
                     class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-base/40 border-t-base"
                   />
                   <span v-else class="text-base">▶</span>
-                  <span>{{ status === "running" ? "Auto Cue running…" : actionLabel }}</span>
+                  <span>{{ status === "running" ? "Auto Cue running…" : (isSystemBusy ? "Loading track…" : actionLabel) }}</span>
                 </button>
 
                 <button

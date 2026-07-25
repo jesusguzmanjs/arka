@@ -5,7 +5,7 @@ export default {
     extend: {
       colors: {
         // surfaces (see .openspec/3-gui-spec.md §4)
-        base: "#121212",
+        base: "#1c1c1e",
         panel: "#1c1c1e",
         elevated: "#232326",
         console: "#0d0d0f",
@@ -25,7 +25,7 @@ export default {
           hover: "#BD903B",
           pressed: "#edb40b",
         },
-        warning: "#f43f5e",
+        warning: "#edb40b",
         // text
         foreground: "#f2f2f2",
         muted: "#8a8a8e",

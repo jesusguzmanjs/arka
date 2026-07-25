@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use sysinfo::{ProcessesToUpdate, System};
 use tauri::{Emitter, Manager};
 
 #[cfg(windows)]
@@ -10,6 +12,33 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const TRAKTOR_STATUS_EVENT: &str = "traktor-status";
+const TRAKTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn is_traktor_process_name(process_name: &str) -> bool {
+    #[cfg(windows)]
+    return process_name.eq_ignore_ascii_case("Traktor.exe");
+
+    #[cfg(not(windows))]
+    return process_name.eq_ignore_ascii_case("Traktor");
+}
+
+fn is_traktor_running() -> bool {
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .any(|process| is_traktor_process_name(&process.name().to_string_lossy()))
+}
+
+fn start_traktor_monitor(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        let _ = app.emit(TRAKTOR_STATUS_EVENT, is_traktor_running());
+        std::thread::sleep(TRAKTOR_POLL_INTERVAL);
+    });
+}
 
 fn telemetry_cache_path() -> PathBuf {
     std::env::temp_dir()
@@ -48,6 +77,12 @@ fn core_command(core_exe: PathBuf) -> Command {
     command
 }
 
+fn append_nml_path(args: &mut Vec<String>, nml_path: Option<String>) {
+    if let Some(path) = nml_path.filter(|path| !path.trim().is_empty()) {
+        args.extend(["--nml".to_string(), path]);
+    }
+}
+
 #[tauri::command]
 async fn cancel_analysis() -> Result<(), String> {
     if let Ok(mut guard) = get_active_process().lock() {
@@ -59,9 +94,20 @@ async fn cancel_analysis() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn start_analysis_stream(app: tauri::AppHandle, args: Vec<String>) -> Result<(), String> {
+fn get_traktor_status() -> bool {
+    is_traktor_running()
+}
+
+#[tauri::command]
+async fn start_analysis_stream(
+    app: tauri::AppHandle,
+    mut args: Vec<String>,
+    nml_path: Option<String>,
+) -> Result<(), String> {
     // Usamos la función auxiliar
     let core_exe = get_core_executable_path(&app)?;
+
+    append_nml_path(&mut args, nml_path);
 
     let mut child = core_command(core_exe)
         .args(args)
@@ -177,9 +223,15 @@ async fn load_track_for_player(
 }
 
 #[tauri::command]
-async fn call_cuegrid_core(app: tauri::AppHandle, args: Vec<String>) -> Result<String, String> {
+async fn call_cuegrid_core(
+    app: tauri::AppHandle,
+    mut args: Vec<String>,
+    nml_path: Option<String>,
+) -> Result<String, String> {
     // Usamos la función auxiliar
     let core_exe = get_core_executable_path(&app)?;
+
+    append_nml_path(&mut args, nml_path);
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         core_command(core_exe)
@@ -227,12 +279,64 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             greet,
+            get_traktor_status,
             export_last_run_telemetry,
             load_track_for_player,
             call_cuegrid_core,
             cancel_analysis,
             start_analysis_stream,
         ])
+        .setup(|app| {
+            start_traktor_monitor(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_nml_path, is_traktor_process_name};
+
+    #[test]
+    fn appends_a_nonempty_nml_path_as_one_argument() {
+        let mut args = vec!["--get-library".to_string()];
+
+        append_nml_path(
+            &mut args,
+            Some("E:\\DJ Collection\\collection.nml".to_string()),
+        );
+
+        assert_eq!(
+            args,
+            [
+                "--get-library",
+                "--nml",
+                "E:\\DJ Collection\\collection.nml"
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_an_empty_nml_path() {
+        let mut args = vec!["--get-library".to_string()];
+        append_nml_path(&mut args, Some("   ".to_string()));
+
+        assert_eq!(args, ["--get-library"]);
+    }
+
+    #[test]
+    fn detects_the_platform_traktor_process_name_case_insensitively() {
+        #[cfg(target_os = "windows")]
+        assert!(is_traktor_process_name("TRAKTOR.EXE"));
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(is_traktor_process_name("traktor"));
+    }
+
+    #[test]
+    fn does_not_match_other_processes() {
+        assert!(!is_traktor_process_name("chrome.exe"));
+        assert!(!is_traktor_process_name("Traktor Pro.exe"));
+    }
 }

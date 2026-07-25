@@ -2,6 +2,16 @@
 
 Status: Current implementation synchronized 2026-07-22 (Vue/Tauri shell, Peaks.js player, library browser, modal Auto Cue flow, and Python sidecar flow). Smart Playlist architecture added 2026-07-21.
 
+### Manual collection path fallback
+
+The GUI persists an optional `customNmlPath` in `localStorage` through the shared configuration state. At startup, a persisted non-empty path is the active collection path; otherwise the GUI attempts standard discovery. The header renders one collection-status button. For a standard Traktor path, its label is derived from the parent directory as **Traktor <version> NML** (for example, **Traktor 4.5 NML**); its tooltip exposes the complete path. When no collection is active, it reads **No collection found**. Clicking this same button opens the native Tauri dialog with an `.nml`-only filter and stores the selected path as `customNmlPath`.
+
+All core invocations pass the optional path as `nmlPath` to the Tauri bridge. `call_cuegrid_core` and streamed analysis append `--nml <path>` in Rust when it is present, so paths containing spaces remain a single process argument. The legacy `nmlPathOverride` config field remains the internal compatibility name for this persisted path.
+
+Changing collections is guarded by the same native unsaved-changes dialog used by a window-close request. If changes are pending, **Save Changes** must complete successfully before the file picker opens, **Discard** clears the pending frontend state before it opens, and **Cancel** leaves both the collection and file picker unchanged.
+
+While Auto Cue analysis is running, global view navigation and the collection-status selector are disabled. The UI must block pointer and keyboard activation, and their handlers must not switch views or open a file picker until the run state has left `running`.
+
 Historical revision notes below are retained only where they describe still-visible UI behavior; they do not indicate pending implementation. The core sidecar contract is defined by `2-core-spec.md`. Active analysis is master-track HPSS analysis and has no Stem/source-selection mode; NML `FLAGS` may still be displayed as UI metadata.
 (v1.7 adds the single-track context-menu interaction, conditional player teardown, and reactive analysis status messages; v1.5 adds dynamic Stem availability badges in the track list and
 retains the mandatory post-operation synchronization loop between Vue
@@ -25,6 +35,28 @@ unchanged.)
 
 ## Current implementation synchronization
 
+### Traktor process safety interlock
+
+CueGrid MUST actively monitor the host operating system for Traktor before
+allowing any collection-management interaction. The Rust Tauri backend polls
+the process list every two seconds using `sysinfo`, matching `Traktor.exe`
+case-insensitively on Windows and `Traktor` case-insensitively on macOS and
+Linux. It emits a `traktor-status` Tauri event containing a boolean payload on
+each poll. It also exposes the current boolean status for the frontend's
+initial bootstrap read, so Traktor detected at application startup is blocked
+without waiting for the first polling event.
+
+`App.vue` registers the event listener during its lifecycle and composes a
+global `TraktorSafetyOverlay`. When the status is true, the overlay MUST cover
+the entire application viewport at the highest application z-index, blur and
+block the UI beneath it, and provide no dismiss, close, or escape route. Its
+warning text MUST read: **"Traktor is currently running. Please close Traktor
+to safely manage your collection and prevent data loss."** The overlay MUST
+disappear automatically as soon as a later backend status reports that Traktor
+has closed. This interlock applies at startup and throughout the application's
+runtime to prevent Traktor from overwriting CueGrid's `collection.nml` writes
+on exit.
+
 The checked-out GUI is no longer the create-tauri-app scaffold described by
 the historical sections below. The current source of truth is:
 
@@ -35,10 +67,12 @@ the historical sections below. The current source of truth is:
   is no persistent **AUTO CUE** card, bottom bar, or mounted `AutoCuePanel`.
   `LibraryBrowser` consumes all remaining height above the fixed workspace
   footer, so its table extends to the bottom of the window.
-- Scrolling is delegated to internal containers. `LibraryBrowser.vue` keeps
-  separate `min-h-0 overflow-y-auto scrollbar-amber` containers for playlists
-  and the track table; `AudioPlayer.vue` owns its own vertical overflow. No
-  page-level scrolling is permitted.
+- Scrolling is delegated to internal containers. `LibraryBrowser.vue` keeps a
+  three-zone playlist sidebar: fixed **NAVIGATE** / **All Tracks** / **PLAYLISTS**
+  headers, a separate `min-h-0 overflow-y-auto scrollbar-amber` playlist-list
+  container, and a fixed footer containing **Create Smart Playlist**. The
+  track table has its own scroll container; `AudioPlayer.vue` owns its own
+  vertical overflow. No page-level scrolling is permitted.
 - `gui/tailwind.config.js` defines the semantic Amber/Ochre roles
   `primary`, `secondary`, `accent`, and `warning`, alongside dark `base`,
   `panel`, `elevated`, and `console` surfaces. Blue/green stage colors and
@@ -59,9 +93,10 @@ the historical sections below. The current source of truth is:
   owns the edit form, mutates loaded library state in memory, and marks each
   affected track dirty. It makes no sidecar write when the modal applies.
 - Smart Playlist creation is a library-level operation. `LibraryBrowser.vue`
-  renders the dedicated add button above the playlist selector and opens
-  `SmartPlaylistModal.vue`; the modal delegates compilation to the Python
-  sidecar and reloads the library only after a successful NML mutation.
+  renders a fixed, full-width **Create Smart Playlist** button in the playlist
+  sidebar footer and opens `SmartPlaylistModal.vue`; the modal delegates
+  compilation to the Python sidecar and reloads the library only after a
+  successful NML mutation.
 
 ### Session-history playlist import revision
 
@@ -247,12 +282,18 @@ global run-state UI and the fixed footer's telemetry/export affordances remain
 unchanged; this revision moves only Auto Cue configuration and execution
 initiation into the modal.
 
+The Auto Cue modal closes immediately when **Run Analysis** is activated,
+before awaiting sidecar execution. While global run state is `running`,
+`WorkspaceFooter.vue` renders a **Cancel** control next to the progress
+indicator. It calls `useCueGridSidecar().cancel()` and is absent for every
+non-running state.
+
 ### Smart Playlist creation
 
-The Collection View's playlist column must render one compact, accessible `+`
-button directly above the playlist selector/list. Its accessible name is
-**Create Smart Playlist**. Clicking it opens `SmartPlaylistModal.vue`; it does
-not create or mutate a playlist until the user submits a valid modal form.
+The Collection View's playlist sidebar must render one fixed, full-width
+**Create Smart Playlist** button below the independently scrollable playlist
+list. Clicking it opens `SmartPlaylistModal.vue`; it does not create or mutate
+a playlist until the user submits a valid modal form.
 
 The modal contains all of the following controls:
 

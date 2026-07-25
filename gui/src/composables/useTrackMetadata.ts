@@ -12,7 +12,6 @@
 // them co-located avoids a premature split that no other module reads.
 
 import { markRaw, reactive, toRefs } from "vue";
-import { invoke } from "@tauri-apps/api/core"; // Swapeado por la API nativa de invocación
 import { useCueGridSidecar } from "./useCueGridSidecar";
 import type {
   ExistingCue,
@@ -173,15 +172,12 @@ export interface FetchTrackMetadataResult {
    const cached = playerState.previewCache.get(trackPath);
    if (cached) return { ok: true, metadata: cached };
  
-   const { nmlPathOverride } = useCueGridSidecar();
+   const { callCueGridCore } = useCueGridSidecar();
    const args = ["--get-track-metadata", trackPath];
-   if (nmlPathOverride.value) {
-     args.push("--nml", nmlPathOverride.value);
-   }
  
    try {
      // Invocamos el puente genérico. Pedimos 'any' porque Rust puede devolver string o el objeto.
-     const rawStdout = await invoke<any>("call_cuegrid_core", { args });
+     const rawStdout = await callCueGridCore(args);
      
      let parsed: any;
  
