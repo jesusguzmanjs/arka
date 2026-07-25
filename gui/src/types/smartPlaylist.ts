@@ -7,7 +7,8 @@ export type SmartPlaylistField =
   | "key"
   | "import_date"
   | "last_played"
-  | "rating";
+  | "rating"
+  | "track_format";
 
 export type SmartPlaylistOperator =
   | "equals"

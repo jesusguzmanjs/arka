@@ -1469,9 +1469,11 @@ made to their path-based bridge contract.
 ### 9.4 Tracklist columns, sorting, and resizing (v1.3)
 
 This section supersedes the right-column table-column requirements in section
-3.5. The tracklist has six columns, in this order: the existing narrow,
-unlabelled **Action** column, then **Artist**, **Title**, **BPM**, **Key**, and
-**Duration**. `Key` renders `CollectionTrack.key`; an absent NML key renders
+3.5. The tracklist has seven columns, in this order: the existing narrow,
+unlabelled **Action** column; a narrow, unlabelled **Stem** indicator column;
+then **Artist**, **Title**, **BPM**, **Key**, and **Duration**. The Stem column
+renders the accessible native-Stems icon for tracks whose `flags` contain bit
+`0x40`, otherwise an empty cell. `Key` renders `CollectionTrack.key`; an absent NML key renders
 as an empty cell. `Duration` renders the existing `duration_ms` value in a
 human-readable duration format. `Artist`, `Title`, `BPM`, `Key`, and
 `Duration` are visible metadata columns; `location_path` remains an internal
@@ -1483,7 +1485,7 @@ by the disabled-row treatment and the accessible tooltip defined in section
 
 #### 9.4.1 Local sorting
 
-Clicking a sortable metadata header (`Artist`, `Title`, `BPM`, `Key`, or
+Clicking a sortable metadata header (`Stem`, `Artist`, `Title`, `BPM`, `Key`, or
 `Duration`) anywhere within its header cell sorts the currently visible track
 rows locally by that field. The resize handle is the only excluded hit target.
 The first click selects that field in ascending order; clicking the active
@@ -1495,7 +1497,8 @@ The chosen sort field and direction are browser-level table state, not
 playlist-local state: changing playlists, selecting Global Collection, or
 refreshing the visible source must preserve the active sort state and apply it
 to the new visible rows. When no header has been selected, rows retain the
-source ordering specified in section 9.2.
+source ordering specified in section 9.2. The Stem header has no visible text,
+but its sort control has an accessible Stem label.
 
 #### 9.4.2 Resizable columns
 

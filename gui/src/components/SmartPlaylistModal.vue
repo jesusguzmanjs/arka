@@ -8,7 +8,7 @@ import type {
   SmartPlaylistRule,
 } from "../types/smartPlaylist";
 
-type ValueKind = "number" | "whole-number" | "range" | "text" | "key" | "date" | "days" | "rating";
+type ValueKind = "number" | "whole-number" | "range" | "text" | "key" | "date" | "days" | "rating" | "format";
 
 interface RuleDraft {
   id: number;
@@ -75,6 +75,7 @@ const FIELD_OPTIONS: readonly FieldOption[] = [
   { value: "playcount", label: "Playcount", valueKind: "whole-number", operators: NUMERIC_OPERATORS },
   { value: "label", label: "Label", valueKind: "text", operators: TEXT_OPERATORS },
   { value: "comment", label: "Comment", valueKind: "text", operators: TEXT_OPERATORS },
+  { value: "track_format", label: "Track Format", valueKind: "format", operators: [{ value: "is_exactly", label: "Is exactly" }] },
 ];
 
 const emit = defineEmits<{
@@ -169,7 +170,7 @@ function isPositiveInteger(value: string | number): boolean {
 
 function isRuleValid(rule: RuleDraft): boolean {
   const kind = valueKind(rule);
-  if (kind === "text" || kind === "key" || kind === "date") return String(rule.value).trim().length > 0;
+  if (kind === "text" || kind === "key" || kind === "date" || kind === "format") return String(rule.value).trim().length > 0;
   if (kind === "rating") {
     const rating = finiteNumber(rule.value);
     return rating !== null && Number.isInteger(rating) && rating >= 1 && rating <= 5;
@@ -266,7 +267,7 @@ onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
           <div>
             <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-secondary">Collection tools</p>
             <h2 id="smart-playlist-title" class="mt-1 text-lg font-semibold text-zinc-100">Create Smart Playlist</h2>
-            <p class="mt-1 text-xs text-muted">Build a rule set; CueGrid compiles the current matches into Traktor.</p>
+            <p class="mt-1 text-xs text-muted">Build a rule set; Arka compiles the current matches into Traktor.</p>
           </div>
           <button
             type="button"
@@ -378,6 +379,10 @@ onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
                   <select v-else-if="valueKind(rule) === 'rating'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Rating value for rule ${index + 1}`">
                     <option value="" disabled>Select a rating</option>
                     <option v-for="rating in 5" :key="rating" :value="String(rating)">{{ '★'.repeat(rating) }}{{ '☆'.repeat(5 - rating) }} · {{ rating }}</option>
+                  </select>
+                  <select v-else-if="valueKind(rule) === 'format'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Track format value for rule ${index + 1}`">
+                    <option value="" disabled>Select a track format</option>
+                    <option value="Stem">Stem</option>
                   </select>
                   <input
                       v-else

@@ -17,32 +17,33 @@ const TRAKTOR_STATUS_EVENT: &str = "traktor-status";
 const TRAKTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn is_traktor_process_name(process_name: &str) -> bool {
-    #[cfg(windows)]
-    return process_name.eq_ignore_ascii_case("Traktor.exe");
-
-    #[cfg(not(windows))]
-    return process_name.eq_ignore_ascii_case("Traktor");
-}
-
-fn is_traktor_running() -> bool {
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system
-        .processes()
-        .values()
-        .any(|process| is_traktor_process_name(&process.name().to_string_lossy()))
+    // Lo pasamos a minúsculas y buscamos "traktor" en cualquier parte del nombre del proceso
+    process_name.to_lowercase().contains("traktor")
 }
 
 fn start_traktor_monitor(app: tauri::AppHandle) {
-    std::thread::spawn(move || loop {
-        let _ = app.emit(TRAKTOR_STATUS_EVENT, is_traktor_running());
-        std::thread::sleep(TRAKTOR_POLL_INTERVAL);
+    std::thread::spawn(move || {
+        // Instanciamos el sistema UNA sola vez fuera del bucle
+        let mut system = System::new();
+
+        loop {
+            // Solo pedimos a macOS que actualice los procesos, nada de discos ni red
+            system.refresh_processes(ProcessesToUpdate::All, true);
+
+            let is_running = system
+                .processes()
+                .values()
+                .any(|process| is_traktor_process_name(&process.name().to_string_lossy()));
+
+            let _ = app.emit(TRAKTOR_STATUS_EVENT, is_running);
+            std::thread::sleep(TRAKTOR_POLL_INTERVAL);
+        }
     });
 }
 
 fn telemetry_cache_path() -> PathBuf {
     std::env::temp_dir()
-        .join("cuegrid")
+        .join("arka")
         .join("last_run_telemetry.csv")
 }
 
@@ -95,7 +96,13 @@ async fn cancel_analysis() -> Result<(), String> {
 
 #[tauri::command]
 fn get_traktor_status() -> bool {
-    is_traktor_running()
+    // IMPORTANTE: new() crea una estructura vacía, mucho más rápido que new_all()
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .any(|process| is_traktor_process_name(&process.name().to_string_lossy()))
 }
 
 #[tauri::command]
@@ -337,6 +344,6 @@ mod tests {
     #[test]
     fn does_not_match_other_processes() {
         assert!(!is_traktor_process_name("chrome.exe"));
-        assert!(!is_traktor_process_name("Traktor Pro.exe"));
+        assert!(!is_traktor_process_name("rekordbox.exe"));
     }
 }

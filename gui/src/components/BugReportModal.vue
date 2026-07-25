@@ -119,7 +119,7 @@ onUnmounted(() => {
         tabindex="-1"
       >
         <header class="border-b border-zinc-700 px-5 py-4">
-          <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-secondary">CueGrid feedback</p>
+          <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-secondary">Arka feedback</p>
           <h2 id="bug-report-title" class="mt-1 text-lg font-semibold text-zinc-100">Report a Bug / Feedback</h2>
         </header>
 

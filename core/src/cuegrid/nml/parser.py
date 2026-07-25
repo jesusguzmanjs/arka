@@ -412,6 +412,7 @@ class NmlParser:
             "lyrics": entry.lyrics,
             "mix": entry.mix,
             "rating": entry.rating,
+            "flags": entry.flags,
         }
 
     def _playlist_nodes_to_payload(
@@ -593,7 +594,7 @@ class NmlParser:
                 pass
         if not key and info_el is not None:
             key = normalize_to_open_key(info_el.get("KEY", ""))
-        flags: int | None = None
+        flags = 0
         album_el = entry_el.find("ALBUM")
         album = album_el.get("TITLE", "") if album_el is not None else ""
         remixer = producer = genre = label = comment = comment2 = lyrics = mix = ""
@@ -608,9 +609,12 @@ class NmlParser:
             lyrics = info_el.get("KEY_LYRICS", "")
             mix = info_el.get("MIX", "")
             rating = NmlParser._extract_rating(info_el.get("RANKING"))
-            flags_str = info_el.get("FLAGS")
-            if flags_str is not None:
-                flags = int(flags_str)
+            flags_str = info_el.get("FLAGS", "")
+            try:
+                parsed_flags = int(flags_str)
+                flags = parsed_flags if parsed_flags >= 0 else 0
+            except ValueError:
+                flags = 0
 
         cues: list[CuePoint] = []
         grid_anchor_ms = 0.0

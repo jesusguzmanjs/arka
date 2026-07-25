@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "gui",
+  "productName": "Arka",
   "version": "0.1.0",
-  "identifier": "com.skam.gui",
+  "identifier": "com.arka.dj",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "CueGrid",
+        "title": "Arka",
         "width": 1120,
         "height": 970,
         "minWidth": 1024,

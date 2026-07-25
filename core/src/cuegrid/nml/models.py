@@ -64,4 +64,4 @@ class TrackEntry:
         None  # from <LOUDNESS PERCEIVED_DB="...">; None if absent
     )
     audio_id: str | None = None  # from <ENTRY AUDIO_ID="...">; None if absent
-    flags: int | None = None  # from <INFO FLAGS="...">; None if absent (v2.0 stems)
+    flags: int = 0  # from <INFO FLAGS="...">; zero when absent or malformed

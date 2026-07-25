@@ -20,6 +20,7 @@ def track() -> dict:
         "import_date": "2026/7/15",
         "last_played": "2026/7/20",
         "rating": 204,
+        "flags": 0x40,
     }
 
 
@@ -41,6 +42,7 @@ def track() -> dict:
         ({"field": "rating", "operator": "equals", "value": 4}, True),
         ({"field": "rating", "operator": "greater_than_or_equal", "value": 4}, True),
         ({"field": "rating", "operator": "less_than_or_equal", "value": 3}, False),
+        ({"field": "track_format", "operator": "is_exactly", "value": "Stem"}, True),
     ],
 )
 def test_matches_supported_numeric_text_key_and_rating_rules(track, rule, expected):
@@ -106,6 +108,15 @@ def test_missing_attributes_default_to_zero_or_no_date_and_xml_elements_are_supp
     )
 
 
+def test_track_format_matches_the_native_stems_flag_for_mapping_and_xml_tracks():
+    stem_rule = {"field": "track_format", "operator": "is_exactly", "value": "Stem"}
+
+    assert matches_rule({"flags": 0x40}, stem_rule)
+    assert not matches_rule({"flags": 0x20}, stem_rule)
+    assert not matches_rule({"flags": "not-a-number"}, stem_rule)
+    assert matches_rule(ET.fromstring('<ENTRY><INFO FLAGS="64" /></ENTRY>'), stem_rule)
+
+
 def test_all_and_any_global_conditions(track):
     rules = [
         {"field": "genre", "operator": "contains", "value": "techno"},
@@ -122,6 +133,8 @@ def test_all_and_any_global_conditions(track):
         ([], "all"),
         ([{"field": "bpm", "operator": "unknown", "value": 120}], "all"),
         ([{"field": "rating", "operator": "equals", "value": 6}], "all"),
+        ([{"field": "track_format", "operator": "equals", "value": "Stem"}], "all"),
+        ([{"field": "track_format", "operator": "is_exactly", "value": "Audio"}], "all"),
         ([{"field": "bpm", "operator": "between", "value": {"min": 130, "max": 120}}], "all"),
         ([{"field": "bpm", "operator": "equals", "value": 120}], "invalid"),
     ],

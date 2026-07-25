@@ -21,7 +21,7 @@ defineProps<{
       <p id="traktor-safety-message" class="mt-3 text-sm leading-6 text-muted">
         Please close Traktor to safely manage your collection and prevent data loss.
       </p>
-      <p class="mt-5 text-xs text-muted">CueGrid will unlock automatically when Traktor has closed.</p>
+      <p class="mt-5 text-xs text-muted">Arka will unlock automatically when Traktor has closed.</p>
     </div>
   </section>
 </template>

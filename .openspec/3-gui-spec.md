@@ -322,6 +322,7 @@ canonical field/operator identifiers unchanged to the core contract in
 | Key | `key` | Exact Match / `is_exactly` | key text, for example `8A` |
 | Import Date | `import_date` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
 | Last Played | `last_played` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
+| Track Format | `track_format` | Is Exactly / `is_exactly` | fixed select option: Stem |
 | Rating | `rating` | Greater than or equal / `greater_than_or_equal`; Less than or equal / `less_than_or_equal`; Equals / `equals` | integer star rating 1–5 |
 
 `SmartPlaylistModal.vue` receives the current playlist names as an
@@ -546,13 +547,15 @@ const hasAvailableStems = (entry.flags & 0x40) === 0x40
 ```
 
 When `hasAvailableStems` is true, the row must dynamically render a
-distinctive, compact indicator next to the track title, such as a
-multi-layer, stacked-waveform, or equivalent Stem icon. The indicator means
+distinctive, compact indicator in its own narrow, unnamed, sortable Stem
+column, such as a multi-layer, stacked-waveform, or equivalent Stem icon. The indicator means
 that Traktor reports native Stems availability; it must not imply that the
-current run is configured to include Stems. Rows whose `flags` are missing,
-null, or do not contain bit `0x40` render no Stem badge. The icon must have
-an accessible label/tooltip (for example, `Stems available`) and must not
-replace or alter the track title text.
+current run is configured to include Stems. The `--get-library` collection
+payload always supplies `flags` as a number, defaulting to `0` when the NML
+attribute is missing or malformed; rows without bit `0x40` render no Stem
+badge. The icon must have an accessible label/tooltip (for example, `Stems
+available`) and must not replace or alter the track title text. The otherwise
+unnamed column's sort control must retain an accessible Stem label.
 
 ## 4. UI Layout
 

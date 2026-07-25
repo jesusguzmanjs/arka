@@ -442,7 +442,7 @@ class TestGlobalLibraryExport:
         nml_file.write_text(
             """<NML><COLLECTION><ENTRY TITLE="Title" ARTIST="Artist">
 <LOCATION VOLUME="C:" DIR="/:Music/:" FILE="metadata.flac" />
-<ALBUM TITLE="Release" /><INFO REMIXER="Remixer" PRODUCER="Producer" GENRE="Techno" LABEL="Label" COMMENT="Comment" RATING="Comment 2" KEY_LYRICS="Lyrics" MIX="Extended" RANKING="204" PLAYTIME="60" /><TEMPO BPM="120" />
+<ALBUM TITLE="Release" /><INFO REMIXER="Remixer" PRODUCER="Producer" GENRE="Techno" LABEL="Label" COMMENT="Comment" RATING="Comment 2" KEY_LYRICS="Lyrics" MIX="Extended" RANKING="204" FLAGS="76" PLAYTIME="60" /><TEMPO BPM="120" />
 </ENTRY></COLLECTION><PLAYLISTS /></NML>""",
             encoding="utf-8",
         )
@@ -451,12 +451,12 @@ class TestGlobalLibraryExport:
 
         assert {key: row[key] for key in (
             "title", "artist", "album", "remixer", "producer", "genre",
-            "label", "comment", "comment2", "lyrics", "mix", "rating",
+            "label", "comment", "comment2", "lyrics", "mix", "rating", "flags",
         )} == {
             "title": "Title", "artist": "Artist", "album": "Release",
             "remixer": "Remixer", "producer": "Producer", "genre": "Techno",
             "label": "Label", "comment": "Comment", "comment2": "Comment 2",
-            "lyrics": "Lyrics", "mix": "Extended", "rating": 4,
+            "lyrics": "Lyrics", "mix": "Extended", "rating": 4, "flags": 76,
         }
 
     def test_materializes_empty_editable_metadata_defaults(self, tmp_path):
@@ -475,6 +475,20 @@ class TestGlobalLibraryExport:
             "remixer", "producer", "genre", "label", "comment", "comment2", "lyrics", "mix",
         ))
         assert row["rating"] == 0
+        assert row["flags"] == 0
+
+    @pytest.mark.parametrize("flags", ["invalid", "-1"])
+    def test_defaults_malformed_or_negative_flags_to_zero(self, tmp_path, flags):
+        nml_file = tmp_path / "library.nml"
+        nml_file.write_text(
+            f'''<NML><COLLECTION><ENTRY TITLE="Title" ARTIST="Artist">
+<LOCATION VOLUME="C:" DIR="/:Music/:" FILE="flags.flac" />
+<INFO FLAGS="{flags}" /><TEMPO BPM="120" />
+</ENTRY></COLLECTION><PLAYLISTS /></NML>''',
+            encoding="utf-8",
+        )
+
+        assert NmlParser(nml_file).get_library()["collection"]["c:/music/flags.flac"]["flags"] == 0
     def test_extracts_and_serializes_musical_key(self, tmp_path):
         nml_file = tmp_path / "library.nml"
         nml_file.write_text(

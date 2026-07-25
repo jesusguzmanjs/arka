@@ -24,8 +24,8 @@ export interface CollectionTrack {
   is_flex_grid: boolean;
   existing_cues: ExistingCue[];
   collection_index: number;
-  /** Optional legacy NML flags field used only for the Stems badge. */
-  flags?: number | null;
+  /** Traktor INFO@FLAGS bitmask; the core supplies zero when it is absent or malformed. */
+  flags: number;
 }
 
 // Retained for source compatibility with existing library consumers.

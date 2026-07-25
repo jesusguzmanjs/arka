@@ -50,7 +50,7 @@ The checkout retains legacy Stem reference helpers in `audio/legacy_stems.py` an
 | `duration_ms` | `INFO.PLAYTIME_FLOAT * 1000`, falling back to `INFO.PLAYTIME * 1000` |
 | `cues` | parsed `CUE_V2` elements |
 | `peak_db`, `perceived_db` | optional `<LOUDNESS>` attributes |
-| `audio_id`, `flags` | retained NML metadata for callers/UI; not active detector inputs |
+| `audio_id`, `flags` | retained NML metadata for callers/UI; `flags` is a non-negative integer parsed from `INFO@FLAGS` and defaults to `0` when absent or malformed; neither is an active detector input |
 
 Path matching normalizes Traktor `VOLUME`/`DIR`/`FILE` values and a supplied filesystem path. A duplicate location requires `--title` and/or `--artist` to disambiguate; unmatched and still-ambiguous lookups are errors.
 
@@ -219,6 +219,7 @@ The supported field-to-NML mapping and operator set is fixed for this feature:
 | `key` | `ENTRY > INFO@KEY` | `is_exactly`, `equals` | one or more comma-separated exact keys, for example `8A, 8B, 9A` |
 | `import_date` | `ENTRY > INFO@IMPORT_DATE` | `in_last_days`, `before`, `after` | `YYYY/M/D` or `YYYY/MM/DD` NML date; comparison is calendar-date based |
 | `last_played` | `ENTRY > INFO@LAST_PLAYED` | `in_last_days`, `before`, `after` | same date format; missing means no date |
+| `track_format` | `ENTRY > INFO@FLAGS` | `is_exactly` | the fixed value `Stem` |
 | `rating` | `ENTRY > INFO@RANKING` | `greater_than_or_equal`, `less_than_or_equal`, `equals` | UI integer stars `1`–`5` |
 
 String comparison is case-insensitive Unicode text comparison. `contains` and
@@ -232,6 +233,11 @@ Key matching is case-insensitive and ignores surrounding whitespace. A Key
 rule may contain one or more comma-separated targets; the track matches when
 its normalized key exactly equals any normalized target. For example,
 `" 8a, 8b, 9a "` matches a track whose NML key is `8A`.
+
+`track_format` supports only `is_exactly` with the case-insensitive value
+`Stem`. It evaluates true when the `0x40` bit is present in `INFO@FLAGS`, the
+same native-Stems availability signal exposed by the Library Browser. Missing,
+malformed, or unset flags evaluate as not Stem.
 
 #### BPM comparison rules
 
@@ -537,6 +543,7 @@ Every collection entry in a successful `--get-library` response must include eve
 | `comment2` | string | `ENTRY > INFO@RATING` |
 | `lyrics` | string | `ENTRY > INFO@KEY_LYRICS` |
 | `mix` | string | `ENTRY > INFO@MIX` |
+| `flags` | number | `ENTRY > INFO@FLAGS`, parsed as a non-negative integer; missing or malformed values are `0` |
 | `rating` | number | `ENTRY > INFO@RANKING`, converted from Traktor's `0`–`255` representation to the nearest integer `0`–`5` rating |
 
 The payload is a read-only representation of the active `collection.nml` state at query time. It must not infer values from physical audio-file tags, cached UI state, or an audio decode.

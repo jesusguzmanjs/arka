@@ -15,7 +15,7 @@ Rule = Mapping[str, Any]
 _STRING_FIELDS = {"genre", "label", "comment"}
 _NUMERIC_FIELDS = {"bpm", "playcount"}
 _DATE_FIELDS = {"import_date", "last_played"}
-_SUPPORTED_FIELDS = _STRING_FIELDS | _NUMERIC_FIELDS | _DATE_FIELDS | {"key", "rating"}
+_SUPPORTED_FIELDS = _STRING_FIELDS | _NUMERIC_FIELDS | _DATE_FIELDS | {"key", "rating", "track_format"}
 _BPM_TOLERANCE = 0.5
 
 
@@ -65,6 +65,8 @@ def matches_rule(track: TrackData, rule: Rule, *, today: date | None = None) -> 
         if operator not in {"is_exactly", "equals", "contains", "does_not_contain"}:
             raise ValueError("unsupported key operator: %r" % operator)
         return _match_key(_key_value(track), operator, rule.get("value"))
+    if field == "track_format":
+        return _match_track_format(track, operator, rule.get("value"))
     if field in _DATE_FIELDS:
         return _match_date(_date_value(track, field), operator, rule.get("value"), today or date.today())
     return _match_rating(_numeric_value(track, "rating"), operator, rule.get("value"))
@@ -140,6 +142,15 @@ def _match_key(actual: str, operator: str, value: Any) -> bool:
     return not matches if operator == "does_not_contain" else matches
 
 
+def _match_track_format(track: TrackData, operator: str, value: Any) -> bool:
+    """Match Traktor native-Stem availability from the INFO FLAGS bitmask."""
+    if operator != "is_exactly":
+        raise ValueError(f"unsupported track format operator: {operator!r}")
+    if _required_text(value).casefold() != "stem":
+        raise ValueError("track_format must be exactly 'Stem'")
+    return _flags_value(track) & 0x40 == 0x40
+
+
 def _match_date(actual: date | None, operator: str, value: Any, today: date) -> bool:
     if actual is None:
         return False
@@ -206,6 +217,17 @@ def _date_value(track: TrackData, field: str) -> date | None:
     return _parse_date(_attribute(track, field))
 
 
+def _flags_value(track: TrackData) -> int:
+    """Return a valid INFO FLAGS bitmask, defaulting malformed values to zero."""
+    raw = _attribute(track, "flags")
+    if isinstance(raw, bool):
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _attribute(track: TrackData, field: str) -> Any:
     nml_attributes = {
         "bpm": ("TEMPO", "BPM"),
@@ -217,6 +239,7 @@ def _attribute(track: TrackData, field: str) -> Any:
         "import_date": ("INFO", "IMPORT_DATE"),
         "last_played": ("INFO", "LAST_PLAYED"),
         "rating": ("INFO", "RANKING"),
+        "flags": ("INFO", "FLAGS"),
     }
     if isinstance(track, ET.Element):
         child_name, attribute = nml_attributes[field]

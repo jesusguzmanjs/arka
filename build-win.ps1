@@ -5,7 +5,7 @@ $CoreDir     = Join-Path $RepoRoot "core"
 $GuiDir      = Join-Path $RepoRoot "gui"
 $ResourcesDir = Join-Path $GuiDir "src-tauri\resources\cuegrid-core"
 
-Write-Host "=== CueGrid production build (Windows) ===" -ForegroundColor Cyan
+Write-Host "=== Arka production build (Windows) ===" -ForegroundColor Cyan
 Write-Host ""
 
 # ── 1/3: Frontend production build ──────────────────────────────────────

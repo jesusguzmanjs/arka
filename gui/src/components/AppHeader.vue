@@ -40,7 +40,7 @@ async function selectCustomCollection(): Promise<void> {
       class="flex items-center justify-between px-6 py-3 bg-panel border-b border-border select-none"
   >
     <div class="flex items-center gap-2">
-      <span class="text-accent text-lg font-semibold tracking-wide">Vaulted</span>
+      <span class="text-accent text-lg font-semibold tracking-wide">Arka</span>
       <span class="text-xs text-dim uppercase tracking-widest">v2.0</span>
     </div>
 

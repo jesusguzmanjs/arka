@@ -14,8 +14,8 @@ import TrackContextMenu from "./TrackContextMenu.vue";
 import PlaylistContextMenu from "./PlaylistContextMenu.vue";
 
 const ROW_HEIGHT = 40;
-const TRACK_COLUMNS = ["action", "artist", "title", "bpm", "key", "duration"] as const;
-const SORTABLE_COLUMNS = ["artist", "title", "bpm", "key", "duration"] as const;
+const TRACK_COLUMNS = ["action", "stems", "artist", "title", "bpm", "key", "duration"] as const;
+const SORTABLE_COLUMNS = ["stems", "artist", "title", "bpm", "key", "duration"] as const;
 
 type TrackColumn = (typeof TRACK_COLUMNS)[number];
 type SortColumn = (typeof SORTABLE_COLUMNS)[number];
@@ -99,6 +99,9 @@ const sortedTracks = computed(() => {
 
   const direction = sortOrder.value === "asc" ? 1 : -1;
   return [...filteredTracks.value].sort((left, right) => {
+    if (activeColumn === "stems") {
+      return (Number(hasAvailableStems(left)) - Number(hasAvailableStems(right))) * direction;
+    }
     if (activeColumn === "bpm" || activeColumn === "duration") {
       const leftValue = activeColumn === "bpm" ? left.bpm : left.duration_ms;
       const rightValue = activeColumn === "bpm" ? right.bpm : right.duration_ms;
@@ -115,8 +118,8 @@ const sortedTracks = computed(() => {
 
 const { columnWidths, startResize } = useColumnResize({
   columns: TRACK_COLUMNS,
-  initialWidths: { action: 6, artist: 22, title: 35, bpm: 11, key: 11, duration: 15 },
-  minWidths: { action: 5, artist: 12, title: 16, bpm: 8, key: 8, duration: 10 },
+  initialWidths: { action: 6, stems: 5, artist: 21, title: 31, bpm: 11, key: 11, duration: 15 },
+  minWidths: { action: 5, stems: 4, artist: 12, title: 16, bpm: 8, key: 8, duration: 10 },
   getContainer: () => trackTableContainer.value,
 });
 
@@ -143,7 +146,9 @@ function isSortColumn(column: TrackColumn): column is SortColumn {
 }
 
 function columnLabel(column: TrackColumn): string {
-  return column === "action" ? "Status" : column.toUpperCase();
+  if (column === "action") return "Status";
+  if (column === "stems") return "Stems";
+  return column.toUpperCase();
 }
 
 function formatDuration(durationMs: number | null): string {
@@ -177,6 +182,10 @@ const flexGridTooltip = "Variable BPM (Flex Grid) is unsupported for Auto Cue.";
 
 function bpmLabel(track: LibraryTrack): string {
   return track.bpm === null ? "—" : track.bpm.toFixed(1);
+}
+
+function hasAvailableStems(track: LibraryTrack): boolean {
+  return typeof track.flags === "number" && (track.flags & 0x40) === 0x40;
 }
 
 function previewTrack(track: LibraryTrack): void {
@@ -602,9 +611,11 @@ onUnmounted(() => {
                 <button
                     v-if="isSortColumn(column)"
                     type="button"
-                    class="group inline-flex max-w-full items-center gap-1 rounded px-0.5 py-1 text-inherit transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                    class="group max-w-full items-center gap-1 rounded px-0.5 py-1 text-inherit transition-colors hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                    :class="column === 'stems' ? 'flex h-full w-full justify-center' : 'inline-flex'"
+                    :aria-label="column === 'stems' ? 'Sort by Stems' : undefined"
                 >
-                  <span class="truncate">{{ columnLabel(column) }}</span>
+                  <span :class="column === 'stems' ? 'sr-only' : 'truncate'">{{ columnLabel(column) }}</span>
                   <span v-if="sortColumn === column" class="text-[9px] text-secondary" aria-hidden="true">
                       {{ sortOrder === 'asc' ? '↑' : '↓' }}
                     </span>
@@ -672,6 +683,20 @@ onUnmounted(() => {
                   </svg>
                   <svg v-else class="h-4 w-4 text-secondary" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
                     <path d="M6.5 4.25A1.25 1.25 0 018.39 3.2l7.1 5.75a1.35 1.35 0 010 2.1l-7.1 5.75A1.25 1.25 0 016.5 15.83V4.25z" />
+                  </svg>
+                </span>
+                <span class="pointer-events-none flex items-center justify-center px-2" role="cell">
+                  <svg
+                      v-if="hasAvailableStems(sortedTracks[virtualRow.index])"
+                      class="h-3.5 w-3.5 shrink-0 text-secondary"
+                      viewBox="0 0 20 20"
+                      fill="none"
+                      role="img"
+                      aria-label="Stems available"
+                      title="Stems available"
+                  >
+                    <path d="M4 5.25h12M4 10h12M4 14.75h12" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
+                    <path d="M6 3.5v3.5M10 8.25v3.5M14 13v3.5" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
                   </svg>
                 </span>
                 <span class="pointer-events-none min-w-0 truncate px-2" role="cell">{{ sortedTracks[virtualRow.index].artist }}</span>
