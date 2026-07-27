@@ -22,7 +22,9 @@ export type SmartPlaylistOperator =
   | "before"
   | "after"
   | "greater_than_or_equal"
-  | "less_than_or_equal";
+  | "less_than_or_equal"
+  | "is_harmonically_compatible"
+  | "is_harmonically_compatible_fuzzy";
 
 export interface SmartPlaylistRule {
   field: SmartPlaylistField;

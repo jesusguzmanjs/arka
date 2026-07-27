@@ -216,7 +216,7 @@ The supported field-to-NML mapping and operator set is fixed for this feature:
 | `genre` | `ENTRY > INFO@GENRE` | `contains`, `is_exactly`, `does_not_contain` | string |
 | `label` | `ENTRY > INFO@LABEL` | `contains`, `is_exactly`, `does_not_contain` | string |
 | `comment` | `ENTRY > INFO@COMMENT` | `contains`, `is_exactly`, `does_not_contain` | string |
-| `key` | `ENTRY > INFO@KEY` | `is_exactly`, `equals` | one or more comma-separated exact keys, for example `8A, 8B, 9A` |
+| `key` | `ENTRY > INFO@KEY` | `is_exactly`, `equals`, `is_harmonically_compatible`, `is_harmonically_compatible_fuzzy` | one or more comma-separated Open Key values, for example `9m, 2m` |
 | `import_date` | `ENTRY > INFO@IMPORT_DATE` | `in_last_days`, `before`, `after` | `YYYY/M/D` or `YYYY/MM/DD` NML date; comparison is calendar-date based |
 | `last_played` | `ENTRY > INFO@LAST_PLAYED` | `in_last_days`, `before`, `after` | same date format; missing means no date |
 | `track_format` | `ENTRY > INFO@FLAGS` | `is_exactly` | the fixed value `Stem` |
@@ -230,9 +230,16 @@ operator name explicitly states it; `greater_than` and `less_than` are strict.
 positive integer. `before` and `after` are strict calendar-date comparisons.
 
 Key matching is case-insensitive and ignores surrounding whitespace. A Key
-rule may contain one or more comma-separated targets; the track matches when
-its normalized key exactly equals any normalized target. For example,
-`" 8a, 8b, 9a "` matches a track whose NML key is `8A`.
+rule may contain one or more comma-separated targets. Exact operators match
+when the track's normalized key equals any normalized target. The harmonic
+operators build one union set across every target before evaluating the track:
+`is_harmonically_compatible` adds each target and its direct Open Key matches
+(same key, one step clockwise or counter-clockwise, and relative major/minor);
+`is_harmonically_compatible_fuzzy` additionally adds every match reachable by
+one semitone adjustment. The track matches when its normalized key belongs to
+that unified set. Invalid targets reject the rule and an absent or invalid
+track key matches neither operator. For example, a rule value of `"9m, 2m"`
+uses the union of the two targets' compatibility sets, not an intersection.
 
 `track_format` supports only `is_exactly` with the case-insensitive value
 `Stem`. It evaluates true when the `0x40` bit is present in `INFO@FLAGS`, the
@@ -677,9 +684,10 @@ cuegrid --create-static-playlist JSON [--nml PATH] [--json] [-v|--verbose]
 ```
 
 `--create-static-playlist` accepts exactly one object with a trimmed non-empty
-`name` and a non-empty ordered `entries` array of normalized collection paths.
-Entries may repeat and their submitted order must be preserved. Every path must
-resolve uniquely in the current collection before mutation. The command creates
+`name` and an ordered `entries` array of normalized collection paths. `entries`
+may be empty when creating a standard empty playlist. Entries may repeat and
+their submitted order must be preserved. Every submitted path must resolve
+uniquely in the current collection before mutation. The command creates
 a new regular top-level playlist using the same node structure, UUID generation,
 primary-key serialization, writer backup, atomic replace, and rollback behavior
 as `--compile-smart-playlist`; it does not create a Smart Playlist rule set.

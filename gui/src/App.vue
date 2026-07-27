@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, shallowRef } from "vue";
+import { computed, onMounted, onUnmounted, shallowRef, watch } from "vue";
 import { type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AppHeader from "./components/AppHeader.vue";
@@ -10,6 +10,8 @@ import { useTraktorStatus } from "./composables/useTraktorStatus";
 import { useUnsavedChangesGuard } from "./composables/useUnsavedChangesGuard";
 import { useRunState } from "./composables/useRunState";
 import { useSaveStore } from "./stores/useSaveStore";
+import { useLibraryState } from "./composables/useLibraryState";
+import { useAppToast } from "./composables/useAppToast";
 
 type TabId = "collection" | "history";
 
@@ -21,13 +23,37 @@ const saveStore = useSaveStore();
 const { isTraktorRunning } = useTraktorStatus();
 const { isSystemBusy } = useRunState();
 const { resolveUnsavedChanges } = useUnsavedChangesGuard();
+const { loadLibrary } = useLibraryState();
+const { message: toastMessage, kind: toastKind, showAppToast } = useAppToast();
 let unlistenCloseRequested: UnlistenFn | undefined;
 let isForceClosing = false;
+let traktorCloseReloadToken = 0;
 
 function selectTab(tab: TabId) {
   if (isSystemBusy.value) return;
   activeTab.value = tab;
 }
+
+watch(isTraktorRunning, async (isRunning, wasRunning) => {
+  if (wasRunning !== true || isRunning !== false) return;
+
+  const reloadToken = ++traktorCloseReloadToken;
+  try {
+    const reloaded = await loadLibrary({
+      preserveTrackPaths: saveStore.modifiedTracks,
+      preservePlaylistUuids: saveStore.modifiedPlaylists,
+    });
+    if (reloadToken !== traktorCloseReloadToken) return;
+    if (!reloaded) throw new Error("The collection could not be read.");
+    showAppToast("Traktor closed. Collection synced in background.");
+  } catch (error) {
+    if (reloadToken !== traktorCloseReloadToken) return;
+    showAppToast(
+      `Traktor closed, but collection data could not be reloaded: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+  }
+});
 
 onMounted(async () => {
   const appWindow = getCurrentWindow();
@@ -106,6 +132,16 @@ onUnmounted(() => {
     </main>
 
     <TraktorSafetyOverlay :is-running="isTraktorRunning" />
+
+    <div
+      v-if="toastMessage"
+      class="fixed bottom-5 right-5 z-[10000] max-w-sm rounded border px-4 py-3 text-sm shadow-xl"
+      :class="toastKind === 'error' ? 'border-warning/70 bg-zinc-900 text-zinc-100' : 'border-success/50 bg-zinc-900 text-zinc-100'"
+      :role="toastKind === 'error' ? 'alert' : 'status'"
+      :aria-live="toastKind === 'error' ? 'assertive' : 'polite'"
+    >
+      <span class="mr-2" :class="toastKind === 'error' ? 'text-warning' : 'text-success'" aria-hidden="true">{{ toastKind === "error" ? "!" : "✓" }}</span>{{ toastMessage }}
+    </div>
   </div>
 </template>
 

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMounted, onUnmounted, shallowRef } from "vue";
 
-const isTraktorRunning = shallowRef(false);
+export const isTraktorRunning = shallowRef(false);
 
 export function useTraktorStatus() {
   let unlisten: UnlistenFn | undefined;

@@ -1567,6 +1567,8 @@ Key resolution occurs in two ordered stages for every collection `ENTRY`:
 Smart Playlist key comparisons normalize both the rule value and the source
 track before evaluation, including raw NML entries evaluated by the CLI. Key
 rules therefore operate only on valid Open Key values, regardless of a
-third-party tag's original notation. The Vue key-rule control is a fixed
-dropdown containing exactly `1d`--`12d` and `1m`--`12m`; it does not accept
-free-text Camelot input.
+third-party tag's original notation. Exact matching and either harmonic
+compatibility operator accept multiple selected or comma-separated keys; the
+harmonic operators evaluate the union of every target's compatible keys. The
+Vue key-rule control is a fixed dropdown containing exactly `1d`--`12d` and
+`1m`--`12m`; it does not accept free-text Camelot input.

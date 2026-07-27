@@ -226,6 +226,37 @@ class TestCompileSmartPlaylist:
         assert nml_path.read_bytes() == original_contents
 
 
+class TestCreateStaticPlaylist:
+    def test_creates_an_empty_playlist_and_emits_json_result(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        shutil.copy2(SAMPLE_COLLECTION, nml_path)
+
+        exit_code = cli.main(
+            [
+                "--create-static-playlist",
+                json.dumps({"name": "Empty crate", "entries": []}),
+                "--nml",
+                str(nml_path),
+                "--json",
+            ]
+        )
+
+        assert exit_code == 0
+        response = json.loads(capsys.readouterr().out)
+        assert response["type"] == "static_playlist_created"
+        assert response["name"] == "Empty crate"
+        assert response["entries"] == 0
+
+        root = ET.parse(nml_path).getroot()
+        playlist = root.find(
+            "./PLAYLISTS/NODE[@TYPE='FOLDER'][@NAME='$ROOT']/SUBNODES/"
+            "NODE[@TYPE='PLAYLIST'][@NAME='Empty crate']/PLAYLIST"
+        )
+        assert playlist is not None
+        assert playlist.get("ENTRIES") == "0"
+        assert playlist.findall("ENTRY") == []
+
+
 # --------------------------------------------------------------------------
 # main(): argument passthrough and graceful error handling
 # --------------------------------------------------------------------------

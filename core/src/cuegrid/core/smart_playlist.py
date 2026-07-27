@@ -62,7 +62,14 @@ def matches_rule(track: TrackData, rule: Rule, *, today: date | None = None) -> 
     if field in _STRING_FIELDS:
         return _match_string(_text_value(track, field), operator, rule.get("value"))
     if field == "key":
-        if operator not in {"is_exactly", "equals", "contains", "does_not_contain"}:
+        if operator not in {
+            "is_exactly",
+            "equals",
+            "contains",
+            "does_not_contain",
+            "is_harmonically_compatible",
+            "is_harmonically_compatible_fuzzy",
+        }:
             raise ValueError("unsupported key operator: %r" % operator)
         return _match_key(_key_value(track), operator, rule.get("value"))
     if field == "track_format":
@@ -138,8 +145,48 @@ def _match_key(actual: str, operator: str, value: Any) -> bool:
     if not targets or any(not target for target in targets):
         raise ValueError("key values must use valid Open Key notation")
 
-    matches = normalize_to_open_key(actual) in targets
+    normalized_actual = normalize_to_open_key(actual)
+    if operator in {"is_harmonically_compatible", "is_harmonically_compatible_fuzzy"}:
+        valid_keys: set[str] = set()
+        include_adjacent = operator == "is_harmonically_compatible_fuzzy"
+        for target in targets:
+            direct_matches, adjacent_matches = _harmonic_matches(target)
+            valid_keys.update(direct_matches)
+            if include_adjacent:
+                valid_keys.update(adjacent_matches)
+        return normalized_actual in valid_keys
+
+    matches = normalized_actual in targets
     return not matches if operator == "does_not_contain" else matches
+
+
+def _harmonic_matches(key: str) -> tuple[list[str], list[str]]:
+    """Return direct and +/-1-semitone Open Key compatibility matches."""
+    number = int(key[:-1])
+    mode = key[-1]
+
+    def wrap(value: int) -> int:
+        return (value - 1) % 12 + 1
+
+    def toggle_mode(value: str) -> str:
+        return "d" if value == "m" else "m"
+
+    def direct(value: int) -> list[str]:
+        return [
+            f"{value}{mode}",
+            f"{wrap(value + 1)}{mode}",
+            f"{wrap(value - 1)}{mode}",
+            f"{value}{toggle_mode(mode)}",
+        ]
+
+    direct_matches = direct(number)
+    direct_set = set(direct_matches)
+    adjacent_matches = [
+        candidate
+        for candidate in [*direct(wrap(number + 7)), *direct(wrap(number + 5))]
+        if candidate not in direct_set
+    ]
+    return direct_matches, list(dict.fromkeys(adjacent_matches))
 
 
 def _match_track_format(track: TrackData, operator: str, value: Any) -> bool:

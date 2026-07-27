@@ -13,6 +13,7 @@
     "fs:read-dirs",
     "core:window:allow-close",
     "core:window:allow-destroy",
+    "aptabase:allow-track-event",
     {
       "identifier": "fs:scope",
       "allow": [

@@ -20,6 +20,11 @@ interface LibraryState {
   libraryError: string | null;
 }
 
+interface LoadLibraryOptions {
+  preserveTrackPaths?: ReadonlySet<string>;
+  preservePlaylistUuids?: ReadonlySet<string>;
+}
+
 const state = reactive<LibraryState>({
   collection: {},
   playlists: [],
@@ -138,6 +143,20 @@ function removePlaylistByUuid(nodes: PlaylistNode[], uuid: string): PlaylistLeaf
   return undefined;
 }
 
+function replacePlaylistByUuid(nodes: PlaylistNode[], uuid: string, replacement: PlaylistLeaf): boolean {
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (node.kind === "playlist" && node.uuid === uuid) {
+      nodes[index] = replacement;
+      return true;
+    }
+    if (node.kind === "folder" && replacePlaylistByUuid(node.children, uuid, replacement)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function flattenPlaylists(nodes: readonly PlaylistNode[]): PlaylistLeaf[] {
   return nodes.flatMap((node) =>
       node.kind === "playlist" ? [node] : flattenPlaylists(node.children),
@@ -174,8 +193,16 @@ export function useLibraryState() {
 
   const playlistLeaves = computed(() => flattenPlaylists(state.playlists));
 
-  async function loadLibrary(): Promise<void> {
+  async function loadLibrary(options: LoadLibraryOptions = {}): Promise<boolean> {
     const myToken = ++loadToken;
+    const preservedTracks = new Map(
+      [...(options.preserveTrackPaths ?? [])]
+        .map((path) => [path, state.collection[path]] as const)
+        .filter((entry): entry is readonly [string, TrackMetadata] => entry[1] !== undefined),
+    );
+    const preservedPlaylists = new Map(
+      [...(options.preservePlaylistUuids ?? [])].map((uuid) => [uuid, findPlaylistByUuid(state.playlists, uuid)] as const),
+    );
     state.libraryLoading = true;
     state.libraryError = null;
 
@@ -185,7 +212,19 @@ export function useLibraryState() {
       const raw = await callCueGridCore(args);
       const payload = parseLibraryPayload(raw);
 
-      if (myToken !== loadToken) return;
+      if (myToken !== loadToken) return false;
+
+      for (const [path, track] of preservedTracks) payload.collection[path] = track;
+      for (const [uuid, playlist] of preservedPlaylists) {
+        if (!playlist) {
+          removePlaylistByUuid(payload.playlists, uuid);
+          continue;
+        }
+        const localPlaylist = { ...playlist, track_paths: [...playlist.track_paths] };
+        if (!replacePlaylistByUuid(payload.playlists, uuid, localPlaylist)) {
+          payload.playlists.push(localPlaylist);
+        }
+      }
 
       const selectedPlaylist = findPlaylist(payload.playlists, state.selectedContext);
       const selectedPath = selectedTrackPath.value;
@@ -204,8 +243,9 @@ export function useLibraryState() {
       }
 
       if (!canKeepSelectedTrack) update("selectedTrackPath", null);
+      return true;
     } catch (error) {
-      if (myToken !== loadToken) return;
+      if (myToken !== loadToken) return false;
       state.collection = {};
       state.playlists = [];
       state.selectedContext = ALL_TRACKS_CONTEXT;
@@ -213,6 +253,7 @@ export function useLibraryState() {
       update("selectedPlaylist", null);
       update("selectedTrackPath", null);
       state.libraryError = error instanceof Error ? error.message : String(error);
+      return false;
     } finally {
       if (myToken === loadToken) state.libraryLoading = false;
     }

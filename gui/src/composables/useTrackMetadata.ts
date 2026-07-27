@@ -13,6 +13,7 @@
 
 import { markRaw, reactive, toRefs } from "vue";
 import { useCueGridSidecar } from "./useCueGridSidecar";
+import { getHarmonicMatches } from "../utils/harmonicKeys";
 import type {
   ExistingCue,
   SuperJSON,
@@ -44,6 +45,8 @@ export interface PlayerMarker {
 
 interface PlayerState {
   loadedTrackPath: string | null;
+  activeDirectKeys: string[];
+  activeAdjacentKeys: string[];
   metadata: TrackMetadata | null;
   metadataError: TrackMetadataError | null;
   markers: PlayerMarker[];
@@ -54,6 +57,8 @@ interface PlayerState {
 
 const playerState = reactive<PlayerState>({
   loadedTrackPath: null,
+  activeDirectKeys: [],
+  activeAdjacentKeys: [],
   metadata: null,
   metadataError: null,
   markers: [],
@@ -118,20 +123,27 @@ export function usePlayerState() {
     /** Reset to the empty pre-load state — used on track change / unmount. */
     reset(): void {
       playerState.loadedTrackPath = null;
+      playerState.activeDirectKeys = [];
+      playerState.activeAdjacentKeys = [];
       playerState.metadata = null;
       playerState.metadataError = null;
       playerState.markers = [];
       playerState.markerStage = null;
     },
     /** Set the loaded-track path + metadata (Stage 1 success). */
-    setLoadedMetadata(path: string, meta: TrackMetadata): void {
+    setLoadedMetadata(path: string, meta: TrackMetadata, key: string | null = null): void {
       playerState.loadedTrackPath = path;
+      const matches = getHarmonicMatches(key);
+      playerState.activeDirectKeys = matches.direct;
+      playerState.activeAdjacentKeys = matches.adjacent;
       playerState.metadata = meta;
       playerState.metadataError = null;
     },
     /** Set a non-fatal metadata error (Stage 1 failure — no waveform). */
     setMetadataError(path: string, err: TrackMetadataError): void {
       playerState.loadedTrackPath = path;
+      playerState.activeDirectKeys = [];
+      playerState.activeAdjacentKeys = [];
       playerState.metadata = null;
       playerState.metadataError = err;
       playerState.markers = [];

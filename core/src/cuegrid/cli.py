@@ -813,8 +813,8 @@ def main(argv: list[str] | None = None) -> int:
             paths = payload.get("entries")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Static Playlist name must be a non-empty string")
-            if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path.strip() for path in paths):
-                raise ValueError("Static Playlist entries must be a non-empty JSON array of paths")
+            if not isinstance(paths, list) or not all(isinstance(path, str) and path.strip() for path in paths):
+                raise ValueError("Static Playlist entries must be a JSON array of paths")
             nml_path = _resolve_nml_path(args.nml)
             if nml_path is None:
                 raise ValueError("no collection.nml found under the standard Traktor install directories. Pass --nml PATH explicitly.")

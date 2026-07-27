@@ -2,6 +2,8 @@ import { defineStore } from "pinia";
 import { useCueGridSidecar } from "../composables/useCueGridSidecar";
 import { useLibraryState } from "../composables/useLibraryState";
 import { syncPlayerAfterMetadataMutation } from "../composables/useTrackMetadata";
+import { showAppToast } from "../composables/useAppToast";
+import { isTraktorRunning } from "../composables/useTraktorStatus";
 import type { CollectionTrack, MetadataPatch } from "../types/library";
 
 let activeSave: Promise<void> | null = null;
@@ -38,6 +40,12 @@ export const useSaveStore = defineStore("save", {
     },
 
     async saveAll(): Promise<void> {
+      if (isTraktorRunning.value) {
+        const error = new Error("Saving is blocked while Traktor is running. Close Traktor and try again.");
+        showAppToast(error.message, "error");
+        throw error;
+      }
+
       if (activeSave) return activeSave;
 
       activeSave = (async () => {

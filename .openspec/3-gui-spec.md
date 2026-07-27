@@ -60,6 +60,23 @@ on exit.
 The checked-out GUI is no longer the create-tauri-app scaffold described by
 the historical sections below. The current source of truth is:
 
+### Traktor-close invalidation
+
+When the monitored Traktor status transitions strictly from `true` to `false`,
+the GUI MUST refresh collection data with a background `--get-library` read.
+This synchronization is optimistic and non-destructive: unsaved track and
+playlist changes, active editors (including the Smart Playlist editor), and
+all temporary user inputs remain intact. The reload merges fresh disk data
+only for entities without pending GUI changes. Once it succeeds, the
+application displays the brief notification: **"Traktor closed. Collection
+synced in background."**
+
+`useSaveStore.saveAll()` MUST perform a final, synchronous check of the shared
+Traktor running state before constructing or invoking a batch-save command. If
+Traktor is running, it must not invoke Core, must keep the dirty state intact,
+and must surface an error toast explaining that saving is blocked until Traktor
+has closed.
+
 - `App.vue` owns a strict `h-screen w-screen overflow-hidden` dark root. The
   HTML/body/#app ancestor chain is also overflow-hidden. Its inner rack is a
   bounded `flex-1 min-h-0 flex flex-col overflow-hidden` stack containing a
@@ -295,6 +312,20 @@ The Collection View's playlist sidebar must render one fixed, full-width
 list. Clicking it opens `SmartPlaylistModal.vue`; it does not create or mutate
 a playlist until the user submits a valid modal form.
 
+### Standard empty playlist creation
+
+The **PLAYLISTS** sidebar header must also render a compact `+` button that
+opens `StaticPlaylistModal.vue`. The modal contains a focused Playlist Name
+input plus **Cancel** and **Create** actions. The frontend validates the trimmed
+name against all loaded playlist names case-insensitively while the user types;
+an empty name or duplicate name disables **Create** and a duplicate shows the
+inline message **"A playlist with this name already exists."**. On submission,
+the modal calls `useCueGridSidecar().createStaticPlaylist({ name, entries: []
+})`. It retains its draft and shows a domain error when the request fails. On
+success it closes, refreshes the library, selects the new playlist, and shows a
+success toast. This direct NML mutation does not add a provisional leaf or mark
+global dirty state.
+
 The modal contains all of the following controls:
 
 - **Playlist Name**: a required trimmed non-empty text input.
@@ -319,7 +350,7 @@ canonical field/operator identifiers unchanged to the core contract in
 | Genre | `genre` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
 | Label | `label` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
 | Comment | `comment` | Contains / `contains`; Is Exactly / `is_exactly`; Does Not Contain / `does_not_contain` | text |
-| Key | `key` | Exact Match / `is_exactly` | key text, for example `8A` |
+| Key | `key` | Exact Match / `is_exactly`; Is harmonically compatible with / `is_harmonically_compatible`; Is harmonically compatible (+/-1 semitono) / `is_harmonically_compatible_fuzzy` | multi-select Open Key tag control; all selected tags form one match or compatibility union. Legacy comma-separated values hydrate as tags and serialize back to comma-separated values for Core. |
 | Import Date | `import_date` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
 | Last Played | `last_played` | In the last X days / `in_last_days`; Before date / `before`; After date / `after` | positive integer days, or calendar date |
 | Track Format | `track_format` | Is Exactly / `is_exactly` | fixed select option: Stem |
@@ -1343,6 +1374,25 @@ stateDiagram-v2
 ```
 
 ## 7. Telemetry Export (v1.8)
+
+### 7.0 Passive Aptabase usage telemetry
+
+The desktop application sends one passive Aptabase event, `app_started`, for
+basic anonymous launch telemetry. This event is separate from the local
+analysis-telemetry CSV described in this section and is never added to or
+exported through that file.
+
+The Rust Tauri builder MUST register `tauri-plugin-aptabase` with
+`tauri_plugin_aptabase::Builder::new("A-EU-4488636274").build()` before either
+the command handler or the setup hook is registered. The Vue application entry
+point MUST invoke `trackEvent("app_started")` from `@aptabase/tauri` during
+initialization. The invocation is fire-and-forget: a rejected promise must be
+handled locally and must not delay mounting, surface an application error, or
+prevent user interaction.
+
+The existing Discord webhook used by `BugReportModal.vue` is exclusively for
+active user feedback and bug reports. Aptabase telemetry MUST NOT replace,
+modify, invoke, or otherwise affect that webhook flow.
 
 ### 7.1 Export control
 

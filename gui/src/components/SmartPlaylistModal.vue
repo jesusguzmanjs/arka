@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, shallowRef, useTemplateRef } from "vue";
+import KeyMultiSelect from "./KeyMultiSelect.vue";
 import { useCueGridSidecar } from "../composables/useCueGridSidecar";
 import type {
   SmartPlaylistField,
@@ -9,12 +10,13 @@ import type {
 } from "../types/smartPlaylist";
 
 type ValueKind = "number" | "whole-number" | "range" | "text" | "key" | "date" | "days" | "rating" | "format";
+type DraftValue = string | number | string[];
 
 interface RuleDraft {
   id: number;
   field: SmartPlaylistField;
   operator: SmartPlaylistOperator;
-  value: string | number;
+  value: DraftValue;
   min: string | number;
   max: string | number;
 }
@@ -55,6 +57,12 @@ const RATING_OPERATORS = [
   { value: "equals", label: "Exactly" },
 ] as const;
 
+const KEY_OPERATORS = [
+  { value: "is_exactly", label: "Exact match" },
+  { value: "is_harmonically_compatible", label: "Is harmonically compatible with" },
+  { value: "is_harmonically_compatible_fuzzy", label: "Is harmonically compatible (+/-1 semitono)" },
+] as const;
+
 const MATCH_OPTIONS = [
   { value: "all", label: "Match ALL" },
   { value: "any", label: "Match ANY" },
@@ -67,7 +75,7 @@ const OPEN_KEY_OPTIONS = [
 
 const FIELD_OPTIONS: readonly FieldOption[] = [
   { value: "bpm", label: "BPM", valueKind: "number", operators: NUMERIC_OPERATORS },
-  { value: "key", label: "Key", valueKind: "key", operators: [{ value: "is_exactly", label: "Exact match" }] },
+  { value: "key", label: "Key", valueKind: "key", operators: KEY_OPERATORS },
   { value: "genre", label: "Genre", valueKind: "text", operators: TEXT_OPERATORS },
   { value: "rating", label: "Rating", valueKind: "rating", operators: RATING_OPERATORS },
   { value: "import_date", label: "Import Date", valueKind: "date", operators: DATE_OPERATORS },
@@ -135,13 +143,17 @@ function inputType(rule: RuleDraft): "date" | "number" | "text" {
 function changeField(rule: RuleDraft): void {
   const definition = definitionFor(rule.field);
   rule.operator = definition.operators[0].value;
-  rule.value = "";
+  rule.value = rule.field === "key" ? [] : "";
   rule.min = "";
   rule.max = "";
   errorMessage.value = null;
 }
 
 function changeOperator(rule: RuleDraft): void {
+  if (rule.field === "key") {
+    errorMessage.value = null;
+    return;
+  }
   rule.value = "";
   rule.min = "";
   rule.max = "";
@@ -157,20 +169,27 @@ function removeRule(index: number): void {
   rules.splice(index, 1);
 }
 
-function finiteNumber(value: string | number): number | null {
+function keyValues(value: DraftValue): string[] {
+  const values = Array.isArray(value) ? value : (typeof value === "string" ? value.split(",") : []);
+  return [...new Set(values.map((key) => key.trim()).filter(Boolean))];
+}
+
+function finiteNumber(value: DraftValue): number | null {
+  if (Array.isArray(value)) return null;
   if (value === null || value === undefined || String(value).trim() === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
-function isPositiveInteger(value: string | number): boolean {
+function isPositiveInteger(value: DraftValue): boolean {
   const number = finiteNumber(value);
   return number !== null && Number.isInteger(number) && number > 0;
 }
 
 function isRuleValid(rule: RuleDraft): boolean {
   const kind = valueKind(rule);
-  if (kind === "text" || kind === "key" || kind === "date" || kind === "format") return String(rule.value).trim().length > 0;
+  if (kind === "key") return keyValues(rule.value).length > 0;
+  if (kind === "text" || kind === "date" || kind === "format") return String(rule.value).trim().length > 0;
   if (kind === "rating") {
     const rating = finiteNumber(rule.value);
     return rating !== null && Number.isInteger(rating) && rating >= 1 && rating <= 5;
@@ -193,7 +212,7 @@ function isRuleValid(rule: RuleDraft): boolean {
   return finiteNumber(rule.value) !== null;
 }
 
-function dateForCore(value: string | number): string {
+function dateForCore(value: DraftValue): string {
   return String(value).replace(/-/g, "/");
 }
 
@@ -206,6 +225,8 @@ function ruleForCore(rule: RuleDraft): SmartPlaylistRule {
     value = Number(rule.value);
   } else if (kind === "date") {
     value = dateForCore(rule.value);
+  } else if (kind === "key") {
+    value = keyValues(rule.value).join(", ");
   } else {
     value = String(rule.value).trim();
   }
@@ -372,10 +393,12 @@ onUnmounted(() => document.removeEventListener("keydown", onKeyDown));
                     <span class="text-xs text-dim" aria-hidden="true">to</span>
                     <input v-model="rule.max" type="number" inputmode="decimal" placeholder="Max" class="min-w-0 rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Maximum value for rule ${index + 1}`">
                   </div>
-                  <select v-else-if="valueKind(rule) === 'key'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Open Key value for rule ${index + 1}`">
-                    <option value="" disabled>Select an Open Key</option>
-                    <option v-for="key in OPEN_KEY_OPTIONS" :key="key" :value="key">{{ key }}</option>
-                  </select>
+                  <KeyMultiSelect
+                    v-else-if="valueKind(rule) === 'key'"
+                    v-model="rule.value"
+                    :options="OPEN_KEY_OPTIONS"
+                    :ariaLabel="`Open Key values for rule ${index + 1}`"
+                  />
                   <select v-else-if="valueKind(rule) === 'rating'" v-model="rule.value" class="w-full rounded border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-100 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" :aria-label="`Rating value for rule ${index + 1}`">
                     <option value="" disabled>Select a rating</option>
                     <option v-for="rating in 5" :key="rating" :value="String(rating)">{{ '★'.repeat(rating) }}{{ '☆'.repeat(5 - rating) }} · {{ rating }}</option>

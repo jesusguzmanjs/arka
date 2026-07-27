@@ -11,6 +11,7 @@
     "package": "powershell -NoProfile -ExecutionPolicy Bypass -File ../build-win.ps1"
   },
   "dependencies": {
+    "@aptabase/tauri": "github:aptabase/tauri-plugin-aptabase",
     "@tanstack/vue-virtual": "^3.13.32",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",

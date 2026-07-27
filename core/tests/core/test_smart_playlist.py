@@ -89,6 +89,31 @@ def test_key_matches_normalized_open_key_values():
     )
 
 
+def test_key_harmonic_compatibility_uses_the_union_for_multiple_targets():
+    direct_rule = {
+        "field": "key",
+        "operator": "is_harmonically_compatible",
+        "value": "9m, 2m",
+    }
+
+    assert matches_rule({"key": "9m"}, direct_rule)
+    assert matches_rule({"key": "10m"}, direct_rule)
+    assert matches_rule({"key": "2d"}, direct_rule)
+    assert not matches_rule({"key": "4m"}, direct_rule)
+
+
+def test_key_fuzzy_harmonic_compatibility_includes_adjacent_matches():
+    fuzzy_rule = {
+        "field": "key",
+        "operator": "is_harmonically_compatible_fuzzy",
+        "value": "9m, 2m",
+    }
+
+    assert matches_rule({"key": "4m"}, fuzzy_rule)
+    assert matches_rule({"key": "7d"}, fuzzy_rule)
+    assert not matches_rule({"key": "11m"}, fuzzy_rule)
+
+
 def test_xml_key_rules_prefer_native_musical_key_value():
     entry = ET.fromstring('<ENTRY><MUSICAL_KEY VALUE="0" /><INFO KEY="8A" /></ENTRY>')
 

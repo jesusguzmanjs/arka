@@ -559,7 +559,7 @@ async function loadTrack(path: string): Promise<void> {
     const metadata = metadataResult.metadata;
     savedBpm.value = metadata.bpm;
     previewCache.value.set(trimmed, metadata);
-    setLoadedMetadata(trimmed, metadata);
+    setLoadedMetadata(trimmed, metadata, collection.value[trimmed]?.key ?? null);
     currentPreview.value = metadata;
     const metadataCues = metadataCuesForTrack(metadata);
     const metadataDuration = Number((metadata as unknown as { duration_ms?: unknown }).duration_ms) || 0;

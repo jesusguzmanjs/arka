@@ -5,11 +5,13 @@ import { ALL_TRACKS_CONTEXT, useLibraryState } from "../composables/useLibrarySt
 import { useConfigState } from "../composables/useConfigState";
 import { usePlayerState } from "../composables/useTrackMetadata";
 import { useColumnResize } from "../composables/useColumnResize";
+import { normalizeHarmonicKey } from "../utils/harmonicKeys";
 import { useSaveStore } from "../stores/useSaveStore";
 import type { LibraryTrack } from "../types/library";
 import AutoCueModal from "./AutoCueModal.vue";
 import MetadataEditModal from "./MetadataEditModal.vue";
 import SmartPlaylistModal from "./SmartPlaylistModal.vue";
+import StaticPlaylistModal from "./StaticPlaylistModal.vue";
 import TrackContextMenu from "./TrackContextMenu.vue";
 import PlaylistContextMenu from "./PlaylistContextMenu.vue";
 
@@ -41,7 +43,7 @@ const {
   deletePlaylist,
 } = useLibraryState();
 const { selectedTrackPath } = useConfigState();
-const { isLoadingTrack } = usePlayerState();
+const { isLoadingTrack, activeDirectKeys, activeAdjacentKeys } = usePlayerState();
 const saveStore = useSaveStore();
 
 const trackScrollElement = useTemplateRef<HTMLDivElement>("trackScrollElement");
@@ -63,6 +65,7 @@ const dragOverPlaylistUuid = shallowRef<string | null>(null);
 const isMetadataModalOpen = shallowRef(false);
 const isAutoCueModalOpen = shallowRef(false);
 const isSmartPlaylistModalOpen = shallowRef(false);
+const isStaticPlaylistModalOpen = shallowRef(false);
 const toastMessage = shallowRef<string | null>(null);
 let toastTimer: number | undefined;
 
@@ -186,6 +189,14 @@ function bpmLabel(track: LibraryTrack): string {
 
 function hasAvailableStems(track: LibraryTrack): boolean {
   return typeof track.flags === "number" && (track.flags & 0x40) === 0x40;
+}
+
+function harmonicKeyClass(key: string | null): string {
+  const normalizedKey = normalizeHarmonicKey(key);
+  if (!normalizedKey) return "text-muted";
+  if (activeDirectKeys.value.includes(normalizedKey)) return "text-primary";
+  if (activeAdjacentKeys.value.includes(normalizedKey)) return "text-secondary/70";
+  return "text-muted";
 }
 
 function previewTrack(track: LibraryTrack): void {
@@ -390,6 +401,17 @@ async function handleSmartPlaylistSaved(name: string): Promise<void> {
   showToast(`Smart Playlist “${name}” created.`);
 }
 
+async function handleStaticPlaylistSaved(name: string): Promise<void> {
+  isStaticPlaylistModalOpen.value = false;
+  await loadLibrary();
+  if (libraryError.value) {
+    showToast(`Playlist “${name}” was created, but the library could not refresh.`);
+    return;
+  }
+  selectContext(name);
+  showToast(`Playlist “${name}” created.`);
+}
+
 function selectAllSongs(): void {
   selectAllLibraryTracks(currentViewTracks.value);
   closeContextMenu();
@@ -461,8 +483,18 @@ onUnmounted(() => {
 
         </nav>
 
-        <div class="shrink-0 px-5 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-dim">
+        <div class="flex shrink-0 items-center justify-between px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-dim">
           <span>Playlists</span>
+          <button
+              type="button"
+              class="flex h-6 w-6 items-center justify-center rounded text-base font-medium leading-none text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label="Create new playlist"
+              title="Create new playlist"
+              :disabled="props.disabled"
+              @click="isStaticPlaylistModalOpen = true"
+          >
+            <span aria-hidden="true">+</span>
+          </button>
         </div>
 
         <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-2 scrollbar-amber" aria-label="Playlists">
@@ -702,7 +734,7 @@ onUnmounted(() => {
                 <span class="pointer-events-none min-w-0 truncate px-2" role="cell">{{ sortedTracks[virtualRow.index].artist }}</span>
                 <span class="pointer-events-none min-w-0 truncate px-2 font-medium" role="cell">{{ sortedTracks[virtualRow.index].title }}</span>
                 <span class="pointer-events-none px-2 text-left font-mono text-xs tabular-nums text-muted" role="cell">{{ bpmLabel(sortedTracks[virtualRow.index]) }}</span>
-                <span class="pointer-events-none min-w-0 truncate px-2 text-muted" role="cell">{{ sortedTracks[virtualRow.index].key ?? "" }}</span>
+                <span class="pointer-events-none min-w-0 truncate px-2" :class="harmonicKeyClass(sortedTracks[virtualRow.index].key)" role="cell">{{ sortedTracks[virtualRow.index].key ?? "" }}</span>
                 <span class="pointer-events-none px-2 text-left font-mono text-xs tabular-nums text-muted" role="cell">{{ formatDuration(sortedTracks[virtualRow.index].duration_ms) }}</span>
               </div>
             </div>
@@ -753,6 +785,13 @@ onUnmounted(() => {
         :existing-playlists="existingPlaylistNames"
         @close="isSmartPlaylistModalOpen = false"
         @saved="handleSmartPlaylistSaved"
+    />
+
+    <StaticPlaylistModal
+        v-if="isStaticPlaylistModalOpen"
+        :existing-playlists="existingPlaylistNames"
+        @close="isStaticPlaylistModalOpen = false"
+        @saved="handleStaticPlaylistSaved"
     />
 
     <div
