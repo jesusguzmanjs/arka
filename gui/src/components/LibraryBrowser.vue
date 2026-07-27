@@ -7,6 +7,7 @@ import { usePlayerState } from "../composables/useTrackMetadata";
 import { useColumnResize } from "../composables/useColumnResize";
 import { normalizeHarmonicKey } from "../utils/harmonicKeys";
 import { useSaveStore } from "../stores/useSaveStore";
+import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import type { LibraryTrack } from "../types/library";
 import AutoCueModal from "./AutoCueModal.vue";
 import MetadataEditModal from "./MetadataEditModal.vue";
@@ -45,6 +46,7 @@ const {
 const { selectedTrackPath } = useConfigState();
 const { isLoadingTrack, activeDirectKeys, activeAdjacentKeys } = usePlayerState();
 const saveStore = useSaveStore();
+const workspaceStore = useWorkspaceStore();
 
 const trackScrollElement = useTemplateRef<HTMLDivElement>("trackScrollElement");
 const trackTableContainer = useTemplateRef<HTMLDivElement>("trackTableContainer");
@@ -56,7 +58,7 @@ const sortOrder = shallowRef<SortOrder>("asc");
 const contextMenu = ref<{
   x: number;
   y: number;
-  target: { kind: "track" } | { kind: "playlist"; name: string };
+  target: { kind: "track"; track: LibraryTrack } | { kind: "playlist"; name: string };
 } | null>(null);
 const playlistContextMenu = ref<{ x: number; y: number; uuid: string } | null>(null);
 const editingPlaylistUuid = shallowRef<string | null>(null);
@@ -215,7 +217,7 @@ function openTrackContextMenu(event: MouseEvent, track: LibraryTrack): void {
   if (!selectedLibraryPaths.value.includes(track.location_path)) {
     selectOnlyLibraryTrack(track);
   }
-  contextMenu.value = { ...contextMenuPosition(event), target: { kind: "track" } };
+  contextMenu.value = { ...contextMenuPosition(event), target: { kind: "track", track } };
 }
 
 function openPlaylistContextMenu(event: MouseEvent, name: string): void {
@@ -374,6 +376,13 @@ function runContextMenuAction(): void {
   }
 
   openAutoCueModal();
+}
+
+function sendToRemixStudio(): void {
+  const target = contextMenu.value?.target;
+  closeContextMenu();
+  if (props.disabled || target?.kind !== "track") return;
+  workspaceStore.sendToRemixStudio(target.track);
 }
 
 function openMetadataEditor(): void {
@@ -754,6 +763,7 @@ onUnmounted(() => {
         @action="runContextMenuAction"
         @selectAll="selectAllSongs"
         @edit-metadata="openMetadataEditor"
+        @send-to-remix-studio="sendToRemixStudio"
         @remove-from-playlist="removeSelectedTracksFromPlaylist"
         @close="closeContextMenu"
     />

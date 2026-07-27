@@ -198,6 +198,69 @@ defaults to 1120×970 client pixels and enforces a 970px minimum client height
 so the player, library, and footer are all visible without compressing any
 region.
 
+### Remix Studio module
+
+The application provides a **Remix Studio** workspace for future Stem editing
+and Traktor Remix Deck creation. It is a first-class main workspace tab,
+identified by the `remix-studio` tab route in the application shell. The
+current application navigation is tab-based rather than Vue Router-based; this
+tab identifier is therefore the route-equivalent navigation contract.
+
+`gui/src/stores/useWorkspaceStore.ts` is the global Pinia boundary for
+workspace navigation. Its state includes `activeTab`, initially `collection`,
+and `activeStudioTrack`, initially `null`. `sendToRemixStudio(track)` MUST store the
+selected `CollectionTrack` in `activeStudioTrack` and set `activeTab` to
+`remix-studio`. The Collection table exposes this action through a **Send to
+Remix Studio** item in its track context menu. The action operates on the track
+that opened that menu and does not mutate collection metadata or dirty/save
+state.
+
+`RemixStudioView.vue` MUST remain bounded inside the fixed application
+viewport. Its top row (~50vh) contains a **Mini Library & Filters** sidebar
+(~300px or 25%) and the remaining-width Stem Editor. The lower-row future
+**4×4 Pad Matrix** workspace spans the full application width. The Mini Library
+uses a `#5a5a5e` right border within the top row; the Pad Matrix uses a
+full-width `#5a5a5e` top border to form a seamless divider. The Stem Editor
+displays the selected track title and artist when `activeStudioTrack` is non-null;
+otherwise it displays **Load a track from the library**. In Single-Track Mode,
+it reuses the application's `peaks.js` engine and primary Collection Beat Grid
+engine (`useGridMath` + `usePeaksMarkers`) to render the selected standard
+audio file. The Stem Editor passes `activeStudioTrack` BPM, grid anchor, duration,
+and existing cue data to that shared engine, so its beat/bar markers match the
+Collection player exactly. It supplies cached/precomputed waveform data when available and
+falls back to Peaks' Web Audio decoding path when it is not. The waveform uses
+the Arka dark surface, `#edb40b` waveform, and a high-contrast white playhead.
+Its header displays title, artist, BPM, and key; its Play/Pause transport
+displays elapsed and total time. Native Peaks waveform click/drag seeking
+updates the same HTML audio playhead. The presentation configures **ZoomView only**:
+it does not create or render a Peaks overview map, and ZoomView fills the entire
+waveform workspace. The **Beat-Quantized Region Selection** engine maintains one
+active Peaks segment and stores its `{ start, end, duration, beatCount }` in
+`useWorkspaceStore.activeLoopRange`. Both segment handles snap to the nearest
+individual Beat Grid line, so loop lengths may contain any whole number of beats.
+Click-drag creates or adjusts the loop, while a single click seeks the playhead.
+**Shift+click-drag** is reserved exclusively for horizontal ZoomView panning.
+The waveform displays `Selected: N Beats | MM:SS.ss` while a loop is active.
+This layout reserves the Pad Matrix
+region without implementing pad behavior.
+
+The Mini Library is a compact, vertically scrolling **List Tile** list, not a
+multi-column data table like the main Collection view. Each clickable track
+tile presents a single-line, ellipsized title; a smaller muted artist line; and
+a muted metadata line formatted as `124.00 BPM • 9m`. The tile has compact
+padding, a subtle hover surface, and a visible keyboard-focus state. Clicking a
+tile sets that `CollectionTrack` as `activeStudioTrack` and loads it into the Stem Editor without modifying
+collection metadata or dirty/save state. The key fragment reuses the Collection
+view's harmonic-key classification: direct harmonic matches to the currently
+loaded Stem Editor track use the primary key color, fuzzy adjacent matches use
+the secondary muted key color, and all other or invalid keys remain muted.
+
+Immediately beneath the **Mini Library** heading, a fixed sidebar search input
+with the placeholder **Search title or artist...** filters the visible tiles in
+real time. The filter is case-insensitive and matches either the track title or
+artist. A visible clear control resets a non-empty query; it does not modify
+the collection, the loaded Stem Editor track, or the saved query state.
+
 ### Auto Cue selection and execution
 
 `useLibraryState()` owns `selectedLibraryPaths: string[]`, containing the

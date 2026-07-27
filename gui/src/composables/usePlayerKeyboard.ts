@@ -4,12 +4,16 @@ import type { PlayerCue } from "./usePeaksMarkers";
 export interface PlayerKeyboardHandlers {
   togglePlay: () => void | Promise<void>;
   stop: () => void;
-  getPad: (padNumber: number) => PlayerCue | null;
-  jump: (padNumber: number) => void | Promise<void>;
+  /** Defaults to true for the Collection player; Studio needs transport only. */
+  enablePadShortcuts?: boolean;
+  getPad?: (padNumber: number) => PlayerCue | null;
+  jump?: (padNumber: number) => void | Promise<void>;
   previewEnd?: (padNumber: number) => void;
-  addCue: (padIndex: number) => void | Promise<void>;
-  deleteCue: (padIndex: number) => void | Promise<void>;
+  addCue?: (padIndex: number) => void | Promise<void>;
+  deleteCue?: (padIndex: number) => void | Promise<void>;
   skipBeats?: (beats: number) => void;
+  zoomIn?: () => void;
+  zoomOut?: () => void;
 }
 
 export function isFocusedOnInput(): boolean {
@@ -30,19 +34,21 @@ export function usePlayerKeyboard(handlers: PlayerKeyboardHandlers): void {
     if (isFocusedOnInput() || event.repeat) return;
     if (event.key === " ") { event.preventDefault(); void handlers.togglePlay(); return; }
     if (event.key === "Enter") { event.preventDefault(); handlers.stop(); return; }
+    if (event.key === "+" || event.key === "=") { event.preventDefault(); handlers.zoomIn?.(); return; }
+    if (event.key === "-" || event.key === "_") { event.preventDefault(); handlers.zoomOut?.(); return; }
     const padNumber = getPadNumber(event);
-    if (padNumber !== null) {
+    if (handlers.enablePadShortcuts !== false && padNumber !== null) {
       event.preventDefault();
-      const cue = handlers.getPad(padNumber);
+      const cue = handlers.getPad?.(padNumber) ?? null;
       if (event.shiftKey) {
-        if (cue) void handlers.deleteCue(padNumber - 1);
+        if (cue) void handlers.deleteCue?.(padNumber - 1);
         return;
       }
       if (cue) {
         previewingPads.add(padNumber);
-        void handlers.jump(padNumber);
+        void handlers.jump?.(padNumber);
       } else {
-        void handlers.addCue(padNumber - 1);
+        void handlers.addCue?.(padNumber - 1);
       }
       return;
     }
@@ -60,7 +66,7 @@ export function usePlayerKeyboard(handlers: PlayerKeyboardHandlers): void {
   const onKeyUp = (event: KeyboardEvent) => {
     if (isFocusedOnInput()) return;
     const padNumber = getPadNumber(event);
-    if (padNumber === null || !previewingPads.delete(padNumber)) return;
+    if (handlers.enablePadShortcuts === false || padNumber === null || !previewingPads.delete(padNumber)) return;
     event.preventDefault();
     handlers.previewEnd?.(padNumber);
   };

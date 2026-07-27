@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, shallowRef, watch } from "vue";
+import { computed, onMounted, onUnmounted, watch } from "vue";
+import { storeToRefs } from "pinia";
 import { type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AppHeader from "./components/AppHeader.vue";
 import CollectionView from "./components/CollectionView.vue";
 import SessionHistoryView from "./components/SessionHistoryView.vue";
+import RemixStudioView from "./components/RemixStudioView.vue";
 import TraktorSafetyOverlay from "./components/TraktorSafetyOverlay.vue";
 import { useTraktorStatus } from "./composables/useTraktorStatus";
 import { useUnsavedChangesGuard } from "./composables/useUnsavedChangesGuard";
@@ -12,13 +14,15 @@ import { useRunState } from "./composables/useRunState";
 import { useSaveStore } from "./stores/useSaveStore";
 import { useLibraryState } from "./composables/useLibraryState";
 import { useAppToast } from "./composables/useAppToast";
+import { type WorkspaceTab, useWorkspaceStore } from "./stores/useWorkspaceStore";
 
-type TabId = "collection" | "history";
-
-const activeTab = shallowRef<TabId>("collection");
-const activeView = computed(() =>
-  activeTab.value === "collection" ? CollectionView : SessionHistoryView,
-);
+const workspaceStore = useWorkspaceStore();
+const { activeTab } = storeToRefs(workspaceStore);
+const activeView = computed(() => ({
+  collection: CollectionView,
+  history: SessionHistoryView,
+  "remix-studio": RemixStudioView,
+})[activeTab.value]);
 const saveStore = useSaveStore();
 const { isTraktorRunning } = useTraktorStatus();
 const { isSystemBusy } = useRunState();
@@ -29,9 +33,9 @@ let unlistenCloseRequested: UnlistenFn | undefined;
 let isForceClosing = false;
 let traktorCloseReloadToken = 0;
 
-function selectTab(tab: TabId) {
+function selectTab(tab: WorkspaceTab) {
   if (isSystemBusy.value) return;
-  activeTab.value = tab;
+  workspaceStore.selectTab(tab);
 }
 
 watch(isTraktorRunning, async (isRunning, wasRunning) => {
@@ -113,6 +117,21 @@ onUnmounted(() => {
         >
           Session History
           <span v-if="activeTab === 'history'" class="absolute inset-x-3 bottom-0 h-0.5 bg-primary" aria-hidden="true" />
+        </button>
+        <button
+          id="remix-studio-tab"
+          type="button"
+          role="tab"
+          :aria-selected="activeTab === 'remix-studio'"
+          aria-controls="workspace-view"
+          :aria-disabled="isSystemBusy"
+          :disabled="isSystemBusy"
+          class="relative h-full px-3 text-sm font-medium text-muted transition-[color,background-color] duration-150 hover:bg-elevated hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-secondary/70 disabled:cursor-not-allowed"
+          :class="activeTab === 'remix-studio' ? 'text-primary' : ''"
+          @click="selectTab('remix-studio')"
+        >
+          Remix Studio
+          <span v-if="activeTab === 'remix-studio'" class="absolute inset-x-3 bottom-0 h-0.5 bg-primary" aria-hidden="true" />
         </button>
       </div>
 

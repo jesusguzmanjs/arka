@@ -7,6 +7,8 @@ use std::time::Duration;
 use sysinfo::{ProcessesToUpdate, System};
 use tauri::{Emitter, Manager};
 
+mod traktor_stems;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -278,6 +280,11 @@ fn export_last_run_telemetry(destination: String) -> Result<(), String> {
         .map_err(|error| format!("Unable to write telemetry export {destination}: {error}"))
 }
 
+#[tauri::command]
+fn check_stem_exists(audio_id: String, collection_root: String) -> Option<String> {
+    traktor_stems::existing_sidecar_path(&audio_id, &collection_root)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -293,6 +300,7 @@ pub fn run() {
             call_cuegrid_core,
             cancel_analysis,
             start_analysis_stream,
+            check_stem_exists,
         ])
         .setup(|app| {
             start_traktor_monitor(app.handle().clone());
