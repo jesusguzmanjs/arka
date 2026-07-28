@@ -15,7 +15,13 @@ interface LoopSelectionOptions {
   instance: any;
   waveformElement: HTMLElement;
   grid: GridTrackData;
+  onPreview?: (range: ActiveLoopRange) => void;
   onChange: (range: ActiveLoopRange | null) => void;
+}
+
+export interface StudioLoopSelection {
+  destroy: () => void;
+  setRange: (range: ActiveLoopRange) => void;
 }
 
 function snapSeconds(seconds: number, grid: GridTrackData): number {
@@ -33,23 +39,24 @@ function normaliseSegment(segment: SegmentLike, grid: GridTrackData): ActiveLoop
 }
 
 /** Owns the Studio-only beat-snapped Peaks segment and its mouse gesture lifecycle. */
-export function useStudioLoopSelection(options: LoopSelectionOptions): () => void {
-  const { instance, waveformElement, grid, onChange } = options;
+export function useStudioLoopSelection(options: LoopSelectionOptions): StudioLoopSelection {
+  const { instance, waveformElement, grid, onPreview, onChange } = options;
   const view = instance.views.getView("zoomview");
-  if (!view) return () => {};
+  if (!view) return { destroy: () => {}, setRange: () => {} };
   view.setWaveformDragMode("insert-segment");
   view.enableSegmentDragging(true);
   view.setSegmentDragMode("overlap");
   view.setMinSegmentDragWidth(0);
 
-  function applySegment(segment: SegmentLike): void {
+  function applySegment(segment: SegmentLike, commit: boolean): void {
     const range = normaliseSegment(segment, grid);
     if (!range) return;
     segment.update({ id: LOOP_ID, startTime: range.start, endTime: range.end, editable: true, overlay: true, color: "#edb40b", borderColor: "#f7d15f" });
-    onChange(range);
+    if (commit) onChange(range);
+    else onPreview?.(range);
   }
 
-  function createSingleActiveSegment(range: ActiveLoopRange): void {
+  function createSingleActiveSegment(range: ActiveLoopRange, notify = true): void {
     // Peaks may assign transient IDs to insert-drag segments. Removing every
     // segment before adding the canonical loop guarantees one region only.
     instance.segments.removeAll();
@@ -62,7 +69,7 @@ export function useStudioLoopSelection(options: LoopSelectionOptions): () => voi
       color: "#edb40b",
       borderColor: "#f7d15f",
     });
-    onChange(range);
+    if (notify) onChange(range);
   }
 
   function handleSegmentInsert(event: { segment: SegmentLike }): void {
@@ -77,7 +84,11 @@ export function useStudioLoopSelection(options: LoopSelectionOptions): () => voi
   }
 
   function handleSegmentDragged(event: { segment: SegmentLike }): void {
-    if (event.segment.id === LOOP_ID) applySegment(event.segment);
+    if (event.segment.id === LOOP_ID) applySegment(event.segment, false);
+  }
+
+  function handleSegmentDragEnd(event: { segment: SegmentLike }): void {
+    if (event.segment.id === LOOP_ID) applySegment(event.segment, true);
   }
 
   let panStartX: number | null = null;
@@ -98,18 +109,23 @@ export function useStudioLoopSelection(options: LoopSelectionOptions): () => voi
 
   instance.on("segments.insert", handleSegmentInsert);
   instance.on("segments.dragged", handleSegmentDragged);
-  instance.on("segments.dragend", handleSegmentDragged);
+  instance.on("segments.dragend", handleSegmentDragEnd);
   waveformElement.addEventListener("mousedown", handleShiftMouseDown, true);
   window.addEventListener("mousemove", handleShiftMouseMove, true);
   window.addEventListener("mouseup", endShiftPan, true);
 
-  return () => {
+  return {
+    setRange(range: ActiveLoopRange): void {
+      createSingleActiveSegment(range, false);
+    },
+    destroy(): void {
     instance.off("segments.insert", handleSegmentInsert);
     instance.off("segments.dragged", handleSegmentDragged);
-    instance.off("segments.dragend", handleSegmentDragged);
+    instance.off("segments.dragend", handleSegmentDragEnd);
     waveformElement.removeEventListener("mousedown", handleShiftMouseDown, true);
     window.removeEventListener("mousemove", handleShiftMouseMove, true);
     window.removeEventListener("mouseup", endShiftPan, true);
     instance.segments.removeAll();
+    },
   };
 }

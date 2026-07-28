@@ -17,6 +17,8 @@ export interface CollectionTrack {
   /** Normalized Traktor rating from 0 through 5. */
   rating: number;
   location_path: string;
+  /** Traktor ENTRY@AUDIO_ID; required to locate a native Stem sidecar. */
+  audio_id: string | null;
   bpm: number | null;
   grid_anchor_ms: number | null;
   key: string | null;

@@ -1377,6 +1377,7 @@ export interface CollectionTrack {
   mix: string;
   rating: number;
   location_path: string;
+  audio_id: string | null;
   bpm: number | null;
   grid_anchor_ms: number | null;
   key: string | null;

@@ -578,6 +578,7 @@ class TestGlobalLibraryExport:
         assert collection[prueba["track_paths"][0]]["location_path"] == prueba[
             "track_paths"
         ][0]
+        assert isinstance(collection[prueba["track_paths"][0]]["audio_id"], str)
         assert set(prueba) == {"kind", "uuid", "name", "track_paths"}
         assert isinstance(prueba["uuid"], str) and prueba["uuid"]
         assert all("artist" not in node and "title" not in node for node in root["children"])

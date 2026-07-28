@@ -375,6 +375,7 @@ class NmlParser:
                     {
                         **self._editable_metadata_dict(track_entry),
                         "location_path": location_path,
+                        "audio_id": track_entry.audio_id,
                         "key": track_entry.key,
                         "duration_ms": track_entry.duration_ms,
                         "collection_index": collection_index,

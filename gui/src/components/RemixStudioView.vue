@@ -8,7 +8,7 @@ import MiniLibrary from "./MiniLibrary.vue";
 import StemEditor from "./StemEditor.vue";
 
 const workspaceStore = useWorkspaceStore();
-const { activeStudioTrack } = storeToRefs(workspaceStore);
+const { activeStudioTrack, activeStemTracks } = storeToRefs(workspaceStore);
 const { collection } = useLibraryState();
 
 const miniLibraryTracks = computed(() => Object.values(collection.value)
@@ -26,7 +26,7 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
         <MiniLibrary :tracks="miniLibraryTracks" :loaded-track="activeStudioTrack" @select="loadTrackInStemEditor" />
       </aside>
 
-      <StemEditor :track="activeStudioTrack" />
+      <StemEditor :track="activeStudioTrack" :stem-tracks="activeStemTracks" />
     </section>
 
     <section class="studio-zone pad-matrix" aria-labelledby="pad-matrix-heading">

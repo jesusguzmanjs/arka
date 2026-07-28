@@ -215,6 +215,69 @@ Remix Studio** item in its track context menu. The action operates on the track
 that opened that menu and does not mutate collection metadata or dirty/save
 state.
 
+#### Native Stem detection and Multi-Track Mode
+
+`CollectionTrack` includes nullable `audio_id` from `ENTRY@AUDIO_ID`. When a
+track is loaded into Remix Studio, `useWorkspaceStore` clears
+`activeStemTracks` and, when both `audio_id` and the configured collection NML
+path are available, calls Tauri `check_stem_exists({ audioId: track.audio_id,
+nmlPath, stemsDirOverride: null })`. A returned native `.stem.mp4` path is passed immediately to
+`extract_stems({ stemFilePath })`. On success, the exact four temporary WAV
+paths returned by the Rust command are stored as `activeStemTracks: string[]`.
+The store uses a load token so a late response for a previously selected track
+cannot replace the newer track's state. Missing IDs, unavailable collection
+roots, no sidecar, extraction failures, or a result other than four paths leave
+`activeStemTracks` empty and retain Single-Track Mode; Stem lookup must not
+prevent normal waveform loading.
+
+`StemEditor.vue` derives Multi-Track Mode from `activeStemTracks.length === 4`.
+Single-Track Mode retains the existing one Peaks.js waveform and transport. In
+Multi-Track Mode it replaces that workspace with four equal-height, vertically
+stacked stem lanes in this order: **Drums**, **Bass**, **Other**, **Vocals**.
+Each lane has a roughly 60px left control strip containing accessible `[M]`
+(Mute) and `[S]` (Solo) buttons, a visible lane label, and the placeholder
+**Loading stem data...** until dedicated Peaks.js instances are initialized.
+
+Multi-Track Mode initializes four independent ZoomView-only Peaks.js instances,
+using the extracted temporary WAV paths in lane order. Their waveform colors are
+Drums `#FF5722`, Bass `#4CAF50`, Other `#2196F3`, and Vocals `#FFC107`. Every
+lane accepts pointer and wheel/trackpad input. Its `zoomview.panned`, zoom,
+seek, and wheel-zoom events synchronize the exact visible range or playhead to
+the other three instances through a guarded `isSyncing` update, so the shared
+X-axis never feeds back recursively. A drag-created or adjusted loop segment is
+beat-snapped and mirrored to all four lanes, visually forming one time column.
+The active loop remains the one global `{ start, end, duration, beatCount }`
+range in `useWorkspaceStore`.
+
+Peaks instances and their synchronization flags are opaque imperative values,
+never deep Vue-reactive state. The four initialization callbacks are awaited by
+one `Promise.all`; only after every instance is ready may the Stem Editor enable
+transport. Fast viewport and segment-preview events use only Peaks APIs. Vue
+state is committed only at lifecycle boundaries such as ready, play/pause, and
+segment drag end. Each Peaks mount container remains empty of Vue-managed child
+nodes, preventing Peaks DOM changes from invalidating Vue vnodes.
+
+Routing is independent of that global time selection. The workspace store owns
+`selectedStems: string[]`; clicking a lane selects only it, while Shift, Ctrl,
+or Command clicks toggle lanes into a multi-selection. Drag-to-pad routing is
+reserved for a future update; this iteration renders no explicit drag control.
+
+The four lanes form one flush waveform block: there is no inter-lane gap or
+per-lane selection border, only a single outer border and horizontal dividers.
+Every lane receives the same Beat Grid markers. The fixed-width 60px control
+strip never shrinks. `[M]` toggles an individual lane's mute state and restores
+it to volume `1` when turned off. `[S]` toggles a solo lane; leaving Solo
+restores each lane according to its individual Mute state. A `ResizeObserver`
+and window-resize listener call `fitToContainer()` on every ZoomView.
+
+Stem Beat Grid opacity is updated imperatively whenever the synchronized
+viewport changes. It uses the Collection waveform's `visibleBeats` fade math:
+beat, bar, 16-beat, and 32-beat line classes progressively fade at the same
+thresholds, with their hard-hide limits at 300, 600, and 1000 visible beats.
+The Stem Editor retains grid-line references per Peaks instance and applies all
+line opacity/visibility changes before calling `batchDraw()` at most once for
+each Konva layer. This loop must not mutate Vue state.
+
 `RemixStudioView.vue` MUST remain bounded inside the fixed application
 viewport. Its top row (~50vh) contains a **Mini Library & Filters** sidebar
 (~300px or 25%) and the remaining-width Stem Editor. The lower-row future

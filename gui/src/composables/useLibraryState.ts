@@ -69,6 +69,7 @@ function isTrackMetadata(value: unknown): value is TrackMetadata {
       typeof value.rating === "number" &&
       Number.isInteger(value.rating) && value.rating >= 0 && value.rating <= 5 &&
       typeof value.location_path === "string" &&
+      (value.audio_id === null || typeof value.audio_id === "string") &&
       isNullableFiniteNumber(value.bpm) &&
       isNullableFiniteNumber(value.grid_anchor_ms) &&
       (value.key === null || typeof value.key === "string") &&

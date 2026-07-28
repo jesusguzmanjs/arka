@@ -7,8 +7,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use quick_xml::events::Event;
+use quick_xml::Reader;
+
 const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
 const TRACK_ID_SIZE: usize = 0x100;
+const TSI_SETTINGS_FILENAME: &str = "Traktor Settings.tsi";
+const TSI_STEMS_DIR_ENTRY_NAME: &str = "Browser.Dir.GeneratedStems";
 const INITIAL_STATE: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
 const SHIFTS: [u32; 64] = [
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
@@ -91,12 +96,6 @@ pub struct SidecarPrediction {
 impl SidecarPrediction {
     pub fn filename(&self) -> String {
         format!("{}.stem.mp4", self.basename)
-    }
-
-    pub fn relative_path(&self) -> PathBuf {
-        PathBuf::from("Stems")
-            .join(format!("{:03}", self.shard))
-            .join(self.filename())
     }
 }
 
@@ -213,11 +212,87 @@ fn md5_words_to_string(words: [u32; 4]) -> String {
         .collect()
 }
 
+/// Reads Traktor's configured generated-Stems directory from the NML sibling
+/// `Traktor Settings.tsi` file. Invalid or unavailable settings fall through
+/// to the next root-resolution candidate.
+pub fn read_stems_dir_from_settings(nml_path: &Path) -> Option<PathBuf> {
+    let settings_path = nml_path.parent()?.join(TSI_SETTINGS_FILENAME);
+    let file = fs::File::open(settings_path).ok()?;
+    let mut reader = Reader::from_reader(std::io::BufReader::new(file));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(entry)) | Ok(Event::Empty(entry))
+                if entry.name().as_ref() == b"Entry" =>
+            {
+                let mut is_stems_directory = false;
+                let mut value = None;
+                for attribute in entry.attributes().flatten() {
+                    let key = attribute.key.as_ref();
+                    let decoded = attribute.decode_and_unescape_value(reader.decoder()).ok()?;
+                    if key == b"Name" && decoded == TSI_STEMS_DIR_ENTRY_NAME {
+                        is_stems_directory = true;
+                    } else if key == b"Value" {
+                        value = Some(decoded.into_owned());
+                    }
+                }
+                if is_stems_directory {
+                    return value.filter(|path| !path.is_empty()).map(PathBuf::from);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buffer.clear();
+    }
+}
+
+fn default_stems_root(nml_path: &Path) -> PathBuf {
+    if let Some(settings_path) = read_stems_dir_from_settings(nml_path) {
+        return settings_path;
+    }
+
+    let native_music_directory =
+        dirs::audio_dir().or_else(|| dirs::home_dir().map(|directory| directory.join("Music")));
+    if let Some(default_stems_directory) = native_music_directory
+        .map(|directory| directory.join("Traktor").join("Stems"))
+        .filter(|directory| directory.is_dir())
+    {
+        return default_stems_directory;
+    }
+
+    nml_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("Stems")
+}
+
+/// Resolves the Stem root with the same override/settings/default/NML-sibling
+/// precedence as CueGrid's Python `resolve_stem_path` helper.
+pub fn resolve_stems_root(nml_path: &Path, stems_dir_override: Option<&str>) -> PathBuf {
+    stems_dir_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_stems_root(nml_path))
+}
+
 /// Returns the canonical absolute path of an existing native Stem sidecar.
-pub fn existing_sidecar_path(audio_id: &str, collection_root: &str) -> Option<String> {
-    let relative_path = predict_sidecar(audio_id)?.relative_path();
-    let candidate = Path::new(collection_root).join(relative_path);
-    if !fs::metadata(&candidate).ok()?.is_file() {
+pub fn existing_sidecar_path(
+    audio_id: &str,
+    nml_path: &str,
+    stems_dir_override: Option<&str>,
+) -> Option<String> {
+    let prediction = predict_sidecar(audio_id)?;
+    let candidate = resolve_stems_root(Path::new(nml_path), stems_dir_override)
+        .join(format!("{:03}", prediction.shard))
+        .join(prediction.filename());
+    let exists = candidate.exists();
+    eprintln!(
+        "Traktor Stem candidate: {} (exists: {exists})",
+        candidate.display()
+    );
+    if !exists || !candidate.is_file() {
         return None;
     }
     candidate
@@ -230,6 +305,7 @@ pub fn existing_sidecar_path(audio_id: &str, collection_root: &str) -> Option<St
 mod tests {
     use super::{
         decode_audio_id, existing_sidecar_path, predict_sidecar, predict_sidecar_from_track_id,
+        read_stems_dir_from_settings, resolve_stems_root,
     };
     use std::fs;
 
@@ -246,8 +322,8 @@ mod tests {
         assert_eq!(prediction.shard, 31);
         assert_eq!(prediction.basename, "5MO1STA4IXTHCA3NYWKDDKERCO3A");
         assert_eq!(
-            prediction.relative_path().to_string_lossy(),
-            "Stems\\031\\5MO1STA4IXTHCA3NYWKDDKERCO3A.stem.mp4"
+            prediction.filename(),
+            "5MO1STA4IXTHCA3NYWKDDKERCO3A.stem.mp4"
         );
     }
 
@@ -257,16 +333,24 @@ mod tests {
     }
 
     #[test]
-    fn returns_an_absolute_path_only_for_an_existing_sidecar() {
+    fn resolves_an_existing_sidecar_from_an_explicit_root() {
         let root = std::env::temp_dir().join(format!("cuegrid-stems-{}", std::process::id()));
+        let nml_path = root.join("collection.nml");
         let audio_id = "A".repeat(342);
         let prediction = predict_sidecar(&audio_id).unwrap();
-        let expected = root.join(prediction.relative_path());
+        let expected = root
+            .join("configured-stems")
+            .join(format!("{:03}", prediction.shard))
+            .join(prediction.filename());
         fs::create_dir_all(expected.parent().unwrap()).unwrap();
         fs::write(&expected, []).unwrap();
 
         assert_eq!(
-            existing_sidecar_path(&audio_id, root.to_str().unwrap()),
+            existing_sidecar_path(
+                &audio_id,
+                nml_path.to_str().unwrap(),
+                Some(root.join("configured-stems").to_str().unwrap()),
+            ),
             Some(
                 expected
                     .canonicalize()
@@ -275,7 +359,34 @@ mod tests {
                     .into_owned()
             )
         );
-        assert_eq!(existing_sidecar_path("AAE", root.to_str().unwrap()), None);
+        assert_eq!(
+            existing_sidecar_path("AAE", nml_path.to_str().unwrap(), None),
+            None
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settings_directory_takes_precedence_over_the_nml_sibling_fallback() {
+        let root = std::env::temp_dir().join(format!("cuegrid-tsi-{}", std::process::id()));
+        let nml_path = root.join("collection.nml");
+        let configured_stems = root.join("custom-stems");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Traktor Settings.tsi"),
+            format!(
+                r#"<Root><Entry Name="Browser.Dir.GeneratedStems" Value="{}"/></Root>"#,
+                configured_stems.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_stems_dir_from_settings(&nml_path),
+            Some(configured_stems.clone())
+        );
+        assert_eq!(resolve_stems_root(&nml_path, None), configured_stems);
 
         fs::remove_dir_all(root).unwrap();
     }

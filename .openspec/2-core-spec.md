@@ -533,7 +533,7 @@ These commands bypass audio analysis and the normal selector requirement:
 | `--get-track-metadata TRACK_PATH` | one Super JSON metadata/preview object |
 | `--get-library` | relational `{collection, playlists}` JSON object |
 
-`--get-library` indexes collection entries by normalized location path. Each collection value includes `location_path`, `bpm`, `grid_anchor_ms`, `key`, `duration_ms`, `is_flex_grid`, `existing_cues`, and `collection_index`, plus the complete metadata dictionary below. Playlist/folder nodes retain hierarchy using `kind`, `name`, `children` (folders), or `track_paths` (playlists); they do not duplicate track metadata. Duplicate normalized collection locations return `{"error":"duplicate_location",...}` with a nonzero exit code.
+`--get-library` indexes collection entries by normalized location path. Each collection value includes `location_path`, `audio_id`, `bpm`, `grid_anchor_ms`, `key`, `duration_ms`, `is_flex_grid`, `existing_cues`, and `collection_index`, plus the complete metadata dictionary below. `audio_id` is the nullable `ENTRY@AUDIO_ID` value and enables the GUI's read-only native Stem lookup; it is not an analysis input. Playlist/folder nodes retain hierarchy using `kind`, `name`, `children` (folders), or `track_paths` (playlists); they do not duplicate track metadata. Duplicate normalized collection locations return `{"error":"duplicate_location",...}` with a nonzero exit code.
 
 Every collection entry in a successful `--get-library` response must include every field in this metadata dictionary. String fields are always present and use `""` when the corresponding NML attribute or element is absent. `rating` is always present as a number in the inclusive range `0` through `5`; a missing or invalid NML `INFO@RANKING` value is reported as `0`.
 
@@ -550,6 +550,7 @@ Every collection entry in a successful `--get-library` response must include eve
 | `comment2` | string | `ENTRY > INFO@RATING` |
 | `lyrics` | string | `ENTRY > INFO@KEY_LYRICS` |
 | `mix` | string | `ENTRY > INFO@MIX` |
+| `audio_id` | string \| null | `ENTRY@AUDIO_ID`; `null` when absent or empty |
 | `flags` | number | `ENTRY > INFO@FLAGS`, parsed as a non-negative integer; missing or malformed values are `0` |
 | `rating` | number | `ENTRY > INFO@RANKING`, converted from Traktor's `0`–`255` representation to the nearest integer `0`–`5` rating |
 

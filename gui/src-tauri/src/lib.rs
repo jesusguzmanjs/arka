@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -17,6 +18,9 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const TRAKTOR_STATUS_EVENT: &str = "traktor-status";
 const TRAKTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const STEM_TEMP_DIRECTORY: &str = "arka_studio";
+
+static STEM_EXTRACTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn is_traktor_process_name(process_name: &str) -> bool {
     // Lo pasamos a minúsculas y buscamos "traktor" en cualquier parte del nombre del proceso
@@ -78,6 +82,115 @@ fn core_command(core_exe: PathBuf) -> Command {
     command.creation_flags(CREATE_NO_WINDOW);
 
     command
+}
+
+fn stem_temp_directory() -> PathBuf {
+    std::env::temp_dir().join(STEM_TEMP_DIRECTORY)
+}
+
+fn reset_stem_temp_directory(directory: &Path) -> Result<(), String> {
+    if directory.exists() {
+        fs::remove_dir_all(directory).map_err(|error| {
+            format!(
+                "Unable to clear temporary Stem directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "Unable to create temporary Stem directory {}: {error}",
+            directory.display()
+        )
+    })
+}
+
+fn stem_output_paths(directory: &Path) -> [PathBuf; 4] {
+    [
+        directory.join("drums.wav"),
+        directory.join("bass.wav"),
+        directory.join("other.wav"),
+        directory.join("vocals.wav"),
+    ]
+}
+
+fn ffmpeg_stem_arguments(stem_file_path: &Path, outputs: &[PathBuf; 4]) -> Vec<String> {
+    vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        stem_file_path.to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:1".to_string(),
+        "-c:a".to_string(),
+        "pcm_s16le".to_string(),
+        outputs[0].to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:2".to_string(),
+        "-c:a".to_string(),
+        "pcm_s16le".to_string(),
+        outputs[1].to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:3".to_string(),
+        "-c:a".to_string(),
+        "pcm_s16le".to_string(),
+        outputs[2].to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:4".to_string(),
+        "-c:a".to_string(),
+        "pcm_s16le".to_string(),
+        outputs[3].to_string_lossy().into_owned(),
+    ]
+}
+
+fn extract_stems_to_temp(stem_file_path: String) -> Result<Vec<String>, String> {
+    let stem_path = PathBuf::from(stem_file_path);
+    if !stem_path.is_file() {
+        return Err(format!(
+            "Stem file does not exist or is not a file: {}",
+            stem_path.display()
+        ));
+    }
+
+    let extraction_lock = STEM_EXTRACTION_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = extraction_lock
+        .lock()
+        .map_err(|_| "Stem extraction lock was poisoned".to_string())?;
+
+    let directory = stem_temp_directory();
+    reset_stem_temp_directory(&directory)?;
+    let outputs = stem_output_paths(&directory);
+
+    let mut command = Command::new("ffmpeg");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = command
+        .args(ffmpeg_stem_arguments(&stem_path, &outputs))
+        .output()
+        .map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        eprintln!("FFmpeg Stem extraction: {stderr}");
+    }
+
+    if !output.status.success() {
+        let _ = reset_stem_temp_directory(&directory);
+        return Err(if stderr.is_empty() {
+            format!("FFmpeg exited with status {}", output.status)
+        } else {
+            format!("FFmpeg Stem extraction failed: {stderr}")
+        });
+    }
+
+    if outputs.iter().any(|path| !path.is_file()) {
+        let _ = reset_stem_temp_directory(&directory);
+        return Err("FFmpeg completed without creating all four Stem WAV files".to_string());
+    }
+
+    Ok(outputs
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 fn append_nml_path(args: &mut Vec<String>, nml_path: Option<String>) {
@@ -281,8 +394,19 @@ fn export_last_run_telemetry(destination: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn check_stem_exists(audio_id: String, collection_root: String) -> Option<String> {
-    traktor_stems::existing_sidecar_path(&audio_id, &collection_root)
+fn check_stem_exists(
+    audio_id: String,
+    nml_path: String,
+    stems_dir_override: Option<String>,
+) -> Option<String> {
+    traktor_stems::existing_sidecar_path(&audio_id, &nml_path, stems_dir_override.as_deref())
+}
+
+#[tauri::command]
+async fn extract_stems(stem_file_path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || extract_stems_to_temp(stem_file_path))
+        .await
+        .map_err(|error| format!("Stem extraction worker failed: {error}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -301,6 +425,7 @@ pub fn run() {
             cancel_analysis,
             start_analysis_stream,
             check_stem_exists,
+            extract_stems,
         ])
         .setup(|app| {
             start_traktor_monitor(app.handle().clone());
@@ -312,7 +437,12 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_nml_path, is_traktor_process_name};
+    use super::{
+        append_nml_path, ffmpeg_stem_arguments, is_traktor_process_name, reset_stem_temp_directory,
+        stem_output_paths,
+    };
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn appends_a_nonempty_nml_path_as_one_argument() {
@@ -354,5 +484,53 @@ mod tests {
     fn does_not_match_other_processes() {
         assert!(!is_traktor_process_name("chrome.exe"));
         assert!(!is_traktor_process_name("rekordbox.exe"));
+    }
+
+    #[test]
+    fn builds_one_ffmpeg_invocation_for_all_four_stem_streams() {
+        let input = PathBuf::from("C:\\Music\\track.stem.mp4");
+        let outputs = stem_output_paths(PathBuf::from("C:\\Temp\\arka_studio").as_path());
+
+        assert_eq!(
+            ffmpeg_stem_arguments(&input, &outputs),
+            [
+                "-y",
+                "-i",
+                "C:\\Music\\track.stem.mp4",
+                "-map",
+                "0:1",
+                "-c:a",
+                "pcm_s16le",
+                "C:\\Temp\\arka_studio\\drums.wav",
+                "-map",
+                "0:2",
+                "-c:a",
+                "pcm_s16le",
+                "C:\\Temp\\arka_studio\\bass.wav",
+                "-map",
+                "0:3",
+                "-c:a",
+                "pcm_s16le",
+                "C:\\Temp\\arka_studio\\other.wav",
+                "-map",
+                "0:4",
+                "-c:a",
+                "pcm_s16le",
+                "C:\\Temp\\arka_studio\\vocals.wav",
+            ]
+        );
+    }
+
+    #[test]
+    fn resets_a_temp_directory_before_extraction() {
+        let directory =
+            std::env::temp_dir().join(format!("arka-stem-reset-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("orphan.wav"), []).unwrap();
+
+        reset_stem_temp_directory(&directory).unwrap();
+
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -25,16 +25,22 @@ export interface GridAnchorDragEvent {
   isFinal: boolean;
 }
 
+export interface CustomMarkerOptions {
+  showLabel?: boolean;
+}
+
 /** Owns Konva marker construction and releases retained grid-line references on destruction. */
 export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) => void) {
   let gridLines: GridLineReference[] = [];
+  const gridLinesByInstance = new WeakMap<object, GridLineReference[]>();
 
   function markerHeight(options: any, group: Konva.Group): number {
     const layer = options.layer ?? group.getLayer();
     return layer?.getHeight?.() ?? 0;
   }
 
-  function createPointMarker(options: any): any {
+  function createPointMarker(options: any, customOptions?: CustomMarkerOptions): any {
+    const showLabel = customOptions?.showLabel ?? true; // <--- Por defecto true salvo que se indique false
     const point = (options.point ?? {}) as Record<string, any>;
     const metadata = point.data ?? point;
     const kind: "grid" | "cue" | "grid-anchor" = metadata.kind ?? "cue";
@@ -72,6 +78,7 @@ export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) 
     let label: Konva.Rect | null = null;
     let labelText: Konva.Text | null = null;
     let parent: Konva.Group | null = null;
+    let gridLineCollection: GridLineReference[] | null = null;
     return {
       init(group: Konva.Group) {
         parent = group;
@@ -84,8 +91,13 @@ export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) 
           opacity: kind === "grid" ? (isBar ? 1 : 0.8) : opacity, listening: isGridAnchor,
         });
         group.add(line);
-        if (kind === "grid" && options.view === "zoomview") gridLines.push({ line, offset });
-        if (kind === "cue" && cueId !== undefined && cueId !== null) {
+        if (kind === "grid" && options.view === "zoomview") {
+          gridLineCollection = gridLines;
+          gridLineCollection.push({ line, offset });
+        }
+
+        // SOLO añadimos la insignia numérica si showLabel es true
+        if (kind === "cue" && cueId !== undefined && cueId !== null && showLabel) {
           const width = 18;
           const heightPx = 14;
           const y = height - heightPx;
@@ -106,7 +118,10 @@ export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) 
       },
       update(next: any) { if (next?.color && line) line.stroke(next.color); },
       destroy() {
-        if (kind === "grid" && options.view === "zoomview" && line) gridLines = gridLines.filter((item) => item.line !== line);
+        if (kind === "grid" && options.view === "zoomview" && line && gridLineCollection) {
+          const index = gridLineCollection.findIndex((item) => item.line === line);
+          if (index >= 0) gridLineCollection.splice(index, 1);
+        }
       },
     };
   }
@@ -114,6 +129,7 @@ export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) 
   function paintAllMarkers(instance: any, track: GridTrackData, cues: readonly PlayerCue[], isGridEditMode = false): void {
     if (!instance) return;
     gridLines = [];
+    gridLinesByInstance.set(instance, gridLines);
     instance.points.removeAll();
     instance.points.add(buildGrid(track).map((point, index) => ({
       id: `grid-${index}`, time: point.timeMs / 1000, editable: false,
@@ -136,5 +152,11 @@ export function usePeaksMarkers(onGridAnchorDrag?: (event: GridAnchorDragEvent) 
 
   function notifyGridAnchorDrag(event: GridAnchorDragEvent): void { onGridAnchorDrag?.(event); }
 
-  return { createPointMarker, markerHeight, paintAllMarkers, notifyGridAnchorDrag, getGridLines: () => gridLines };
+  return {
+    createPointMarker,
+    markerHeight,
+    paintAllMarkers,
+    notifyGridAnchorDrag,
+    getGridLines: (instance?: object) => instance ? (gridLinesByInstance.get(instance) ?? []) : gridLines,
+  };
 }
