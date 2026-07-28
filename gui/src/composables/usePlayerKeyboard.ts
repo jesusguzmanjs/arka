@@ -3,9 +3,12 @@ import type { PlayerCue } from "./usePeaksMarkers";
 
 export interface PlayerKeyboardHandlers {
   togglePlay: () => void | Promise<void>;
+  restartLoop?: () => void | Promise<void>;
   stop: () => void;
   /** Defaults to true for the Collection player; Studio needs transport only. */
   enablePadShortcuts?: boolean;
+  /** Handles a read-only pad shortcut without cue creation, deletion, or preview state. */
+  onPadTrigger?: (padNumber: number) => void | Promise<void>;
   getPad?: (padNumber: number) => PlayerCue | null;
   jump?: (padNumber: number) => void | Promise<void>;
   previewEnd?: (padNumber: number) => void;
@@ -32,13 +35,22 @@ export function usePlayerKeyboard(handlers: PlayerKeyboardHandlers): void {
   const previewingPads = new Set<number>();
   const onKeyDown = (event: KeyboardEvent) => {
     if (isFocusedOnInput() || event.repeat) return;
-    if (event.key === " ") { event.preventDefault(); void handlers.togglePlay(); return; }
+    if (event.key === " ") {
+      event.preventDefault();
+      if (event.shiftKey && handlers.restartLoop) void handlers.restartLoop();
+      else void handlers.togglePlay();
+      return;
+    }
     if (event.key === "Enter") { event.preventDefault(); handlers.stop(); return; }
     if (event.key === "+" || event.key === "=") { event.preventDefault(); handlers.zoomIn?.(); return; }
     if (event.key === "-" || event.key === "_") { event.preventDefault(); handlers.zoomOut?.(); return; }
     const padNumber = getPadNumber(event);
     if (handlers.enablePadShortcuts !== false && padNumber !== null) {
       event.preventDefault();
+      if (handlers.onPadTrigger) {
+        void handlers.onPadTrigger(padNumber);
+        return;
+      }
       const cue = handlers.getPad?.(padNumber) ?? null;
       if (event.shiftKey) {
         if (cue) void handlers.deleteCue?.(padNumber - 1);

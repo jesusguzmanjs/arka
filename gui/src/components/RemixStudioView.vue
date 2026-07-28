@@ -41,7 +41,7 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
   display: grid;
   flex: 1;
   min-height: 0;
-  grid-template-rows: minmax(50vh, 1fr) minmax(180px, 1fr);
+  grid-template-rows: minmax(320px, 1fr) minmax(180px, 1fr);
   overflow: hidden;
   background: #1c1c1e;
 }
@@ -50,7 +50,7 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(240px, 25%) minmax(0, 1fr);
+  grid-template-columns: minmax(250px, 25%) minmax(0, 1fr);
 }
 
 .studio-zone {
@@ -61,7 +61,9 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
 
 .mini-library {
   display: flex;
+  min-width: 250px;
   padding: 1.25rem 0.75rem 1.25rem 1.25rem;
+  flex-direction: column;
   border-right: 1px solid #5a5a5e;
 }
 

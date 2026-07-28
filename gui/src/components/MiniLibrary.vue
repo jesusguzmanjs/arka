@@ -97,6 +97,7 @@ function selectTrack(track: CollectionTrack): void {
 <style scoped>
 .mini-library-content {
   display: flex;
+  min-width: 0;
   min-height: 0;
   flex: 1;
   flex-direction: column;
@@ -117,6 +118,7 @@ function selectTrack(track: CollectionTrack): void {
 .search-controls {
   position: relative;
   margin-top: 0.625rem;
+  flex-shrink: 0;
 }
 
 .search-input {

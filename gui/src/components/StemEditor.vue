@@ -6,7 +6,6 @@ import Peaks from "peaks.js";
 import { fetchTrackMetadata } from "../composables/useTrackMetadata";
 import { usePeaksMarkers, type PlayerCue } from "../composables/usePeaksMarkers";
 import { usePlayerKeyboard } from "../composables/usePlayerKeyboard";
-import { useStudioLoopSelection, type StudioLoopSelection } from "../composables/useStudioLoopSelection";
 import { STEM_LANES, useStemPeaks } from "../composables/useStemPeaks";
 import type { GridTrackData } from "../composables/useGridMath";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
@@ -30,9 +29,8 @@ const selectionOverlayViewportVersion = shallowRef(0);
 let syncRaf: number | null = null;
 let stemGridBpm = 0;
 let initToken = 0;
-let loopSelections: StudioLoopSelection[] = [];
-let isSyncingLoop = false;
 const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096];
+const MIN_VISIBLE_SECONDS = 16;
 
 interface StemTimeline {
   container: HTMLElement;
@@ -44,7 +42,7 @@ interface StemTimeline {
 }
 
 type SelectionDrag =
-  | { mode: "draw"; timeline: StemTimeline; startRawTime: number }
+  | { mode: "draw"; timeline: StemTimeline; startRawTime: number; didCreateLoop: boolean }
   | { mode: "move"; timeline: StemTimeline; startClientX: number; range: NonNullable<typeof activeLoopRange.value> }
   | { mode: "resize-left" | "resize-right"; timeline: StemTimeline; range: NonNullable<typeof activeLoopRange.value> };
 
@@ -101,21 +99,35 @@ const loopLabel = computed(() => {
   return range ? `Selected: ${range.beatCount} ${range.beatCount === 1 ? "Beat" : "Beats"} | ${formatDuration(range.duration)}` : null;
 });
 const customSelectionOverlayStyle = computed(() => {
-  // Peaks owns the viewport, so its change callback invalidates this derived style.
+  // Esta línea fuerza a Vue a recalcular cuando hacemos refreshCustomSelectionOverlay()
   void selectionOverlayViewportVersion.value;
 
   const range = activeLoopRange.value;
-  const view = getMasterPeaks()?.views?.getView("zoomview");
+  const activeInstance = activePeaks.value;
+  const view = activeInstance?.views?.getView("zoomview");
+
   if (!range || !view) return { display: "none" };
 
+  // Usamos el API de Peaks para obtener los segundos exactos visibles ahora mismo
   const startTime = view.getStartTime();
-  const visibleSeconds = view.getEndTime() - startTime;
+  const endTime = view.getEndTime();
+  const visibleSeconds = endTime - startTime;
+
   if (!Number.isFinite(startTime) || !Number.isFinite(visibleSeconds) || visibleSeconds <= 0) {
     return { display: "none" };
   }
 
+  // Calculamos el porcentaje exacto de dónde cae el inicio del bucle dentro de la ventana visible
   const leftPercent = ((range.start - startTime) / visibleSeconds) * 100;
+
+  // Calculamos qué porcentaje de la ventana visible ocupa la duración del bucle
   const widthPercent = (range.duration / visibleSeconds) * 100;
+
+  // Si la caja está completamente fuera de la vista por la izquierda o por la derecha, la ocultamos (opcional pero limpio)
+  if (leftPercent + widthPercent < 0 || leftPercent > 100) {
+    return { display: "none" };
+  }
+
   return {
     display: "block",
     left: `${leftPercent}%`,
@@ -132,8 +144,9 @@ const gridTrack = computed<GridTrackData>(() => ({
   duration_ms: duration.value * 1000,
 }));
 const gridCues = computed<PlayerCue[]>(() => (props.track?.existing_cues ?? [])
-    .filter((cue) => Number.isFinite(cue.start_ms))
-    .map((cue, index) => ({ id: Number.isInteger(cue.hotcue) ? cue.hotcue : index, position_ms: cue.start_ms, is_valid: true })));
+    .filter((cue) => Number.isInteger(cue.hotcue) && cue.hotcue >= 0 && cue.hotcue < 8 && Number.isFinite(cue.start_ms))
+    .map((cue) => ({ id: cue.hotcue, position_ms: cue.start_ms, is_valid: true }))
+    .sort((first, second) => first.id - second.id));
 
 watch(isStemReady, (ready) => {
   if (ready) {
@@ -167,6 +180,8 @@ function startOpacitySync(): void {
 
 function opacitySyncLoop(): void {
   syncGridOpacity();
+  refreshCustomSelectionOverlay();
+  enforceLoopBoundary();
   syncRaf = requestAnimationFrame(opacitySyncLoop);
 }
 
@@ -201,7 +216,6 @@ function handleZoomWheel(event: WheelEvent): void {
   if (rect.width <= 0) return;
 
   const ratio = (event.clientX - rect.left) / rect.width;
-  const MIN_VISIBLE_SECONDS = 2;
 
   let newSeconds = event.deltaY < 0
       ? visibleSeconds * 0.8
@@ -218,14 +232,13 @@ function handleZoomWheel(event: WheelEvent): void {
   const newStartTime = Math.max(0, Math.min(timeAtCursor - ratio * actualSeconds, totalSeconds - actualSeconds));
 
   view.setStartTime(newStartTime);
+  refreshCustomSelectionOverlay();
 }
 
 function destroyPeaks(): void {
   initToken += 1;
   stopSelectionDrag();
   stopOpacitySync();
-  loopSelections.forEach((selection) => selection.destroy());
-  loopSelections = [];
   destroyStemPeaks();
   workspaceStore.setActiveLoopRange(null);
   isPlaying.value = false;
@@ -240,14 +253,34 @@ function destroyPeaks(): void {
 }
 
 function wirePlayerEvents(instance: any): void {
-  const syncView = () => syncGridOpacity();
-  instance.on("zoomview.update", syncView);
-  instance.on("zoomview.panned", syncView);
-  instance.on("zoom.update", syncView);
   instance.on("player.playing", () => { isPlaying.value = true; });
   instance.on("player.pause", () => { isPlaying.value = false; });
   instance.on("player.ended", () => { isPlaying.value = false; });
-  instance.on("player.timeupdate", (time: number) => { currentTime.value = time; });
+
+  // Lo dejamos súper limpio, solo actualiza la interfaz
+  instance.on("player.timeupdate", (time: number) => {
+    currentTime.value = time;
+  });
+}
+
+function enforceLoopBoundary(): void {
+  if (!isPlaying.value) return;
+  const instance = activePeaks.value;
+  const loopRange = activeLoopRange.value;
+  if (!instance || !loopRange) return;
+
+  const time = instance.player.getCurrentTime();
+
+  // VENTANA DE ANTICIPACIÓN (Lookahead)
+  // El navegador tarda unos 15-20ms en procesar el salto.
+  // Le ordenamos saltar justo antes de que se trague el siguiente bombo.
+  const LOOKAHEAD = 0.020; // 20 milisegundos
+
+  if (time >= loopRange.end - LOOKAHEAD) {
+    // 0 Overshoot. Aterrizamos EXACTAMENTE en la línea del grid
+    // para que el transitorio del bombo suene limpio y entero.
+    instance.player.seek(loopRange.start);
+  }
 }
 
 function paintBeatGrid(instance: any): void {
@@ -336,33 +369,6 @@ function syncGridOpacity(): void {
   });
 }
 
-function mirrorLoopRange(range: import("../stores/useWorkspaceStore").ActiveLoopRange): void {
-  if (isSyncingLoop) return;
-  isSyncingLoop = true;
-  try {
-    loopSelections.forEach((selection) => selection.setRange(range));
-  } finally {
-    isSyncingLoop = false;
-  }
-}
-
-function commitLoopRange(range: import("../stores/useWorkspaceStore").ActiveLoopRange | null): void {
-  if (range) mirrorLoopRange(range);
-  workspaceStore.setActiveLoopRange(range);
-}
-
-function installLoopSelection(instance: any, container: HTMLElement): void {
-  loopSelections.push(
-      useStudioLoopSelection({
-        instance,
-        waveformElement: container,
-        grid: gridTrack.value, // <--- Volvemos al objeto directo
-        onPreview: mirrorLoopRange,
-        onChange: commitLoopRange,
-      })
-  );
-}
-
 function snapTimeToBeat(timeSeconds: number, bpm: number, anchorMs = 0): number {
   if (!Number.isFinite(timeSeconds) || !Number.isFinite(bpm) || bpm <= 0) return 0;
   const beatLength = 60 / bpm;
@@ -372,27 +378,36 @@ function snapTimeToBeat(timeSeconds: number, bpm: number, anchorMs = 0): number 
   return Math.max(0, anchorSec + (nearestBeat * beatLength));
 }
 
-function getStemTimeline(container: HTMLElement): StemTimeline | null {
-  const master = getMasterPeaks();
-  const view = master?.views?.getView("zoomview");
+// Le quitamos el argumento "container: HTMLElement"
+function getStemTimeline(): StemTimeline | null {
+  const activeInstance = activePeaks.value;
+  const view = activeInstance?.views?.getView("zoomview");
+
+  // Magia: Elegimos automáticamente el contenedor de la onda pura ignorando la barra lateral
+  const container = isMultiTrackMode.value
+      ? stemWaveformElements.value?.[0]
+      : waveformElement.value;
+
   const startTime = view?.getStartTime();
   const visibleSeconds = view ? view.getEndTime() - startTime : 0;
-  const trackDuration = master?.player?.getDuration() || duration.value;
+  const trackDuration = activeInstance?.player?.getDuration() || duration.value;
   const bpmValue = gridTrack.value.bpm;
+
   if (
-    !view
-    || container.getBoundingClientRect().width <= 0
-    || !Number.isFinite(startTime)
-    || !Number.isFinite(visibleSeconds)
-    || visibleSeconds <= 0
-    || !Number.isFinite(trackDuration)
-    || trackDuration <= 0
-    || !Number.isFinite(bpmValue)
-    || bpmValue <= 0
+      !view
+      || !container
+      || container.getBoundingClientRect().width <= 0
+      || !Number.isFinite(startTime)
+      || !Number.isFinite(visibleSeconds)
+      || visibleSeconds <= 0
+      || !Number.isFinite(trackDuration)
+      || trackDuration <= 0
+      || !Number.isFinite(bpmValue)
+      || bpmValue <= 0
   ) return null;
 
   return {
-    container,
+    container, // Ahora este contenedor es 100% preciso
     startTime,
     visibleSeconds,
     duration: trackDuration,
@@ -438,20 +453,33 @@ function setStemLoopRange(startRawTime: number, endRawTime: number, timeline: St
 }
 
 function startDrawSelection(event: MouseEvent): void {
+  if (event.shiftKey) return;
   const target = event.target;
   if (event.button !== 0 || (target instanceof Element && target.closest(".stem-controls"))) return;
 
   const container = event.currentTarget;
   if (!(container instanceof HTMLElement)) return;
-  const timeline = getStemTimeline(container);
+  const timeline = getStemTimeline();
   if (!timeline) return;
 
   event.preventDefault();
+
+  // 1. Calculamos el tiempo crudo donde el usuario ha hecho clic
+  const rawTime = rawTimeAtClientX(event.clientX, timeline);
+
+  // 2. Lo forzamos INMEDIATAMENTE al compás más cercano (Imán)
+  const snappedStart = snapTimeToBeat(rawTime, timeline.bpm, timeline.anchorMs);
+  // 3. Pintamos al instante una selección de 1 beat perfecto
+  activePeaks.value?.player.seek(snappedStart);
+
+  // 4. Guardamos ese punto exacto del grid como origen del arrastre
   selectionDrag = {
     mode: "draw",
     timeline,
-    startRawTime: rawTimeAtClientX(event.clientX, timeline),
+    startRawTime: snappedStart,
+    didCreateLoop: false,
   };
+
   startSelectionDrag();
 }
 
@@ -460,7 +488,7 @@ function startMoveSelection(event: MouseEvent): void {
 
   const container = event.currentTarget;
   if (!(container instanceof HTMLElement)) return;
-  const timeline = getStemTimeline(container.parentElement ?? container);
+  const timeline = getStemTimeline();
   if (!timeline) return;
 
   event.preventDefault();
@@ -488,7 +516,7 @@ function startResizeSelection(event: MouseEvent, mode: "resize-left" | "resize-r
   if (!(handle instanceof HTMLElement)) return;
   const overlay = handle.parentElement;
   if (!(overlay instanceof HTMLElement)) return;
-  const timeline = getStemTimeline(overlay.parentElement ?? overlay);
+  const timeline = getStemTimeline();
   if (!timeline) return;
 
   event.preventDefault();
@@ -510,7 +538,9 @@ function handleSelectionDrag(event: MouseEvent): void {
   const beatLength = beatLengthSeconds(drag.timeline);
 
   if (drag.mode === "draw") {
+    if (Math.abs(currentRawTime - drag.startRawTime) < beatLength) return;
     setStemLoopRange(drag.startRawTime, currentRawTime, drag.timeline);
+    drag.didCreateLoop = true;
     return;
   }
 
@@ -540,7 +570,18 @@ function handleSelectionDrag(event: MouseEvent): void {
 function stopSelectionDrag(): void {
   window.removeEventListener("mousemove", handleSelectionDrag);
   window.removeEventListener("mouseup", stopSelectionDrag);
+  const drag = selectionDrag;
   selectionDrag = null;
+
+  if (drag?.mode !== "draw") return;
+
+  if (drag.didCreateLoop) {
+    const loopRange = activeLoopRange.value;
+    if (loopRange) activePeaks.value?.player.seek(loopRange.start);
+    return;
+  }
+
+  workspaceStore.setActiveLoopRange(null);
 }
 
 async function loadTrack(track: CollectionTrack): Promise<void> {
@@ -583,19 +624,70 @@ async function loadTrack(track: CollectionTrack): Promise<void> {
       peaks.value = instance;
       wirePlayerEvents(instance);
       duration.value = (instance as any).player.getDuration() || duration.value;
+      const view = (instance as any).views?.getView("zoomview");
+      if (view && duration.value > 0) {
+        view.setZoom({ seconds: duration.value });
+        view.setStartTime(0);
+      }
       paintBeatGrid(instance); // Funciona para el reproductor simple
-      installLoopSelection(instance, container);
       startOpacitySync();
       resolve();
     });
   });
 }
 
+function handleLanesMousedown(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+
+  // 1. Si hace clic en Mute/Solo, o en la caja amarilla para moverla/redimensionarla,
+  // dejamos que pase (no bloqueamos nada).
+  if (target.closest(".stem-controls, .custom-selection-overlay, .selection-handle")) {
+    return;
+  }
+
+  // 2. Si tiene Shift pulsado, dejamos que el evento llegue a Peaks.js para hacer Panning.
+  if (event.shiftKey) {
+    return;
+  }
+
+  // 3. Si NO hay Shift, bloqueamos el evento para que Peaks no haga panning...
+  event.stopPropagation();
+
+  // 4. ...y lanzamos nosotros manualmente la selección.
+  startDrawSelection(event);
+}
+
+async function restartLoop(): Promise<void> {
+  const instance = activePeaks.value;
+  const loopRange = activeLoopRange.value;
+  if (!instance || !loopRange) return;
+
+  instance.player.seek(loopRange.start);
+  if (isPlaying.value) return;
+
+  try { await instance.player.play(); } catch (error) { loadError.value = `Playback failed: ${String(error)}`; }
+}
+
 async function togglePlayback(): Promise<void> {
   const instance = activePeaks.value;
   if (!instance) return;
-  if (isPlaying.value) { instance.player.pause(); return; }
+  if (isPlaying.value) {
+    instance.player.pause();
+    return;
+  }
+
+  // Novedad: Si hay un bucle activo, forzamos que el play empiece desde su inicio
   try { await instance.player.play(); } catch (error) { loadError.value = `Playback failed: ${String(error)}`; }
+}
+
+function seekToCue(cue: PlayerCue): void {
+  activePeaks.value?.player.seek(cue.position_ms / 1000);
+}
+
+function triggerCuePad(padNumber: number): void {
+  const cue = gridCues.value.find((item) => item.id === padNumber - 1);
+  if (cue) seekToCue(cue);
 }
 
 function stop(): void {
@@ -608,20 +700,26 @@ function stop(): void {
 
 function zoomIn(): void {
   const view = activePeaks.value?.views.getView("zoomview");
-  if (view) view.setZoom({ seconds: Math.max(1, (view.getEndTime() - view.getStartTime()) * 0.8) });
+  if (view) {
+    view.setZoom({ seconds: Math.max(MIN_VISIBLE_SECONDS, (view.getEndTime() - view.getStartTime()) * 0.8) });
+  }
 }
 
 function zoomOut(): void {
   const view = activePeaks.value?.views.getView("zoomview");
-  if (view) view.setZoom({ seconds: Math.min(Math.max(1, duration.value), (view.getEndTime() - view.getStartTime()) * 1.2) });
+  if (view) {
+    view.setZoom({ seconds: Math.min(duration.value, (view.getEndTime() - view.getStartTime()) * 1.2) });
+  }
 }
 
 usePlayerKeyboard({
   togglePlay: togglePlayback,
+  restartLoop,
   stop,
   zoomIn,
   zoomOut,
-  enablePadShortcuts: false,
+  enablePadShortcuts: true,
+  onPadTrigger: triggerCuePad,
 });
 
 watch([() => props.track, () => props.stemTracks], async ([track, stemTracks]) => {
@@ -636,6 +734,12 @@ watch([() => props.track, () => props.stemTracks], async ([track, stemTracks]) =
       const master = await initializeStemPeaks(stemTracks);
       if (!master || props.track?.location_path !== track.location_path || props.stemTracks !== stemTracks) return;
       duration.value = master.player.getDuration() || duration.value;
+      const masterView = master.views?.getView("zoomview");
+      if (masterView && duration.value > 0) {
+        masterView.setZoom({ seconds: duration.value });
+        masterView.setStartTime(0);
+      }
+      wirePlayerEvents(master);
       paintStemBeatGrids();
       refreshCustomSelectionOverlay();
     } catch (error) {
@@ -667,31 +771,52 @@ onBeforeUnmount(() => {
         <div class="track-identification"><h2 id="stem-editor-heading" class="track-title">{{ title }}</h2><p class="track-artist">{{ artist }}</p></div>
         <dl class="track-details" aria-label="Track details"><div><dt>BPM</dt><dd>{{ bpm }}</dd></div><div><dt>Key</dt><dd>{{ key }}</dd></div></dl>
       </header>
-      <div v-if="isMultiTrackMode" class="stem-lanes" aria-label="Stem tracks" @mousedown="startDrawSelection">
+      <div v-if="isMultiTrackMode" class="stem-lanes" aria-label="Stem tracks" @mousedown.capture="handleLanesMousedown">
         <article v-for="(stem, index) in stemLanes" :key="stem.path" class="stem-lane" :style="{ '--stem-color': stem.color }">
           <div class="stem-controls" :aria-label="`${stem.name} controls`">
             <span class="stem-name">{{ stem.name }}</span>
-            <button type="button" class="stem-control" :class="{ 'is-active': mutedStems[index] }" :aria-pressed="mutedStems[index]" :aria-label="`${mutedStems[index] ? 'Unmute' : 'Mute'} ${stem.name}`" @click="toggleMute(index)">[M]</button>
-            <button type="button" class="stem-control" :class="{ 'is-active': soloedStem === index }" :aria-pressed="soloedStem === index" :aria-label="`${soloedStem === index ? 'Disable solo for' : 'Solo'} ${stem.name}`" @click="toggleSolo(index)">[S]</button>
+            <div class="stem-actions">
+              <button type="button" class="stem-control" :class="{ 'is-active': mutedStems[index] }" :aria-pressed="mutedStems[index]" :aria-label="`${mutedStems[index] ? 'Unmute' : 'Mute'} ${stem.name}`" @click="toggleMute(index)">[M]</button>
+              <button type="button" class="stem-control" :class="{ 'is-active': soloedStem === index }" :aria-pressed="soloedStem === index" :aria-label="`${soloedStem === index ? 'Disable solo for' : 'Solo'} ${stem.name}`" @click="toggleSolo(index)">[S]</button>
+            </div>
           </div>
           <div
               ref="stemWaveform"
               class="stem-waveform"
+              :class="{ 'is-dimmed': mutedStems[index] || (soloedStem !== null && soloedStem !== index) }"
               :aria-label="`${stem.name} waveform`"
               @wheel.prevent="handleZoomWheel"
           />
           <audio ref="stemAudio" class="audio-element" preload="none" />
         </article>
-        <div class="custom-selection-overlay" :style="customSelectionOverlayStyle" @mousedown.stop="startMoveSelection">
+        <div class="overlay-wrapper">
+          <div class="custom-selection-overlay" :style="customSelectionOverlayStyle" @mousedown.stop="startMoveSelection" @wheel.prevent="handleZoomWheel">
+            <div class="selection-handle handle-left" @mousedown.stop="startResizeLeft" />
+            <div class="selection-handle handle-right" @mousedown.stop="startResizeRight" />
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="waveform-shell" :class="{ 'is-loading': isLoading }" @mousedown.capture="handleLanesMousedown">
+        <div ref="waveform" @wheel.prevent="handleZoomWheel" class="waveform" aria-label="Audio waveform. Click or drag to seek." />
+        <div class="custom-selection-overlay" :style="customSelectionOverlayStyle" @mousedown.stop="startMoveSelection" @wheel.prevent="handleZoomWheel">
           <div class="selection-handle handle-left" @mousedown.stop="startResizeLeft" />
           <div class="selection-handle handle-right" @mousedown.stop="startResizeRight" />
         </div>
+        <p v-if="isLoading" class="waveform-status">Loading waveform…</p>
       </div>
-      <div v-else class="waveform-shell" :class="{ 'is-loading': isLoading }"><div ref="waveform" @wheel.prevent="handleZoomWheel" class="waveform" aria-label="Audio waveform. Click or drag to seek." /><p v-if="isLoading" class="waveform-status">Loading waveform…</p></div>
-      <p v-if="loopLabel" class="loop-feedback">{{ loopLabel }}</p>
+
       <p v-if="isMultiTrackMode && isStemLoading" class="stem-loading">Loading stem data...</p>
       <p v-if="loadError" class="waveform-error">{{ loadError }}</p>
-      <div class="transport"><button type="button" class="play-button" :disabled="!activePeaks" :aria-label="playLabel" @click="togglePlayback">{{ playLabel }}</button><output class="time-display" aria-label="Elapsed time and total duration">{{ timeLabel }}</output></div>
+      <div class="transport">
+        <button type="button" class="play-button" :disabled="!activePeaks" :aria-label="playLabel" @click="togglePlayback">{{ playLabel }}</button>
+        <button v-if="activeLoopRange && isPlaying" type="button" class="restart-button" @click="restartLoop">Restart</button>
+        <output class="time-display" aria-label="Elapsed time and total duration">{{ timeLabel }}</output>
+        <div v-if="gridCues.length" class="cue-pads" aria-label="Track Hotcues">
+          <button v-for="cue in gridCues" :key="cue.id" type="button" class="cue-pad" :aria-label="`Seek to Hotcue ${cue.id + 1}`" @click="seekToCue(cue)">{{ cue.id + 1 }}</button>
+        </div>
+        <p v-if="loopLabel" class="loop-feedback">{{ loopLabel }}</p>
+      </div>
       <audio v-if="!isMultiTrackMode" ref="audio" class="audio-element" preload="none" />
     </template>
     <p v-else id="stem-editor-heading" class="empty-state">Load a track from the library</p>
@@ -699,49 +824,38 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.stem-editor { display: flex; min-width: 0; min-height: 0; padding: 1.5rem; flex-direction: column; background: #232326; }
+.stem-editor { --stem-controls-width: 70px; display: flex; min-width: 0; min-height: 0; padding: 1.5rem; flex-direction: column; overflow: hidden; background: #232326; }
 .stem-editor { position: relative; }
 .zone-label { margin: 0; color: #f7d15f; font-size: .6875rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
 .track-header { display: flex; min-width: 0; margin-top: .75rem; align-items: flex-end; justify-content: space-between; gap: 1rem; }.track-identification { min-width: 0; }.track-title { margin: 0; overflow: hidden; color: #f2f2f2; font-size: 1.5rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }.track-artist, .empty-state { margin: .35rem 0 0; color: #8a8a8e; font-size: .875rem; }.empty-state { margin-top: .75rem; }
 .track-details { display: flex; margin: 0; gap: 1rem; font-variant-numeric: tabular-nums; }.track-details div { display: grid; gap: .15rem; }.track-details dt { color: #8a8a8e; font-size: .625rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }.track-details dd { margin: 0; color: #f7d15f; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .8125rem; }
-.waveform-shell { position: relative; min-height: 0; margin-top: 1.25rem; flex: 1; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.waveform-shell.is-loading { opacity: .6; }.waveform { width: 100%; height: 100%; min-height: 150px; }.waveform-status { position: absolute; inset: 0; display: grid; margin: 0; place-items: center; color: #8a8a8e; font-size: .75rem; pointer-events: none; }
-.stem-lanes { position: relative; display: grid; min-height: 0; margin-top: 1.25rem; flex: 1; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 0; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.stem-lane { display: grid; min-height: 0; grid-template-columns: 60px minmax(0, 1fr); overflow: hidden; background: #17171a; }.stem-lane + .stem-lane { border-top: 1px solid #3a3a3e; }.stem-controls { display: grid; min-width: 60px; width: 60px; flex-shrink: 0; align-content: center; gap: .25rem; padding: .375rem; border-right: 1px solid #3a3a3e; background: #202024; }.stem-control { padding: .25rem 0; border: 1px solid #5a5a5e; border-radius: .125rem; background: #2a2a2e; color: #f2f2f2; cursor: pointer; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .625rem; font-weight: 800; }.stem-control:hover { border-color: #f7d15f; color: #f7d15f; }.stem-control.is-active { border-color: var(--stem-color); background: var(--stem-color); color: #17171a; }.stem-control:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }.stem-waveform { min-width: 0; background: linear-gradient(90deg, rgb(237 180 11 / 5%), transparent 35%); }.stem-name { color: var(--stem-color); font-size: .5625rem; font-weight: 700; letter-spacing: .08em; text-align: center; text-transform: uppercase; }.stem-loading { margin: .5rem 0 0; color: #8a8a8e; font-size: .75rem; }
-.custom-selection-overlay { position: absolute; z-index: 5; pointer-events: auto; background-color: rgba(247, 209, 95, 0.25); border-left: 1px solid rgba(247, 209, 95, 0.8); border-right: 1px solid rgba(247, 209, 95, 0.8); cursor: move; }.selection-handle { position: absolute; top: 0; bottom: 0; width: 8px; cursor: ew-resize; background: rgba(247, 209, 95, 0.8); }.handle-left { left: -4px; }.handle-right { right: -4px; }
-.transport { display: flex; margin-top: .75rem; align-items: center; gap: .75rem; }.play-button { min-width: 4.5rem; padding: .45rem .75rem; border: 1px solid #edb40b; border-radius: .1875rem; background: #edb40b; color: #17171a; cursor: pointer; font-size: .75rem; font-weight: 800; text-transform: uppercase; }.play-button:hover:not(:disabled) { background: #f7d15f; }.play-button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }.play-button:disabled { cursor: not-allowed; opacity: .5; }.time-display { color: #f2f2f2; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .75rem; font-variant-numeric: tabular-nums; }.waveform-error { margin: .5rem 0 0; color: #f87171; font-size: .75rem; }.audio-element { display: none; }
-:deep(.peaks-view-container) { overflow: hidden !important; } @media (max-width: 520px) { .track-header { align-items: flex-start; flex-direction: column; } }
-.loop-feedback { position: absolute; right: 1.5rem; bottom: 3.75rem; z-index: 2; margin: 0; padding: .3rem .45rem; border: 1px solid rgb(247 209 95 / 55%); background: rgb(23 23 26 / 88%); color: #f7d15f; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .6875rem; font-variant-numeric: tabular-nums; pointer-events: none; }
-/* 1. Ocultar por completo los tiradores grises flotantes (SVG y HTML) */
-:deep(.peaks-segment-handle),
-:deep(.peaks-segment-handle-marker),
-:deep([class*="peaks-segment-handle"]) {
-  display: none !important;
-  visibility: hidden !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-}
-
-/* 2. Hacer que la franja amarilla ocupe el 100% de la altura de la pista */
-:deep(.peaks-segment),
-:deep([class*="peaks-segment"]) {
-  /* Propiedades para HTML Divs */
-  top: 0 !important;
-  bottom: 0 !important;
-  height: 100% !important;
-  background-color: rgba(247, 209, 95, 0.25) !important;
-  border-left: 1px solid rgba(247, 209, 95, 0.8) !important;
-  border-right: 1px solid rgba(247, 209, 95, 0.8) !important;
-
-  /* Propiedades para SVG (Lo que usa Peaks.js en ZoomView) */
-  y: 0 !important;
-  fill: rgba(247, 209, 95, 0.25) !important;       /* Fondo amarillo traslúcido */
-  stroke: rgba(247, 209, 95, 0.8) !important;     /* Borde amarillo */
-  stroke-width: 1px !important;
-}
-
-.stem-waveform {
+.waveform-shell { position: relative; min-height: 240px; margin-top: 1.25rem; flex: 1; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.waveform-shell.is-loading { opacity: .6; }.waveform { width: 100%; height: 100%; min-height: 150px; }.waveform-status { position: absolute; inset: 0; display: grid; margin: 0; place-items: center; color: #8a8a8e; font-size: .75rem; pointer-events: none; }
+.stem-lanes { position: relative; display: grid; min-width: 0; min-height: 0; margin-top: 1.25rem; flex: 1 1 0; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 0; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.stem-lane { display: grid; min-height: 0; grid-template-columns: var(--stem-controls-width) minmax(0, 1fr); overflow: hidden; background: #17171a; }.stem-lane + .stem-lane { border-top: 1px solid #3a3a3e; }.stem-controls { display: grid; width: var(--stem-controls-width); min-width: var(--stem-controls-width); align-content: center; gap: .125rem; padding: .125rem .375rem; border-right: 1px solid #3a3a3e; background: #202024; }.stem-actions { display: flex; min-width: 0; gap: .1875rem; }.stem-control { min-width: 0; flex: 1; padding: .125rem 0; border: 1px solid #5a5a5e; border-radius: .125rem; background: #2a2a2e; color: #f2f2f2; cursor: pointer; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .625rem; font-weight: 800; }.stem-control:hover { border-color: #f7d15f; color: #f7d15f; }.stem-control.is-active { border-color: var(--stem-color); background: var(--stem-color); color: #17171a; }.stem-control:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }.stem-waveform { min-width: 0; height: 100%; overflow: hidden; background: linear-gradient(90deg, rgb(237 180 11 / 5%), transparent 35%); }.stem-waveform.is-dimmed { pointer-events: none; opacity: .3; transition: opacity .2s ease-in-out; }.stem-name { color: var(--stem-color); font-size: .5625rem; font-weight: 700; letter-spacing: .08em; text-align: center; text-transform: uppercase; }.stem-loading { margin: .5rem 0 0; color: #8a8a8e; font-size: .75rem; }
+.custom-selection-overlay { position: absolute; z-index: 10; pointer-events: auto; background-color: rgba(247, 209, 95, 0.25); border-left: 1px solid rgba(247, 209, 95, 0.8); border-right: 1px solid rgba(247, 209, 95, 0.8); cursor: move; }.selection-handle { position: absolute; top: 0; bottom: 0; width: 10px; cursor: ew-resize; background: transparent; }.handle-left { left: -5px; }.handle-right { right: -5px; }
+.transport { display: flex; flex-wrap: wrap; margin-top: .75rem; align-items: center; gap: .75rem; }.play-button, .restart-button { min-width: 4.5rem; padding: .45rem .75rem; border: 1px solid #edb40b; border-radius: .1875rem; background: #edb40b; color: #17171a; cursor: pointer; font-size: .75rem; font-weight: 800; text-transform: uppercase; }.play-button:hover:not(:disabled), .restart-button:hover { background: #f7d15f; }.play-button:focus-visible, .restart-button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }.play-button:disabled { cursor: not-allowed; opacity: .5; }.time-display { color: #f2f2f2; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .75rem; font-variant-numeric: tabular-nums; }.cue-pads { display: flex; gap: .25rem; }.cue-pad { min-width: 1.75rem; padding: .35rem .5rem; border: 1px solid #aa8208; border-radius: .1875rem; background: #2a2a2e; color: #f7d15f; cursor: pointer; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .75rem; font-weight: 800; }.cue-pad:hover { border-color: #f7d15f; background: #3a3a3e; }.cue-pad:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }.waveform-error { margin: .5rem 0 0; color: #f87171; font-size: .75rem; }.audio-element { display: none; }
+:deep(.peaks-view-container) { height: 100% !important; overflow: hidden !important; } .stem-waveform :deep(canvas) { height: 100% !important; max-height: 100% !important; overflow: hidden !important; } @media (max-width: 520px) { .track-header { align-items: flex-start; flex-direction: column; } }
+.loop-feedback {
+  margin: 0 0 0 auto; /* El 'auto' a la izquierda lo empuja al extremo derecho de la barra */
+  padding: .35rem .5rem;
+  border: 1px solid rgb(247 209 95 / 55%);
+  border-radius: .1875rem; /* Le damos las esquinas redondeadas como los cues */
+  background: rgb(23 23 26 / 88%);
+  color: #f7d15f;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: .6875rem;
+  font-variant-numeric: tabular-nums;
+}.stem-waveform {
   position: relative;
   min-width: 0;
   height: 100%;
+}
+.stem-lanes > .overlay-wrapper {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--stem-controls-width);
+  right: 0;
+  pointer-events: none; /* Vital para no bloquear los clics de la onda */
 }
 
 </style>

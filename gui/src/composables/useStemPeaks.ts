@@ -20,6 +20,7 @@ interface StemPeaksOptions {
 
 const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096];
 const SUPPRESS_EVENT_MS = 750;
+let syncTimeout: ReturnType<typeof setTimeout> | null = null;
 
 /** Owns opaque Peaks instances and all high-frequency synchronization imperatively. */
 export function useStemPeaks(options: StemPeaksOptions) {
@@ -33,7 +34,6 @@ export function useStemPeaks(options: StemPeaksOptions) {
   let syncFrame: number | null = null;
   let resizeFrame: number | null = null;
   let isSyncing = false;
-  const wheelHandlers = new Map<HTMLDivElement, (event: WheelEvent) => void>();
   let resizeObserver: ResizeObserver | null = null;
   const suppressedEvents = new WeakMap<object, Map<string, number>>();
 
@@ -49,18 +49,19 @@ export function useStemPeaks(options: StemPeaksOptions) {
   }
 
   function syncViews(source: any): void {
-    if (isSyncing || syncFrame !== null) return;
-    syncFrame = requestAnimationFrame(() => {
-      syncFrame = null;
+    // Si ya había un repaso programado, lo cancelamos (porque sigues moviendo el ratón)
+    if (syncTimeout !== null) {
+      clearTimeout(syncTimeout);
+    }
+
+    // Aislamos la lógica de sincronización
+    const applySync = () => {
       const sourceView = source?.views.getView("zoomview");
       if (!sourceView || isSyncing) return;
 
       const startTime = sourceView.getStartTime();
       const rawVisibleSeconds = sourceView.getEndTime() - startTime;
-
-      // Guard de seguridad: Evitamos valores infinitesimales durante el resize
-      const MIN_VISIBLE_SECONDS = 2;
-      const visibleSeconds = Math.max(MIN_VISIBLE_SECONDS, rawVisibleSeconds);
+      const visibleSeconds = Math.max(2, rawVisibleSeconds);
 
       isSyncing = true;
       try {
@@ -74,7 +75,20 @@ export function useStemPeaks(options: StemPeaksOptions) {
         isSyncing = false;
       }
       options.onViewportChanged?.();
-    });
+    };
+
+    // 1. Sincronización en tiempo real (a 60fps, ignora eventos si está ocupado)
+    if (!isSyncing && syncFrame === null) {
+      syncFrame = requestAnimationFrame(() => {
+        syncFrame = null;
+        applySync();
+      });
+    }
+
+    // 2. EL PARCHE: Sincronización final garantizada 50ms después de que pares de mover
+    syncTimeout = setTimeout(() => {
+      applySync();
+    }, 50);
   }
 
   function syncPlayback(source: any, command: "play" | "pause" | "seek", time?: number): void {
@@ -118,24 +132,6 @@ export function useStemPeaks(options: StemPeaksOptions) {
     instance.on("player.seeked", (time: number) => {
       if (!isSuppressed(instance, "seeked")) syncPlayback(instance, "seek", time);
     });
-  }
-
-  function handleWheel(instance: any, event: WheelEvent): void {
-    if (isSyncing || event.deltaY === 0) return;
-    event.preventDefault();
-    const view = instance.views.getView("zoomview");
-    if (!view) return;
-
-    const currentSeconds = view.getEndTime() - view.getStartTime();
-
-    // Cambiamos Math.max(1, ...) por Math.max(2, ...)
-    const nextSeconds = Math.max(
-        2,
-        Math.min(instance.player.getDuration(), currentSeconds * (event.deltaY > 0 ? 1.2 : 0.8))
-    );
-
-    view.setZoom({ seconds: nextSeconds });
-    syncViews(instance);
   }
 
   function fitViewsToContainers(): void {
@@ -212,11 +208,8 @@ export function useStemPeaks(options: StemPeaksOptions) {
 
       instances = createdInstances;
       options.onDuration(instances[0].player.getDuration());
-      instances.forEach((instance, index) => {
+      instances.forEach((instance) => {
         bindEvents(instance);
-        const handler = (event: WheelEvent) => handleWheel(instance, event);
-        containers[index].addEventListener("wheel", handler, { passive: false });
-        wheelHandlers.set(containers[index], handler);
       });
       bindResizeObserver(containers);
       applyVolumes();
@@ -250,8 +243,6 @@ export function useStemPeaks(options: StemPeaksOptions) {
     resizeObserver?.disconnect();
     resizeObserver = null;
     isReady.value = false;
-    for (const [container, handler] of wheelHandlers) container.removeEventListener("wheel", handler);
-    wheelHandlers.clear();
     for (const instance of instances) { try { instance.destroy(); } catch (error) { console.warn("[StemPeaks] Peaks destroy failed:", error); } }
     instances = [];
     for (const audio of options.getAudioElements()) { try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch { /* best-effort media cleanup */ } }

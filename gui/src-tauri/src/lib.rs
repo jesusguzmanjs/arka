@@ -164,6 +164,16 @@ fn extract_stems_to_temp(stem_file_path: String) -> Result<Vec<String>, String> 
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
 
+    // NUEVO: Forzar la inyección de las rutas de Homebrew en macOS/Linux
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(current_path) = std::env::var("PATH") {
+            command.env("PATH", format!("{}:/opt/homebrew/bin:/usr/local/bin", current_path));
+        } else {
+            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin");
+        }
+    }
+
     let output = command
         .args(ffmpeg_stem_arguments(&stem_path, &outputs))
         .output()
