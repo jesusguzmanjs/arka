@@ -442,6 +442,78 @@ The following rules were established by Traktor Pro A/B testing. They are mandat
 
 CueGrid MUST NEVER write cue points or beatgrids physically to audio files, avoiding changes to Traktor's `TRAKTOR4` base64/binary blocks. CueGrid injects these values exclusively into `collection.nml`. Users who need them synchronized to physical files must use Traktor's native **Write File Tags** feature.
 
+### 5.6 Remix Set persistence
+
+`--save-remix-set JSON` is a standalone NML mutation. It parses one Remix Set
+payload, resolves the collection NML, and invokes `NmlWriter.write_remix_set`.
+It cannot be combined with track selection, other mutations or queries, or
+audio-analysis options; `--nml`, `--json`, and `--verbose` remain valid.
+
+The read-only Remix Set commands also bypass the analysis selector and audio
+pipeline. `--list-remix-sets` prints the root `<SETS>` element's direct `<SET>`
+titles in document order, or `[]` when `<SETS>` is absent. `--get-remix-set
+TITLE` matches `SET@TITLE` exactly and returns the set title, tempo BPM,
+quantize value/state, four-slot column settings, and pads. It accepts the
+native `QUANT_VAlUE` spelling and falls back to `QUANT_VALUE`. Cell paths are
+normalized using `nml_location_to_path` and cross-referenced against the main
+collection for each resolved track's duration and musical key. `START_MARKER`
+and `END_MARKER` are converted from seconds to milliseconds; an `END_MARKER`
+of `0` is replaced with the matched collection duration when available,
+because Traktor uses it to represent the full source file. A missing title returns
+`{"error":"not_found","message":"..."}` with a nonzero exit code;
+duplicate titles are ambiguous.
+
+`NmlWriter.write_remix_set(payload)` checks each active pad's normalized source
+path against the current collection before changing the NML. A pad whose source
+path already has a collection entry is referenced in place: its source file is
+not copied and its existing collection entry is left untouched, preserving
+Traktor-managed stripe and transient data. A pad whose source path is absent
+from the collection is copied to
+`~/Music/Traktor/Samples/Arka/<sanitized set title>/`; its destination filename
+is deterministic: `<pad id>_<original filename>`.
+The title-derived directory name replaces filesystem-reserved characters,
+slashes, and control characters, and is never empty. A Windows `\\?\` path
+prefix is stripped before source paths are resolved or serialized.
+
+The writer locates or creates a root-level `<SETS>` element and writes one
+native `<SET>` child. A same-title `<SET>` is replaced at its existing document
+index; a new title is appended. `SETS@ENTRIES` always equals the total number
+of direct `<SET>` children. The set has `TITLE`, `QUANT_VAlUE`, and
+`QUANT_STATE` attributes. Its first children, in order, are a virtual `LOCATION`,
+`MODIFICATION_INFO AUTHOR_TYPE="importer"`, `INFO` with an un-padded
+`IMPORT_DATE`, and `TEMPO`. Its timestamped `LOCATION@FILE` follows
+`YYYYyMMmDDd_HHhMMmSSs000000.set`, and its `DIR` and
+`VOLUME` are derived from the collection's directory. The `.set` file is
+never created or touched on disk. The set also has a six-decimal `TEMPO@BPM`.
+The virtual `.set` is never registered in `<COLLECTION>`; Traktor reads it
+from `<SETS>`. The writer appends one root `<COLLECTION><ENTRY>` for every
+active-pad sample whose destination is not already in the collection. Existing
+matching entries are never modified or duplicated. Each new entry has
+`MODIFIED_DATE`, `MODIFIED_TIME`, `LOCK="1"`,
+and an ISO-8601 `LOCK_MODIFICATION_TIME`, plus a
+`MODIFICATION_INFO AUTHOR_TYPE="importer"` child, and an `INFO` child with its
+`IMPORT_DATE`, `FLAGS="28"`, the copied file's physical `FILESIZE`, and—when
+the submitted pad range is positive—integer and six-decimal duration fields.
+`INFO@COMMENT` is `Arka: <set title>` for browser filtering. A valid submitted
+Open Key is serialized as `MUSICAL_KEY@VALUE`; invalid or absent keys are
+omitted. Its `TEMPO` includes `BPM_QUALITY="100.000000"`, followed by an AutoGrid
+`CUE_V2 TYPE="4"` at `0.000000` containing `GRID@BPM`. It updates
+`COLLECTION@ENTRIES` to the total number of direct `ENTRY` children. Every new
+`LOCATION` inherits the first non-empty `COLLECTION//LOCATION@VOLUMEID`, when
+available.
+It has exactly four `SLOT` elements (A through D), with `KEYLOCK`,
+`FXENABLE="1"`, `PUNCHMODE`, and `ACTIVE_CELL_INDEX`: slots containing one or
+more cells use `0`, while empty slots use `-1`. Each active pad produces a
+`CELL` under its slot whose `INDEX` is its zero-based row index and whose audio
+location is written directly as `VOLUME`, `DIR`, and `FILE` attributes on the
+cell.
+`DIR` uses Traktor `/:` separators; Windows uses the drive volume; macOS uses
+the mounted volume for `/Volumes/<volume>/...` and `Macintosh HD` otherwise.
+
+The daily NML backup is created immediately before XML mutation, then the
+complete document is atomically replaced through the existing writer path. An
+exception restores the retained parser tree to its original in-memory state.
+
 ## 6. Pipeline behavior
 
 `run_pipeline` performs one path-selected analysis:

@@ -161,6 +161,35 @@ fn base64_value(value: u8) -> Option<u8> {
     }
 }
 
+/// Converts legacy macOS HFS paths (Volume:Folder:File) from Traktor into POSIX paths (/Folder/File)
+fn normalize_traktor_path(raw_path: &str) -> String {
+    // Si es una ruta de Windows (C:\) o ya es POSIX estándar (/Users/...), la dejamos intacta
+    if raw_path.contains('\\') || raw_path.starts_with('/') {
+        return raw_path.to_string();
+    }
+
+    // Si contiene ':' pero no es de Windows, es una ruta HFS legacy de Mac
+    if raw_path.contains(':') {
+        let mut parts: Vec<&str> = raw_path.split(':').filter(|s| !s.is_empty()).collect();
+
+        if !parts.is_empty() {
+            let volume = parts.remove(0); // Extraemos el nombre del disco (ej. "Macintosh HD")
+            let rest_of_path = parts.join("/");
+
+            // Si el disco es el principal ("Macintosh HD") o el primer directorio es "Users",
+            // mapeamos directamente a la raíz del sistema (/).
+            if volume == "Macintosh HD" || parts.first() == Some(&"Users") {
+                return format!("/{}", rest_of_path);
+            } else {
+                // Si es un pendrive o disco externo (ej. "USB DJ:Stems:"), macOS lo monta en /Volumes/
+                return format!("/Volumes/{}/{}", volume, rest_of_path);
+            }
+        }
+    }
+
+    raw_path.to_string()
+}
+
 fn traktor_md5_transform_byte_array(data: &[u8]) -> [u32; 4] {
     let mut state = INITIAL_STATE;
     let full_length = data.len() / 64 * 64;
@@ -235,7 +264,7 @@ pub fn read_stems_dir_from_settings(nml_path: &Path) -> Option<PathBuf> {
                     if key == b"Name" && decoded == TSI_STEMS_DIR_ENTRY_NAME {
                         is_stems_directory = true;
                     } else if key == b"Value" {
-                        value = Some(decoded.into_owned());
+                        value = Some(normalize_traktor_path(&decoded));
                     }
                 }
                 if is_stems_directory {

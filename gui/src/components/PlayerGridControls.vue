@@ -1,11 +1,14 @@
 <script setup lang="ts">
-defineProps<{
+withDefaults(defineProps<{
   hasTrack: boolean;
   isFlexGrid: boolean;
   isGridEditMode: boolean;
   dynamicLabel: string;
   dynamicStepMs: number;
-}>();
+  showModifiers?: boolean;
+}>(), {
+  showModifiers: true,
+});
 
 const emit = defineEmits<{
   nudge: [deltaMs: number];
@@ -20,7 +23,7 @@ const emit = defineEmits<{
     <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-200 border-zinc-700 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50" :disabled="dynamicStepMs <= 0" title="Moves the grid and all cues backward by the current zoom-based resolution." @click="emit('nudge', -dynamicStepMs)">− {{ dynamicLabel }}</button>
     <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-200 border-zinc-700 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50" :disabled="dynamicStepMs <= 0" title="Moves the grid and all cues forward by the current zoom-based resolution." @click="emit('nudge', dynamicStepMs)">+ {{ dynamicLabel }}</button>
     <button type="button" class="text-xs font-semibold px-2 h-full rounded border bg-zinc-800 text-zinc-200 border-zinc-700 hover:bg-zinc-700" title="Sets the grid anchor at the current playhead position." @click="emit('setToPlayhead')">Set to Playhead</button>
-    <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Halve BPM" title="Halves the track BPM." @click="emit('divideBpm')">/2</button>
-    <button type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Double BPM" title="Doubles the track BPM." @click="emit('multiplyBpm')">x2</button>
+    <button v-if="showModifiers" type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Halve BPM" title="Halves the track BPM." @click="emit('divideBpm')">/2</button>
+    <button v-if="showModifiers" type="button" class="text-xs font-mono px-2 h-full rounded border bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" aria-label="Double BPM" title="Doubles the track BPM." @click="emit('multiplyBpm')">x2</button>
   </div>
 </template>

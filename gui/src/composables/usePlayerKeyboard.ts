@@ -1,20 +1,11 @@
 import { onBeforeUnmount, onMounted } from "vue";
-import type { PlayerCue } from "./usePeaksMarkers";
 
 export interface PlayerKeyboardHandlers {
   togglePlay: () => void | Promise<void>;
-  restartLoop?: () => void | Promise<void>;
-  stop: () => void;
-  /** Defaults to true for the Collection player; Studio needs transport only. */
-  enablePadShortcuts?: boolean;
-  /** Handles a read-only pad shortcut without cue creation, deletion, or preview state. */
+  stop?: () => void;
   onPadTrigger?: (padNumber: number) => void | Promise<void>;
-  getPad?: (padNumber: number) => PlayerCue | null;
-  jump?: (padNumber: number) => void | Promise<void>;
-  previewEnd?: (padNumber: number) => void;
-  addCue?: (padIndex: number) => void | Promise<void>;
-  deleteCue?: (padIndex: number) => void | Promise<void>;
-  skipBeats?: (beats: number) => void;
+  onPadRelease?: (padNumber: number) => void;
+  onSeekBeats?: (beats: number) => void;
   zoomIn?: () => void;
   zoomOut?: () => void;
 }
@@ -37,51 +28,47 @@ export function usePlayerKeyboard(handlers: PlayerKeyboardHandlers): void {
     if (isFocusedOnInput() || event.repeat) return;
     if (event.key === " ") {
       event.preventDefault();
-      if (event.shiftKey && handlers.restartLoop) void handlers.restartLoop();
-      else void handlers.togglePlay();
+      void handlers.togglePlay();
       return;
     }
-    if (event.key === "Enter") { event.preventDefault(); handlers.stop(); return; }
+    if (event.key === "Enter" && handlers.stop) {
+      event.preventDefault();
+      handlers.stop();
+      return;
+    }
     if (event.key === "+" || event.key === "=") { event.preventDefault(); handlers.zoomIn?.(); return; }
     if (event.key === "-" || event.key === "_") { event.preventDefault(); handlers.zoomOut?.(); return; }
     const padNumber = getPadNumber(event);
-    if (handlers.enablePadShortcuts !== false && padNumber !== null) {
+    if (padNumber !== null && handlers.onPadTrigger) {
       event.preventDefault();
-      if (handlers.onPadTrigger) {
-        void handlers.onPadTrigger(padNumber);
-        return;
-      }
-      const cue = handlers.getPad?.(padNumber) ?? null;
-      if (event.shiftKey) {
-        if (cue) void handlers.deleteCue?.(padNumber - 1);
-        return;
-      }
-      if (cue) {
-        previewingPads.add(padNumber);
-        void handlers.jump?.(padNumber);
-      } else {
-        void handlers.addCue?.(padNumber - 1);
-      }
+      previewingPads.add(padNumber);
+      void handlers.onPadTrigger(padNumber);
       return;
     }
     if (event.key === "ArrowRight") {
       event.preventDefault();
-      handlers.skipBeats?.(8);
+      handlers.onSeekBeats?.(4);
       return;
     }
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      handlers.skipBeats?.(-8);
-      return;
+      handlers.onSeekBeats?.(-4);
     }
   };
+
   const onKeyUp = (event: KeyboardEvent) => {
-    if (isFocusedOnInput()) return;
     const padNumber = getPadNumber(event);
-    if (handlers.enablePadShortcuts === false || padNumber === null || !previewingPads.delete(padNumber)) return;
+    if (padNumber === null || !previewingPads.delete(padNumber)) return;
     event.preventDefault();
-    handlers.previewEnd?.(padNumber);
+    handlers.onPadRelease?.(padNumber);
   };
-  onMounted(() => { window.addEventListener("keydown", onKeyDown); window.addEventListener("keyup", onKeyUp); });
-  onBeforeUnmount(() => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); });
+
+  onMounted(() => {
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+  });
+  onBeforeUnmount(() => {
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onKeyUp);
+  });
 }

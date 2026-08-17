@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { getHarmonicMatches, normalizeHarmonicKey } from "../utils/harmonicKeys";
+import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import type { CollectionTrack } from "../types/library";
 
 const props = defineProps<{
@@ -13,6 +14,8 @@ const emit = defineEmits<{
 }>();
 
 const searchQuery = ref("");
+const workspaceStore = useWorkspaceStore();
+const isPadEditMode = computed(() => workspaceStore.editorMode === "pad");
 const compatibleKeys = computed(() => getHarmonicMatches(props.loadedTrack?.key));
 const filteredMiniLibraryTracks = computed(() => {
   const query = searchQuery.value.trim().toLocaleLowerCase();
@@ -40,15 +43,22 @@ function keyClass(track: CollectionTrack): string {
   return "key-muted";
 }
 
+function hasAvailableStems(track: CollectionTrack): boolean {
+  return typeof track.flags === "number" && (track.flags & 0x40) === 0x40;
+}
+
 function selectTrack(track: CollectionTrack): void {
+  if (isPadEditMode.value) return;
   emit("select", track);
 }
 </script>
 
 <template>
-  <section class="mini-library-content" aria-labelledby="mini-library-heading">
-    <p id="mini-library-heading" class="zone-label">Mini Library</p>
-
+  <section
+    class="mini-library-content"
+    :class="{ 'opacity-50 pointer-events-none grayscale': isPadEditMode }"
+    :aria-disabled="isPadEditMode"
+  >
     <div class="search-controls">
       <input
         v-model="searchQuery"
@@ -77,7 +87,21 @@ function selectTrack(track: CollectionTrack): void {
           :aria-label="`Load ${track.artist} – ${track.title} in the Stem Editor`"
           @click="selectTrack(track)"
         >
-          <span class="track-title">{{ track.title || "Untitled track" }}</span>
+          <span class="track-title">
+            <svg
+              v-if="hasAvailableStems(track)"
+              class="stem-indicator"
+              viewBox="0 0 20 20"
+              fill="none"
+              role="img"
+              aria-label="Stems available"
+              title="Stems available"
+            >
+              <path d="M4 5.25h12M4 10h12M4 14.75h12" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
+              <path d="M6 3.5v3.5M10 8.25v3.5M14 13v3.5" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
+            </svg>
+            <span class="track-title-text">{{ track.title || "Untitled track" }}</span>
+          </span>
           <span class="track-artist">{{ track.artist || "Unknown artist" }}</span>
           <span class="track-metadata">
             <span>{{ bpmLabel(track) }}</span>
@@ -117,7 +141,7 @@ function selectTrack(track: CollectionTrack): void {
 
 .search-controls {
   position: relative;
-  margin-top: 0.625rem;
+  margin-top: 0;
   flex-shrink: 0;
 }
 
@@ -213,8 +237,24 @@ function selectTrack(track: CollectionTrack): void {
 }
 
 .track-title {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
   font-size: 0.875rem;
   font-weight: 650;
+}
+
+.track-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stem-indicator {
+  width: 0.875rem;
+  height: 0.875rem;
+  flex: 0 0 auto;
+  color: #8a8a8e;
 }
 
 .track-artist {

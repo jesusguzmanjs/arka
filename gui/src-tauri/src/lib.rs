@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{ProcessesToUpdate, System};
 use tauri::{Emitter, Manager};
 
@@ -19,6 +19,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const TRAKTOR_STATUS_EVENT: &str = "traktor-status";
 const TRAKTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STEM_TEMP_DIRECTORY: &str = "arka_studio";
+const GENERATED_AUDIO_DIRECTORY: [&str; 4] = ["Traktor", "Samples", "Arka", "Working"];
 
 static STEM_EXTRACTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -51,6 +52,103 @@ fn telemetry_cache_path() -> PathBuf {
     std::env::temp_dir()
         .join("arka")
         .join("last_run_telemetry.csv")
+}
+
+fn generated_audio_working_directory(music_directory: &Path) -> PathBuf {
+    GENERATED_AUDIO_DIRECTORY
+        .iter()
+        .fold(music_directory.to_path_buf(), |directory, segment| {
+            directory.join(segment)
+        })
+}
+
+fn float_sample_to_pcm16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn is_within_arka_directory(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "Arka")
+}
+
+fn validated_generated_audio_path(path: String) -> Result<PathBuf, String> {
+    let file_path = PathBuf::from(path);
+    let canonical_path = file_path
+        .canonicalize()
+        .map_err(|_| "Path is not a generated Arka file or does not exist".to_string())?;
+
+    if canonical_path.is_file() && is_within_arka_directory(&canonical_path) {
+        Ok(canonical_path)
+    } else {
+        Err("Path is not a generated Arka file or does not exist".to_string())
+    }
+}
+
+#[tauri::command]
+fn save_generated_audio(
+    app_handle: tauri::AppHandle,
+    audio_data: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<String, String> {
+    if sample_rate == 0 {
+        return Err("Sample rate must be greater than zero".to_string());
+    }
+    if channels == 0 {
+        return Err("Channel count must be greater than zero".to_string());
+    }
+
+    let music_directory = app_handle
+        .path()
+        .audio_dir()
+        .map_err(|_| "Could not find Music directory".to_string())?;
+    let working_directory = generated_audio_working_directory(&music_directory);
+    fs::create_dir_all(&working_directory).map_err(|error| {
+        format!(
+            "Unable to create generated-audio directory {}: {error}",
+            working_directory.display()
+        )
+    })?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock is before Unix epoch: {error}"))?
+        .as_millis();
+    let file_path = working_directory.join(format!("arka_loop_{timestamp}.wav"));
+    let specification = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&file_path, specification)
+        .map_err(|error| format!("Unable to create WAV file {}: {error}", file_path.display()))?;
+
+    for sample in audio_data {
+        writer
+            .write_sample(float_sample_to_pcm16(sample))
+            .map_err(|error| format!("Unable to write WAV sample: {error}"))?;
+    }
+    writer.finalize().map_err(|error| {
+        format!(
+            "Unable to finalize WAV file {}: {error}",
+            file_path.display()
+        )
+    })?;
+
+    Ok(file_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn delete_generated_audio(path: String) -> Result<(), String> {
+    let file_path = validated_generated_audio_path(path)?;
+
+    fs::remove_file(&file_path).map_err(|error| {
+        format!(
+            "Unable to delete generated audio {}: {error}",
+            file_path.display()
+        )
+    })
 }
 
 // Contenedor global seguro para trackear el proceso activo y poder cancelarlo
@@ -115,31 +213,172 @@ fn stem_output_paths(directory: &Path) -> [PathBuf; 4] {
 }
 
 fn ffmpeg_stem_arguments(stem_file_path: &Path, outputs: &[PathBuf; 4]) -> Vec<String> {
+    // Magia negra del AAC: Traktor inyecta 2112 samples de silencio.
+    // FFmpeg elimina 1024 automáticamente al decodificar. Quedan 1088 exactos residuales en el PCM.
+    // Los eliminamos físicamente y reseteamos el reloj interno a 0.
+    let filter = "[0:1]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out1];\
+                  [0:2]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out2];\
+                  [0:3]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out3];\
+                  [0:4]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out4]";
+
     vec![
         "-y".to_string(),
         "-i".to_string(),
         stem_file_path.to_string_lossy().into_owned(),
+        "-filter_complex".to_string(),
+        filter.to_string(),
         "-map".to_string(),
-        "0:1".to_string(),
+        "[out1]".to_string(),
         "-c:a".to_string(),
         "pcm_s16le".to_string(),
         outputs[0].to_string_lossy().into_owned(),
         "-map".to_string(),
-        "0:2".to_string(),
+        "[out2]".to_string(),
         "-c:a".to_string(),
         "pcm_s16le".to_string(),
         outputs[1].to_string_lossy().into_owned(),
         "-map".to_string(),
-        "0:3".to_string(),
+        "[out3]".to_string(),
         "-c:a".to_string(),
         "pcm_s16le".to_string(),
         outputs[2].to_string_lossy().into_owned(),
         "-map".to_string(),
-        "0:4".to_string(),
+        "[out4]".to_string(),
         "-c:a".to_string(),
         "pcm_s16le".to_string(),
         outputs[3].to_string_lossy().into_owned(),
     ]
+}
+
+#[derive(serde::Serialize)]
+struct PadExtractionResult {
+    file_path: String,
+    duration_ms: f64,
+}
+
+fn pad_audio_output_path(pad_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{pad_id}_pad_sample.wav"))
+}
+
+fn ffmpeg_pad_audio_arguments(
+    source_paths: &[PathBuf],
+    start_sec: f64,
+    duration: f64,
+    output_path: &Path,
+) -> Vec<String> {
+    let mut arguments = vec!["-y".to_string()];
+    for source_path in source_paths {
+        arguments.extend([
+            "-ss".to_string(),
+            start_sec.to_string(),
+            "-i".to_string(),
+            source_path.to_string_lossy().into_owned(),
+        ]);
+    }
+    arguments.extend(["-t".to_string(), duration.to_string()]);
+    if source_paths.len() > 1 {
+        arguments.extend([
+            "-filter_complex".to_string(),
+            format!("amix=inputs={}:duration=longest", source_paths.len()),
+        ]);
+    }
+    arguments.extend([
+        "-c:a".to_string(),
+        "pcm_s16le".to_string(),
+        "-ar".to_string(),
+        "44100".to_string(),
+        output_path.to_string_lossy().into_owned(),
+    ]);
+    arguments
+}
+
+fn extract_pad_audio_to_temp(
+    source_paths: Vec<String>,
+    start_sec: f64,
+    end_sec: f64,
+    pad_id: String,
+) -> Result<PadExtractionResult, String> {
+    if !start_sec.is_finite() || !end_sec.is_finite() {
+        return Err("Loop start and end times must be finite numbers".to_string());
+    }
+
+    let duration = end_sec - start_sec;
+    if duration <= 0.0 {
+        return Err("Loop end time must be greater than loop start time".to_string());
+    }
+
+    if source_paths.is_empty() {
+        return Err("At least one source audio path is required".to_string());
+    }
+    let source_paths = source_paths
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    for source_path in &source_paths {
+        if !source_path.is_file() {
+            return Err(format!(
+                "Source audio does not exist or is not a file: {}",
+                source_path.display()
+            ));
+        }
+    }
+
+    let output_path = pad_audio_output_path(&pad_id);
+    let mut command = Command::new("ffmpeg");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(current_path) = std::env::var("PATH") {
+            command.env(
+                "PATH",
+                format!("{}:/opt/homebrew/bin:/usr/local/bin", current_path),
+            );
+        } else {
+            command.env(
+                "PATH",
+                "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
+            );
+        }
+    }
+
+    let output = command
+        .args(ffmpeg_pad_audio_arguments(
+            &source_paths,
+            start_sec,
+            duration,
+            &output_path,
+        ))
+        .output()
+        .map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        eprintln!("FFmpeg Pad extraction: {stderr}");
+    }
+
+    if !output.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("FFmpeg exited with status {}", output.status)
+        } else {
+            format!("FFmpeg Pad extraction failed: {stderr}")
+        });
+    }
+
+    if !output_path.is_file() {
+        return Err("FFmpeg completed without creating the Pad WAV file".to_string());
+    }
+
+    let file_path = output_path
+        .canonicalize()
+        .map_err(|error| format!("Unable to resolve Pad WAV output path: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+
+    Ok(PadExtractionResult {
+        file_path,
+        duration_ms: duration * 1000.0,
+    })
 }
 
 fn extract_stems_to_temp(stem_file_path: String) -> Result<Vec<String>, String> {
@@ -168,9 +407,15 @@ fn extract_stems_to_temp(stem_file_path: String) -> Result<Vec<String>, String> 
     #[cfg(not(target_os = "windows"))]
     {
         if let Ok(current_path) = std::env::var("PATH") {
-            command.env("PATH", format!("{}:/opt/homebrew/bin:/usr/local/bin", current_path));
+            command.env(
+                "PATH",
+                format!("{}:/opt/homebrew/bin:/usr/local/bin", current_path),
+            );
         } else {
-            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin");
+            command.env(
+                "PATH",
+                "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
+            );
         }
     }
 
@@ -419,6 +664,20 @@ async fn extract_stems(stem_file_path: String) -> Result<Vec<String>, String> {
         .map_err(|error| format!("Stem extraction worker failed: {error}"))?
 }
 
+#[tauri::command]
+async fn extract_pad_audio(
+    source_paths: Vec<String>,
+    start_sec: f64,
+    end_sec: f64,
+    pad_id: String,
+) -> Result<PadExtractionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_pad_audio_to_temp(source_paths, start_sec, end_sec, pad_id)
+    })
+    .await
+    .map_err(|error| format!("Pad extraction worker failed: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -436,6 +695,9 @@ pub fn run() {
             start_analysis_stream,
             check_stem_exists,
             extract_stems,
+            extract_pad_audio,
+            save_generated_audio,
+            delete_generated_audio,
         ])
         .setup(|app| {
             start_traktor_monitor(app.handle().clone());
@@ -448,8 +710,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_nml_path, ffmpeg_stem_arguments, is_traktor_process_name, reset_stem_temp_directory,
-        stem_output_paths,
+        append_nml_path, ffmpeg_pad_audio_arguments, ffmpeg_stem_arguments, float_sample_to_pcm16,
+        generated_audio_working_directory, is_traktor_process_name, is_within_arka_directory,
+        pad_audio_output_path, reset_stem_temp_directory, stem_output_paths,
+        validated_generated_audio_path,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -507,27 +771,94 @@ mod tests {
                 "-y",
                 "-i",
                 "C:\\Music\\track.stem.mp4",
+                "-filter_complex",
+                "[0:1]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out1];[0:2]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out2];[0:3]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out3];[0:4]atrim=start_sample=2048,asetpts=PTS-STARTPTS[out4]",
                 "-map",
-                "0:1",
+                "[out1]",
                 "-c:a",
                 "pcm_s16le",
                 "C:\\Temp\\arka_studio\\drums.wav",
                 "-map",
-                "0:2",
+                "[out2]",
                 "-c:a",
                 "pcm_s16le",
                 "C:\\Temp\\arka_studio\\bass.wav",
                 "-map",
-                "0:3",
+                "[out3]",
                 "-c:a",
                 "pcm_s16le",
                 "C:\\Temp\\arka_studio\\other.wav",
                 "-map",
-                "0:4",
+                "[out4]",
                 "-c:a",
                 "pcm_s16le",
                 "C:\\Temp\\arka_studio\\vocals.wav",
             ]
+        );
+    }
+
+    #[test]
+    fn builds_a_fast_exact_ffmpeg_invocation_for_one_pad_loop_source() {
+        let sources = [PathBuf::from("C:\\Music\\track.mp3")];
+        let output = PathBuf::from("C:\\Temp\\A1_pad_sample.wav");
+
+        assert_eq!(
+            ffmpeg_pad_audio_arguments(&sources, 12.5, 3.25, &output),
+            [
+                "-y",
+                "-ss",
+                "12.5",
+                "-i",
+                "C:\\Music\\track.mp3",
+                "-t",
+                "3.25",
+                "-c:a",
+                "pcm_s16le",
+                "-ar",
+                "44100",
+                "C:\\Temp\\A1_pad_sample.wav",
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_a_fast_mixed_ffmpeg_invocation_for_multiple_pad_loop_sources() {
+        let sources = [
+            PathBuf::from("C:\\Temp\\drums.wav"),
+            PathBuf::from("C:\\Temp\\bass.wav"),
+        ];
+        let output = PathBuf::from("C:\\Temp\\A1_pad_sample.wav");
+
+        assert_eq!(
+            ffmpeg_pad_audio_arguments(&sources, 12.5, 3.25, &output),
+            [
+                "-y",
+                "-ss",
+                "12.5",
+                "-i",
+                "C:\\Temp\\drums.wav",
+                "-ss",
+                "12.5",
+                "-i",
+                "C:\\Temp\\bass.wav",
+                "-t",
+                "3.25",
+                "-filter_complex",
+                "amix=inputs=2:duration=longest",
+                "-c:a",
+                "pcm_s16le",
+                "-ar",
+                "44100",
+                "C:\\Temp\\A1_pad_sample.wav",
+            ]
+        );
+    }
+
+    #[test]
+    fn names_pad_audio_output_after_the_pad_id() {
+        assert_eq!(
+            pad_audio_output_path("A1").file_name().unwrap(),
+            "A1_pad_sample.wav"
         );
     }
 
@@ -541,6 +872,50 @@ mod tests {
         reset_stem_temp_directory(&directory).unwrap();
 
         assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn writes_generated_audio_under_the_traktor_arka_working_directory() {
+        assert_eq!(
+            generated_audio_working_directory(PathBuf::from("C:\\Music").as_path()),
+            PathBuf::from("C:\\Music\\Traktor\\Samples\\Arka\\Working")
+        );
+    }
+
+    #[test]
+    fn converts_web_audio_samples_to_clamped_pcm16() {
+        assert_eq!(float_sample_to_pcm16(-2.0), -i16::MAX);
+        assert_eq!(float_sample_to_pcm16(-0.5), -16383);
+        assert_eq!(float_sample_to_pcm16(0.0), 0);
+        assert_eq!(float_sample_to_pcm16(0.5), 16383);
+        assert_eq!(float_sample_to_pcm16(2.0), i16::MAX);
+    }
+
+    #[test]
+    fn only_recognizes_paths_inside_an_arka_directory_for_deletion() {
+        assert!(is_within_arka_directory(
+            PathBuf::from("C:\\Music\\Traktor\\Samples\\Arka\\Working\\loop.wav").as_path()
+        ));
+        assert!(!is_within_arka_directory(
+            PathBuf::from("C:\\Music\\Arka-loops\\loop.wav").as_path()
+        ));
+    }
+
+    #[test]
+    fn rejects_a_path_that_escapes_the_arka_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("arka-delete-boundary-test-{}", std::process::id()));
+        let arka_directory = directory.join("Arka");
+        fs::create_dir_all(&arka_directory).unwrap();
+        let outside_file = directory.join("outside.wav");
+        fs::write(&outside_file, []).unwrap();
+
+        let escaped_path = arka_directory.join("..").join("outside.wav");
+        assert!(
+            validated_generated_audio_path(escaped_path.to_string_lossy().into_owned()).is_err()
+        );
+
         fs::remove_dir_all(directory).unwrap();
     }
 }

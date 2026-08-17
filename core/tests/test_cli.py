@@ -465,6 +465,105 @@ class TestMainArgumentPassthrough:
 # --------------------------------------------------------------------------
 
 
+class TestRemixSetQueries:
+    def test_list_and_get_bypass_analysis_and_emit_json(self, tmp_path, monkeypatch, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text(
+            """<NML><SETS><SET TITLE="Live Set" QUANT_VALUE="4" QUANT_STATE="1">
+<TEMPO BPM="120" /><SLOT KEYLOCK="0" PUNCHMODE="1" FXENABLE="1" />
+</SET></SETS></NML>""",
+            encoding="utf-8",
+        )
+
+        def fail_analysis(**_kwargs):
+            raise AssertionError("Remix Set query must not start audio analysis")
+
+        monkeypatch.setattr(cli, "run_pipeline", fail_analysis)
+        monkeypatch.setattr(cli, "run_batch_pipeline", fail_analysis)
+
+        with pytest.raises(SystemExit) as list_exit:
+            cli.main(["--nml", str(nml_path), "--list-remix-sets"])
+        assert list_exit.value.code == 0
+        assert json.loads(capsys.readouterr().out) == ["Live Set"]
+
+        with pytest.raises(SystemExit) as get_exit:
+            cli.main(["--nml", str(nml_path), "--get-remix-set", "Live Set"])
+        assert get_exit.value.code == 0
+        assert json.loads(capsys.readouterr().out) == {
+            "title": "Live Set",
+            "bpm": 120.0,
+            "quantize_value": 4,
+            "quantize_state": 1,
+            "columns": [{"keylock": 0, "punchmode": 1, "fxenable": 1}],
+            "pads": [],
+        }
+
+    def test_get_reports_not_found_as_json_and_exits_one(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML><SETS /></NML>", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["--nml", str(nml_path), "--get-remix-set", "Missing"])
+
+        assert exc_info.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"] == "not_found"
+        assert "Missing" in payload["message"]
+
+    def test_list_and_get_are_mutually_exclusive(self):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.build_parser().parse_args(
+                ["--list-remix-sets", "--get-remix-set", "Live Set"]
+            )
+
+        assert exc_info.value.code == 2
+
+
+class TestSaveRemixSet:
+    def test_routes_json_payload_to_writer(self, tmp_path, monkeypatch, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+        captured: dict[str, object] = {}
+
+        def fake_write_remix_set(self, payload):
+            captured["payload"] = payload
+
+        monkeypatch.setattr(cli.NmlWriter, "write_remix_set", fake_write_remix_set)
+        payload = '{"title":"Set","pads":[]}'
+
+        assert cli.main(["--nml", str(nml_path), "--save-remix-set", payload]) == 0
+        assert captured["payload"] == json.loads(payload)
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": True,
+            "message": "Remix Set saved successfully!",
+        }
+
+    def test_rejects_incompatible_operation(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+
+        assert cli.main(
+            [
+                "--nml",
+                str(nml_path),
+                "--save-remix-set",
+                "{}",
+                "--batch-save",
+                "{}",
+            ]
+        ) == 1
+        assert "cannot be combined" in capsys.readouterr().err
+
+    def test_rejects_audio_analysis_selector(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML/>", encoding="utf-8")
+
+        assert cli.main(
+            ["--nml", str(nml_path), "--playlist", "Warmup", "--save-remix-set", "{}"]
+        ) == 1
+        assert "cannot be combined" in capsys.readouterr().err
+
+
 class TestBatchSave:
     def test_routes_payload_and_emits_ndjson(self, tmp_path, monkeypatch, capsys):
         captured: dict[str, object] = {}
@@ -914,6 +1013,15 @@ class TestBuildConfigFromArgs:
 
 
 class TestGetLibrary:
+    def test_reports_missing_collection_as_structured_not_found_error(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli, "_resolve_nml_path", lambda _explicit_nml: None)
+
+        assert cli.main(["--get-library"]) == 1
+        assert json.loads(capsys.readouterr().out.strip()) == {
+            "error": "not_found",
+            "message": "No collection.nml found.",
+        }
+
     def test_prints_compact_relational_json_creates_backup_and_exits_zero(self, tmp_path, capsys):
         nml_path = tmp_path / "collection.nml"
         shutil.copy2(SAMPLE_COLLECTION, nml_path)
@@ -944,5 +1052,14 @@ class TestGetLibrary:
 
         assert cli.main(["--nml", str(nml_path), "--get-library"]) == 1
         payload = json.loads(capsys.readouterr().out.strip())
-        assert payload["error"] == "duplicate_location"
+        assert payload["error"] == "parse_error"
         assert "same.flac" in payload["message"]
+
+    def test_reports_malformed_nml_as_structured_parse_error(self, tmp_path, capsys):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML><COLLECTION>", encoding="utf-8")
+
+        assert cli.main(["--nml", str(nml_path), "--get-library"]) == 1
+        payload = json.loads(capsys.readouterr().out.strip())
+        assert payload["error"] == "parse_error"
+        assert payload["message"]

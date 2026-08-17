@@ -12,11 +12,13 @@ import pytest
 from cuegrid.nml.constants import CueType
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
+    AmbiguousRemixSetError,
     AmbiguousTrackError,
     BatchTrackRef,
     DuplicateLocationError,
     NmlParser,
     PlaylistNotFoundError,
+    RemixSetNotFoundError,
     TrackNotFoundError,
     nml_location_to_path,
     normalize_to_open_key,
@@ -55,6 +57,94 @@ class TestNmlLocationToPath:
             file_="track.mp3",
         )
         assert result == "/volumes/external drive/music/track.mp3"
+
+
+class TestRemixSetParsing:
+    def test_lists_and_extracts_native_remix_set(self, tmp_path):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text(
+            """<NML><SETS ENTRIES="1">
+<SET TITLE="Live Set" QUANT_VAlUE="8" QUANT_STATE="1">
+<TEMPO BPM="128.5" />
+<SLOT KEYLOCK="1" PUNCHMODE="0" FXENABLE="1">
+  <CELL INDEX="0" CELLNAME="Kick" COLOR="7" SYNC="1" REVERSE="0" MODE="3" TYPE="2" TRANSPOSE="-2.5" GAIN="0.75" START_MARKER="12.5" END_MARKER="99.25" BPM="126.5" VOLUME="C:" DIR="/:Samples/:" FILE="kick.wav" />
+</SLOT>
+<SLOT KEYLOCK="0" PUNCHMODE="1" FXENABLE="0" />
+</SET>
+</SETS></NML>""",
+            encoding="utf-8",
+        )
+
+        parser = NmlParser(nml_path)
+
+        assert parser.list_remix_sets() == ["Live Set"]
+        assert parser.get_remix_set("Live Set") == {
+            "title": "Live Set",
+            "bpm": 128.5,
+            "quantize_value": 8,
+            "quantize_state": 1,
+            "columns": [
+                {"keylock": 1, "punchmode": 0, "fxenable": 1},
+                {"keylock": 0, "punchmode": 1, "fxenable": 0},
+            ],
+            "pads": [
+                {
+                    "id": "A1",
+                    "name": "Kick",
+                    "path": "c:/samples/kick.wav",
+                    "color_id": 7,
+                    "sync": 1,
+                    "reverse": 0,
+                    "mode": 3,
+                    "type": 2,
+                    "transpose": -2.5,
+                    "gain": 0.75,
+                    "start_ms": 12500.0,
+                    "end_ms": 99250.0,
+                    "duration_ms": 0.0,
+                    "bpm": 126.5,
+                    "key": "",
+                }
+            ],
+        }
+
+    def test_uses_collection_duration_and_key_for_full_file_pad(self, tmp_path):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text(
+            """<NML><COLLECTION ENTRIES="1">
+<ENTRY><LOCATION VOLUME="C:" DIR="/:Samples/:" FILE="kick.wav" />
+<INFO PLAYTIME_FLOAT="123.456" /><MUSICAL_KEY VALUE="12" /></ENTRY>
+</COLLECTION><SETS ENTRIES="1"><SET TITLE="Live Set"><TEMPO BPM="128" />
+<SLOT KEYLOCK="1" PUNCHMODE="0" FXENABLE="1">
+  <CELL INDEX="0" START_MARKER="0" END_MARKER="0" VOLUME="C:" DIR="/:Samples/:" FILE="kick.wav" />
+</SLOT></SET></SETS></NML>""",
+            encoding="utf-8",
+        )
+
+        pad = NmlParser(nml_path).get_remix_set("Live Set")["pads"][0]
+
+        assert pad["duration_ms"] == 123_456.0
+        assert pad["end_ms"] == 123_456.0
+        assert pad["key"] == "1m"
+
+    def test_returns_empty_list_without_sets(self, tmp_path):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text("<NML />", encoding="utf-8")
+
+        assert NmlParser(nml_path).list_remix_sets() == []
+
+    def test_raises_for_missing_or_duplicate_set_title(self, tmp_path):
+        nml_path = tmp_path / "collection.nml"
+        nml_path.write_text(
+            """<NML><SETS><SET TITLE="Duplicate" /><SET TITLE="Duplicate" /></SETS></NML>""",
+            encoding="utf-8",
+        )
+        parser = NmlParser(nml_path)
+
+        with pytest.raises(RemixSetNotFoundError):
+            parser.get_remix_set("Missing")
+        with pytest.raises(AmbiguousRemixSetError):
+            parser.get_remix_set("Duplicate")
 
 
 class TestFindEntry:

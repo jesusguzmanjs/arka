@@ -14,6 +14,8 @@ import { useRunState } from "./composables/useRunState";
 import { useSaveStore } from "./stores/useSaveStore";
 import { useLibraryState } from "./composables/useLibraryState";
 import { useAppToast } from "./composables/useAppToast";
+import { useConfigState } from "./composables/useConfigState";
+import { syncActiveRemixSet } from "./composables/useRemixAudio";
 import { type WorkspaceTab, useWorkspaceStore } from "./stores/useWorkspaceStore";
 
 const workspaceStore = useWorkspaceStore();
@@ -28,6 +30,7 @@ const { isTraktorRunning } = useTraktorStatus();
 const { isSystemBusy } = useRunState();
 const { resolveUnsavedChanges } = useUnsavedChangesGuard();
 const { loadLibrary } = useLibraryState();
+const { nmlPathOverride } = useConfigState();
 const { message: toastMessage, kind: toastKind, showAppToast } = useAppToast();
 let unlistenCloseRequested: UnlistenFn | undefined;
 let isForceClosing = false;
@@ -50,6 +53,7 @@ watch(isTraktorRunning, async (isRunning, wasRunning) => {
     if (reloadToken !== traktorCloseReloadToken) return;
     if (!reloaded) throw new Error("The collection could not be read.");
     showAppToast("Traktor closed. Collection synced in background.");
+    await syncActiveRemixSet(nmlPathOverride.value);
   } catch (error) {
     if (reloadToken !== traktorCloseReloadToken) return;
     showAppToast(

@@ -16,17 +16,22 @@ tree exposed by ``nml.parser.NmlParser``.
 from __future__ import annotations
 
 import math
+import platform
 import shutil
 import time
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, datetime
 import copy
 import re
 import uuid
 from pathlib import Path
 
 from cuegrid.nml.models import CuePoint
-from cuegrid.nml.parser import NmlParser
+from cuegrid.nml.parser import (
+    NmlParser,
+    TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY,
+    TrackNotFoundError,
+)
 
 # Matches Traktor's own declaration exactly (spec section 3.1's example),
 # rather than Python's default single-quoted, standalone-less declaration.
@@ -34,6 +39,13 @@ _XML_DECLARATION = b'<?xml version="1.0" encoding="UTF-8" standalone="no" ?>\n'
 _MIN_BPM = 50.0
 _MAX_BPM = 200.0
 _PLAYLIST_UUID_RE = re.compile(r"^[0-9a-f]{32}$")
+_REMIX_PAD_ID_RE = re.compile(r"^([A-D])(\d+)$")
+_UNSAFE_REMIX_DIRECTORY_CHARS_RE = re.compile(r'[<>:"/\\\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_DIRECTORY_NAMES = {
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9",
+}
 
 
 def generate_playlist_uuid() -> str:
@@ -93,6 +105,276 @@ class NmlWriter:
 
     def __init__(self, parser: NmlParser) -> None:
         self._parser = parser
+
+    @staticmethod
+    def _path_to_nml_location(filepath: str) -> tuple[str, str, str]:
+        """Convert an absolute OS path to Traktor's VOLUME, DIR, FILE syntax."""
+        normalized_filepath = filepath[4:] if filepath.startswith("\\\\?\\") else filepath
+        p = Path(normalized_filepath).expanduser().resolve()
+        file_ = p.name
+
+        if platform.system() == "Windows":
+            volume = p.drive
+            dir_parts = p.parts[1:-1]
+        else:
+            if len(p.parts) > 2 and p.parts[1] == "Volumes":
+                volume = p.parts[2]
+                dir_parts = p.parts[3:-1]
+            else:
+                volume = "Macintosh HD"
+                dir_parts = p.parts[1:-1]
+
+        dir_str = "/:" + "/:".join(dir_parts) + "/:" if dir_parts else "/:"
+        return volume, dir_str, file_
+
+    def write_remix_set(self, payload: dict) -> None:
+        """Copy active pad audio and append a native root-level Remix ``SET``."""
+        if not isinstance(payload, dict):
+            raise ValueError("Remix Set payload must be a JSON object")
+
+        title = payload.get("title", "New Remix Set")
+        if not isinstance(title, str):
+            raise ValueError("Remix Set title must be a string")
+        title = title.strip() or "New Remix Set"
+        columns = payload.get("columns", [])
+        pads = payload.get("pads", [])
+        if not isinstance(columns, list) or not all(isinstance(column, dict) for column in columns):
+            raise ValueError("Remix Set columns must be an array of objects")
+        if not isinstance(pads, list) or not all(isinstance(pad, dict) for pad in pads):
+            raise ValueError("Remix Set pads must be an array of objects")
+
+        active_pads = self._copy_remix_pad_audio(title, pads)
+        snapshot = copy.deepcopy(self._parser.tree)
+        try:
+            root = self._parser.tree.getroot()
+            collection_el = root.find("COLLECTION")
+            if collection_el is None:
+                raise ValueError("No COLLECTION node found in NML")
+
+            # The backup intentionally happens immediately before the first
+            # NML mutation. Failed source-file copies never touch the NML.
+            self._backup_if_needed()
+
+            default_vol_id = next(
+                (
+                    location.get("VOLUMEID")
+                    for location in collection_el.findall(".//LOCATION")
+                    if location.get("VOLUMEID")
+                ),
+                "",
+            )
+            sets_el = root.find("SETS")
+            if sets_el is None:
+                sets_el = ET.SubElement(root, "SETS", ENTRIES="0")
+            set_el = ET.Element("SET")
+            set_el.set("TITLE", title)
+            set_el.set("QUANT_VAlUE", str(payload.get("quantize_value", 4)))
+            set_el.set("QUANT_STATE", str(payload.get("quantize_state", 1)))
+
+            now = datetime.now()
+            import_date = f"{now.year}/{now.month}/{now.day}"
+            virtual_set_filename = f"{now.strftime('%Yy%mm%dd_%Hh%Mm%Ss')}000000.set"
+            virtual_set_path = Path(self._parser.nml_path).parent / virtual_set_filename
+            set_volume, set_directory, _ = self._path_to_nml_location(str(virtual_set_path))
+            location_el = ET.SubElement(set_el, "LOCATION")
+            location_el.set("DIR", set_directory)
+            location_el.set("FILE", virtual_set_filename)
+            location_el.set("VOLUME", set_volume)
+            if default_vol_id:
+                location_el.set("VOLUMEID", default_vol_id)
+
+            mod_info_el = ET.SubElement(set_el, "MODIFICATION_INFO")
+            mod_info_el.set("AUTHOR_TYPE", "importer")
+
+            info_el = ET.SubElement(set_el, "INFO")
+            info_el.set("IMPORT_DATE", import_date)
+
+            tempo_el = ET.SubElement(set_el, "TEMPO")
+            tempo_el.set("BPM", f"{payload.get('bpm', 120.0):.6f}")
+            for col_idx in range(4):
+                slot_el = ET.SubElement(set_el, "SLOT")
+                col_data = (
+                    columns[col_idx]
+                    if col_idx < len(columns)
+                    else {"keylock": 1, "punchmode": 0}
+                )
+                slot_el.set("KEYLOCK", str(col_data.get("keylock", 1)))
+                slot_el.set("PUNCHMODE", str(col_data.get("punchmode", 0)))
+                slot_el.set("FXENABLE", "1")
+
+                col_letter = chr(65 + col_idx)
+                column_pads = active_pads.get(col_letter, [])
+                slot_el.set("ACTIVE_CELL_INDEX", "0" if column_pads else "-1")
+                for row_index, pad_data, destination in column_pads:
+                    cell_el = ET.SubElement(slot_el, "CELL")
+                    cell_el.set("INDEX", str(row_index))
+                    cell_el.set("CELLNAME", str(pad_data.get("name", pad_data["id"])))
+                    cell_el.set("COLOR", str(pad_data.get("color_id", 1)))
+                    cell_el.set("SYNC", str(pad_data.get("sync", 1)))
+                    cell_el.set("REVERSE", str(pad_data.get("reverse", 0)))
+                    cell_el.set("MODE", str(pad_data.get("mode", 0)))
+                    cell_el.set("TYPE", str(pad_data.get("type", 1)))
+                    cell_el.set("SPEED", "1.000000")
+                    cell_el.set("TRANSPOSE", f"{pad_data.get('transpose', 0):.6f}")
+                    cell_el.set("OFFSET", "0.000000")
+                    cell_el.set("NUDGE", "0.000000")
+                    cell_el.set("GAIN", f"{pad_data.get('gain', 0.5):.6f}")
+                    cell_el.set("START_MARKER", f"{pad_data.get('start_ms', 0.0):.6f}")
+                    cell_el.set("END_MARKER", f"{pad_data.get('end_ms', 0.0):.6f}")
+                    cell_el.set("BPM", f"{pad_data.get('bpm', 120.0):.6f}")
+
+                    sample_volume, sample_directory, file_ = self._path_to_nml_location(str(destination))
+                    cell_el.set("DIR", sample_directory)
+                    cell_el.set("FILE", file_)
+                    cell_el.set("VOLUME", sample_volume)
+
+            seconds_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+            open_key_to_traktor = {
+                open_key.lower(): traktor_key
+                for traktor_key, open_key in TRAKTOR_MUSICAL_KEY_TO_OPEN_KEY.items()
+            }
+            for column_pads in active_pads.values():
+                for _row_index, pad_data, destination in column_pads:
+                    try:
+                        self._parser._find_matching_elements(destination, None, None)
+                    except TrackNotFoundError:
+                        pass
+                    else:
+                        continue
+
+                    sample_entry = ET.SubElement(collection_el, "ENTRY")
+                    sample_entry.set("MODIFIED_DATE", import_date)
+                    sample_entry.set("MODIFIED_TIME", str(seconds_since_midnight))
+                    sample_entry.set("LOCK", "1")
+                    sample_entry.set(
+                        "LOCK_MODIFICATION_TIME", now.strftime("%Y-%m-%dT%H:%M:%S")
+                    )
+                    sample_entry.set("TITLE", str(pad_data.get("name", pad_data.get("id", ""))))
+                    sample_location = ET.SubElement(sample_entry, "LOCATION")
+                    sample_volume, sample_directory, sample_file = self._path_to_nml_location(
+                        str(destination)
+                    )
+                    sample_location.set("DIR", sample_directory)
+                    sample_location.set("FILE", sample_file)
+                    sample_location.set("VOLUME", sample_volume)
+                    if default_vol_id:
+                        sample_location.set("VOLUMEID", default_vol_id)
+                    modification_info = ET.SubElement(sample_entry, "MODIFICATION_INFO")
+                    modification_info.set("AUTHOR_TYPE", "importer")
+                    sample_info = ET.SubElement(sample_entry, "INFO")
+                    sample_info.set("IMPORT_DATE", import_date)
+                    sample_info.set("FLAGS", "28")
+                    sample_info.set("COMMENT", f"Arka: {title}")
+                    duration_sec = pad_data.get("duration_ms", 0.0) / 1000.0
+                    if duration_sec > 0:
+                        sample_info.set("PLAYTIME", str(int(duration_sec)))
+                        sample_info.set("PLAYTIME_FLOAT", f"{duration_sec:.6f}")
+                    sample_info.set("FILESIZE", str(destination.stat().st_size))
+                    bpm_str = f"{pad_data.get('bpm', 120.0):.6f}"
+                    sample_tempo = ET.SubElement(sample_entry, "TEMPO")
+                    sample_tempo.set("BPM", bpm_str)
+                    sample_tempo.set("BPM_QUALITY", "100.000000")
+                    pad_key = str(pad_data.get("key", "")).strip().lower()
+                    if pad_key in open_key_to_traktor:
+                        musical_key = ET.SubElement(sample_entry, "MUSICAL_KEY")
+                        musical_key.set("VALUE", str(open_key_to_traktor[pad_key]))
+                    sample_grid_cue = ET.SubElement(sample_entry, "CUE_V2")
+                    sample_grid_cue.set("NAME", "AutoGrid")
+                    sample_grid_cue.set("DISPL_ORDER", "0")
+                    sample_grid_cue.set("TYPE", "4")
+                    sample_grid_cue.set("START", "0.000000")
+                    sample_grid_cue.set("LEN", "0.000000")
+                    sample_grid_cue.set("REPEATS", "-1")
+                    sample_grid_cue.set("HOTCUE", "-1")
+                    sample_grid = ET.SubElement(sample_grid_cue, "GRID")
+                    sample_grid.set("BPM", bpm_str)
+
+            existing_set = next(
+                (set_node for set_node in sets_el.findall("SET") if set_node.get("TITLE") == title),
+                None,
+            )
+            if existing_set is None:
+                sets_el.append(set_el)
+            else:
+                insertion_index = list(sets_el).index(existing_set)
+                sets_el.remove(existing_set)
+                sets_el.insert(insertion_index, set_el)
+            sets_el.set("ENTRIES", str(len(sets_el.findall("SET"))))
+            collection_el.set("ENTRIES", str(len(collection_el.findall("ENTRY"))))
+
+            self._write_atomic()
+        except Exception:
+            self._parser.restore_tree(snapshot)
+            raise
+
+    @staticmethod
+    def _safe_remix_set_directory_name(title: str) -> str:
+        """Return a portable, non-empty directory name derived from a set title."""
+        sanitized = _UNSAFE_REMIX_DIRECTORY_CHARS_RE.sub("_", title).strip(". ")
+        if not sanitized:
+            return "New Remix Set"
+        return f"_{sanitized}" if sanitized.upper() in _WINDOWS_RESERVED_DIRECTORY_NAMES else sanitized
+
+    def _copy_remix_pad_audio(
+        self, title: str, pads: list[dict]
+    ) -> dict[str, list[tuple[int, dict, Path]]]:
+        """Copy active pad audio into its durable per-Set Traktor directory."""
+        target_directory = (
+            Path.home()
+            / "Music"
+            / "Traktor"
+            / "Samples"
+            / "Arka"
+            / self._safe_remix_set_directory_name(title)
+        )
+        active_pads: dict[str, list[tuple[int, dict, Path]]] = {
+            column: [] for column in "ABCD"
+        }
+        seen_pad_ids: set[str] = set()
+        seen_cell_indices: set[tuple[str, int]] = set()
+
+        for pad_data in pads:
+            path = pad_data.get("path")
+            if not path:
+                continue
+            pad_id = pad_data.get("id")
+            if not isinstance(pad_id, str):
+                raise ValueError("active Remix Set pad requires a string id")
+            pad_match = _REMIX_PAD_ID_RE.fullmatch(pad_id)
+            if pad_match is None:
+                raise ValueError(f"invalid Remix Set pad id: {pad_id}")
+            if pad_id in seen_pad_ids:
+                raise ValueError(f"duplicate Remix Set pad id: {pad_id}")
+            column, row = pad_match.groups()
+            row_index = int(row) - 1
+            if row_index < 0:
+                raise ValueError(f"Remix Set pad id must start at row 1: {pad_id}")
+            if (column, row_index) in seen_cell_indices:
+                raise ValueError(f"duplicate Remix Set cell index: {pad_id}")
+            if not isinstance(path, str):
+                raise ValueError(f"Remix Set pad {pad_id} path must be a string")
+
+            normalized_path = path[4:] if path.startswith("\\\\?\\") else path
+            source = Path(normalized_path).expanduser().resolve()
+            try:
+                self._parser._find_matching_elements(normalized_path, None, None)
+            except TrackNotFoundError:
+                if not source.is_file():
+                    raise FileNotFoundError(f"Remix Set pad source does not exist: {source}")
+                target_directory.mkdir(parents=True, exist_ok=True)
+                destination = target_directory / f"{pad_id}_{source.name}"
+                if source != destination.resolve():
+                    shutil.copy2(source, destination)
+            else:
+                destination = source
+
+            active_pads[column].append((row_index, pad_data, destination))
+            seen_pad_ids.add(pad_id)
+            seen_cell_indices.add((column, row_index))
+
+        for column_pads in active_pads.values():
+            column_pads.sort(key=lambda item: item[0])
+        return active_pads
 
     def write_cues(
         self,

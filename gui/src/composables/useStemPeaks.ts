@@ -1,6 +1,8 @@
 import { shallowRef } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import Peaks from "peaks.js";
+import * as Tone from "tone";
+import { activeAudioEngine } from "./useGlobalAudio";
 
 export const STEM_LANES = [
   { name: "Drums", color: "#FF5722" },
@@ -11,58 +13,124 @@ export const STEM_LANES = [
 
 interface StemPeaksOptions {
   getWaveformContainers: () => HTMLDivElement[];
-  getAudioElements: () => HTMLAudioElement[];
-  createPointMarker?: (markerOptions: any, laneIndex: number) => any; // <--- Suministra el generador de marcadores
-  onPlayingChange: (isPlaying: boolean) => void;
+  createPointMarker?: (markerOptions: any, laneIndex: number) => any;
   onDuration: (duration: number) => void;
+  onMixStateChanged?: (muted: readonly boolean[], soloed: number | null) => void;
   onViewportChanged?: () => void;
 }
 
-const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096];
-const SUPPRESS_EVENT_MS = 750;
+const ZOOM_LEVELS = [64, 256, 512, 1024, 2048, 4096, 8192, 16384];
 let syncTimeout: ReturnType<typeof setTimeout> | null = null;
+let savedTransportTime = 0;
 
-/** Owns opaque Peaks instances and all high-frequency synchronization imperatively. */
+/** Owns opaque Peaks instances and Tone's shared, sample-accurate Stem transport. */
 export function useStemPeaks(options: StemPeaksOptions) {
   const isLoading = shallowRef(false);
   const isReady = shallowRef(false);
   const muted = shallowRef<boolean[]>(STEM_LANES.map(() => false));
   const soloed = shallowRef<number | null>(null);
   let instances: any[] = [];
-  let audioContext: AudioContext | null = null;
+  let tonePlayers: Tone.Player[] = [];
   let initToken = 0;
   let syncFrame: number | null = null;
   let resizeFrame: number | null = null;
   let isSyncing = false;
   let resizeObserver: ResizeObserver | null = null;
-  const suppressedEvents = new WeakMap<object, Map<string, number>>();
+  let isPlaying = false;
+  let animationFrame: number | null = null;
+  let activePlayerAdapters = 0;
+  const eventEmitters = new Set<any>();
+  let mutedByAudioMutex = false;
+  let stoppedByAudioMutex = false;
 
-  function suppress(instance: any, event: string): void {
-    const events = suppressedEvents.get(instance) ?? new Map<string, number>();
-    events.set(event, performance.now() + SUPPRESS_EVENT_MS);
-    suppressedEvents.set(instance, events);
+  function emit(event: string, time?: number): void {
+    eventEmitters.forEach((eventEmitter) => eventEmitter.emit(event, time));
   }
 
-  function isSuppressed(instance: any, event: string): boolean {
-    const until = suppressedEvents.get(instance)?.get(event) ?? 0;
-    return until > performance.now();
+  function stopTimeUpdates(): void {
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+  }
+
+  function stopTransport(): void {
+    isPlaying = false;
+    stopTimeUpdates();
+    Tone.Transport.stop();
+    Tone.Transport.cancel(0);
+  }
+
+  function createCustomPlayer(): any {
+    let eventEmitter: any = null;
+    const VISUAL_OFFSET = 0.04;
+
+    const getVisualTime = () => {
+      const time = activeAudioEngine.value === "stems" ? Tone.Transport.seconds : savedTransportTime;
+      return Math.max(0, time - VISUAL_OFFSET);
+    };
+
+    const emitTimeUpdate = () => {
+      if (activeAudioEngine.value !== "stems" || !isPlaying) {
+        animationFrame = null;
+        return;
+      }
+      eventEmitter?.emit("player.timeupdate", getVisualTime());
+      animationFrame = requestAnimationFrame(emitTimeUpdate);
+    };
+
+    return {
+      init: async (emitter: any) => {
+        eventEmitter = emitter;
+        eventEmitters.add(emitter);
+        activePlayerAdapters += 1;
+      },
+      destroy: () => {
+        if (eventEmitter) eventEmitters.delete(eventEmitter);
+        eventEmitter = null;
+        activePlayerAdapters = Math.max(0, activePlayerAdapters - 1);
+        if (activePlayerAdapters === 0) stopTransport();
+      },
+      play: async () => {
+        await Tone.start();
+        if (activeAudioEngine.value !== "stems") return;
+        // Inyectamos el tiempo congelado a Tone justo antes de arrancar
+        Tone.Transport.seconds = savedTransportTime;
+        Tone.Transport.start();
+        isPlaying = true;
+        emit("player.playing", Tone.Transport.seconds);
+        stopTimeUpdates();
+        emitTimeUpdate();
+      },
+      pause: () => {
+        if (activeAudioEngine.value === "stems") Tone.Transport.pause();
+        isPlaying = false;
+        emit("player.pause", Tone.Transport.seconds);
+        stopTimeUpdates();
+      },
+      isPlaying: () => isPlaying,
+      isSeeking: () => false,
+      getCurrentTime: () => getVisualTime(),
+      getDuration: () => tonePlayers[0]?.buffer.duration ?? 0,
+      seek: (time: number) => {
+        savedTransportTime = time;
+        // Solo manipulamos Tone.js si está reproduciendo
+        if (activeAudioEngine.value === "stems" && isPlaying) {
+          Tone.Transport.seconds = time;
+        }
+        emit("player.seeked", time);
+        emit("player.timeupdate", time);
+      },
+    };
   }
 
   function syncViews(source: any): void {
-    // Si ya había un repaso programado, lo cancelamos (porque sigues moviendo el ratón)
-    if (syncTimeout !== null) {
-      clearTimeout(syncTimeout);
-    }
+    if (syncTimeout !== null) clearTimeout(syncTimeout);
 
-    // Aislamos la lógica de sincronización
     const applySync = () => {
       const sourceView = source?.views.getView("zoomview");
       if (!sourceView || isSyncing) return;
 
       const startTime = sourceView.getStartTime();
-      const rawVisibleSeconds = sourceView.getEndTime() - startTime;
-      const visibleSeconds = Math.max(2, rawVisibleSeconds);
-
+      const visibleSeconds = Math.max(2, sourceView.getEndTime() - startTime);
       isSyncing = true;
       try {
         for (const target of instances) {
@@ -77,40 +145,13 @@ export function useStemPeaks(options: StemPeaksOptions) {
       options.onViewportChanged?.();
     };
 
-    // 1. Sincronización en tiempo real (a 60fps, ignora eventos si está ocupado)
     if (!isSyncing && syncFrame === null) {
       syncFrame = requestAnimationFrame(() => {
         syncFrame = null;
         applySync();
       });
     }
-
-    // 2. EL PARCHE: Sincronización final garantizada 50ms después de que pares de mover
-    syncTimeout = setTimeout(() => {
-      applySync();
-    }, 50);
-  }
-
-  function syncPlayback(source: any, command: "play" | "pause" | "seek", time?: number): void {
-    if (isSyncing) return;
-    isSyncing = true;
-    try {
-      for (const target of instances) {
-        if (target === source) continue;
-        if (command === "play") {
-          suppress(target, "playing");
-          void target.player.play().catch(() => undefined);
-        } else if (command === "pause") {
-          suppress(target, "pause");
-          target.player.pause();
-        } else if (time !== undefined && Number.isFinite(time)) {
-          suppress(target, "seeked");
-          target.player.seek(time);
-        }
-      }
-    } finally {
-      isSyncing = false;
-    }
+    syncTimeout = setTimeout(applySync, 50);
   }
 
   function bindEvents(instance: any): void {
@@ -118,19 +159,8 @@ export function useStemPeaks(options: StemPeaksOptions) {
     instance.on("zoomview.update", syncView);
     instance.on("zoomview.panned", syncView);
     instance.on("zoom.update", syncView);
-    instance.on("player.playing", () => {
-      if (isSuppressed(instance, "playing")) return;
-      options.onPlayingChange(true);
-      syncPlayback(instance, "play");
-    });
-    instance.on("player.pause", () => {
-      if (isSuppressed(instance, "pause")) return;
-      options.onPlayingChange(false);
-      syncPlayback(instance, "pause");
-    });
-    instance.on("player.ended", () => options.onPlayingChange(false));
     instance.on("player.seeked", (time: number) => {
-      if (!isSuppressed(instance, "seeked")) syncPlayback(instance, "seek", time);
+      if (Number.isFinite(time)) syncViews(instance);
     });
   }
 
@@ -149,24 +179,54 @@ export function useStemPeaks(options: StemPeaksOptions) {
     window.addEventListener("resize", fitViewsToContainers);
   }
 
-  function applyVolumes(): void {
-    options.getAudioElements().forEach((audio, index) => {
-      audio.volume = soloed.value === null
-          ? (muted.value[index] ? 0 : 1)
-          : (soloed.value === index ? 1 : 0);
+  function applyMuteState(): void {
+    tonePlayers.forEach((player, index) => {
+      const shouldMute = mutedByAudioMutex || (soloed.value === null
+          ? muted.value[index]
+          : soloed.value !== index);
+
+      // -100 dB es silencio absoluto garantizado en Tone.js sin errores de rango
+      player.volume.value = shouldMute ? -100 : 0;
     });
   }
 
-  function createInstance(container: HTMLDivElement, audio: HTMLAudioElement, color: string, token: number, laneIndex: number): Promise<any> {
+  function pauseForAudioMutex(): void {
+    savedTransportTime = Tone.Transport.seconds;
+    mutedByAudioMutex = true;
+    stoppedByAudioMutex = true;
+    isPlaying = false;
+    stopTimeUpdates();
+    for (const player of tonePlayers) {
+      player.unsync();
+      player.stop();
+    }
+    applyMuteState();
+    emit("player.pause", savedTransportTime);
+  }
+
+  function resumeFromAudioMutex(): void {
+    if (stoppedByAudioMutex) {
+      Tone.Transport.seconds = savedTransportTime;
+      for (const player of tonePlayers) player.sync().start(0);
+      stoppedByAudioMutex = false;
+    }
+    mutedByAudioMutex = false;
+    applyMuteState();
+  }
+
+  function notifyMixStateChanged(): void {
+    options.onMixStateChanged?.([...muted.value], soloed.value);
+  }
+
+  function createInstance(container: HTMLDivElement, color: string, token: number, laneIndex: number): Promise<any> {
     return new Promise((resolve, reject) => {
       Peaks.init({
         zoomview: { container, waveformColor: color, playedWaveformColor: color, playheadColor: "#ffffff", showPlayheadTime: laneIndex === 0, showAxisLabels: false, axisGridlineColor: "transparent", axisLabelColor: "transparent", enablePoints: true, wheelMode: "none" },
-        mediaElement: audio,
-        webAudio: { audioContext: audioContext! },
+        player: createCustomPlayer(),
+        webAudio: { audioBuffer: tonePlayers[laneIndex]?.buffer.get() },
         zoomLevels: ZOOM_LEVELS,
         keyboard: false,
         pointMarkerColor: "#facf25",
-        // CONEXIÓN CLAVE: Pasamos la función del marcador Konva correspondiente a esta pista
         createPointMarker: (markerOptions: any) => options.createPointMarker?.(markerOptions, laneIndex),
       } as any, (error: Error | null, instance: unknown) => {
         if (token !== initToken) {
@@ -185,35 +245,37 @@ export function useStemPeaks(options: StemPeaksOptions) {
     destroy();
     const token = ++initToken;
     const containers = options.getWaveformContainers();
-    const audioElements = options.getAudioElements();
-    if (stemPaths.length !== STEM_LANES.length || containers.length !== STEM_LANES.length || audioElements.length !== STEM_LANES.length) return null;
-
-    const AudioContextConstructor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextConstructor) throw new Error("Web Audio is unavailable in this environment.");
+    if (stemPaths.length !== STEM_LANES.length || containers.length !== STEM_LANES.length) return null;
 
     isLoading.value = true;
     isReady.value = false;
     muted.value = STEM_LANES.map(() => false);
     soloed.value = null;
+    mutedByAudioMutex = false;
+    stoppedByAudioMutex = false;
+    notifyMixStateChanged();
     try {
-      audioContext = new AudioContextConstructor();
-      const createdInstances = await Promise.all(STEM_LANES.map((lane, index) => {
-        const audio = audioElements[index];
-        audio.src = convertFileSrc(stemPaths[index]);
-        audio.preload = "auto";
-        audio.load();
-        return createInstance(containers[index], audio, lane.color, token, index);
-      }));
+      await Tone.start();
+      tonePlayers = stemPaths.map((path) => {
+        const player = new Tone.Player({ url: convertFileSrc(path), autostart: false }).toDestination();
+        player.sync().start(0);
+        return player;
+      });
+      await Tone.loaded();
+      if (token !== initToken) return null;
+
+      const createdInstances = await Promise.all(STEM_LANES.map((lane, index) =>
+          createInstance(containers[index], lane.color, token, index),
+      ));
       if (token !== initToken || createdInstances.some((instance) => !instance)) return null;
 
       instances = createdInstances;
-      options.onDuration(instances[0].player.getDuration());
-      instances.forEach((instance) => {
-        bindEvents(instance);
-      });
+      options.onDuration(tonePlayers[0].buffer.duration);
+      instances.forEach(bindEvents);
       bindResizeObserver(containers);
-      applyVolumes();
+      applyMuteState();
       syncViews(instances[0]);
+      if (activeAudioEngine.value !== "stems") pauseForAudioMutex();
       isReady.value = true;
       return instances[0];
     } finally {
@@ -223,33 +285,73 @@ export function useStemPeaks(options: StemPeaksOptions) {
 
   function getMasterPeaks(): any | null { return instances[0] ?? null; }
   function getStemPeaks(): readonly any[] { return instances; }
+
   function toggleMute(index: number): void {
-    muted.value = muted.value.map((isMuted, audioIndex) => audioIndex === index ? !isMuted : isMuted);
-    applyVolumes();
+    const nextMuted = [...muted.value];
+    nextMuted[index] = !nextMuted[index];
+    muted.value = nextMuted;
+
+    // UX: Si silenciamos la pista que estaba en Solo, quitamos el Solo
+    if (soloed.value === index) {
+      soloed.value = null;
+    }
+
+    applyMuteState();
+    notifyMixStateChanged();
   }
 
   function toggleSolo(index: number): void {
-    soloed.value = soloed.value === index ? null : index;
-    applyVolumes();
+    if (soloed.value === index) {
+      soloed.value = null;
+    } else {
+      soloed.value = index;
+
+      // UX: Si ponemos una pista en Solo, nos aseguramos de quitarle el Mute
+      const nextMuted = [...muted.value];
+      nextMuted[index] = false;
+      muted.value = nextMuted;
+    }
+
+    applyMuteState();
+    notifyMixStateChanged();
   }
 
   function destroy(): void {
     initToken += 1;
+    if (syncTimeout !== null) clearTimeout(syncTimeout);
+    syncTimeout = null;
     if (syncFrame !== null) cancelAnimationFrame(syncFrame);
     syncFrame = null;
     if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
     resizeFrame = null;
+    stopTransport();
     window.removeEventListener("resize", fitViewsToContainers);
     resizeObserver?.disconnect();
     resizeObserver = null;
     isReady.value = false;
+    mutedByAudioMutex = false;
+    stoppedByAudioMutex = false;
+    activePlayerAdapters = 0;
     for (const instance of instances) { try { instance.destroy(); } catch (error) { console.warn("[StemPeaks] Peaks destroy failed:", error); } }
     instances = [];
-    for (const audio of options.getAudioElements()) { try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch { /* best-effort media cleanup */ } }
-    void audioContext?.close();
-    audioContext = null;
+    eventEmitters.clear();
+    for (const player of tonePlayers) player.dispose();
+    tonePlayers = [];
     isLoading.value = false;
   }
 
-  return { getMasterPeaks, getStemPeaks, isLoading, isReady, muted, soloed, initialize, toggleMute, toggleSolo, destroy };
+  return {
+    getMasterPeaks,
+    getStemPeaks,
+    isLoading,
+    isReady,
+    muted,
+    soloed,
+    initialize,
+    pauseForAudioMutex,
+    resumeFromAudioMutex,
+    toggleMute,
+    toggleSolo,
+    destroy,
+  };
 }

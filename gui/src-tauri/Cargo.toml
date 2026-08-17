@@ -29,3 +29,4 @@ tauri-plugin-aptabase = "1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dirs = "6"
 quick-xml = "0.37"
+hound = "3.5.1"

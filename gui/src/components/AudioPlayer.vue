@@ -432,14 +432,14 @@ function endCuePreview(padIndex: number): void {
   }
   activeCue.value = null; activePad.value = null; isPlaying.value = false;
 }
-function skipBeats(beatsToSkip: number): void {
+function seekBeats(beatsToSeek: number): void {
   if (isAnalysisRunning.value) return; // Si está analizando, bloqueamos
   const instance = peaks.value;
   if (!instance || trackData.value.bpm <= 0) return;
 
   // Calculamos cuánto dura un beat en segundos y lo multiplicamos
   const beatDurationSec = 60 / trackData.value.bpm;
-  const timeShiftSec = beatsToSkip * beatDurationSec;
+  const timeShiftSec = beatsToSeek * beatDurationSec;
 
   const currentSec = instance.player.getCurrentTime();
   const totalSec = trackData.value.duration_ms / 1000;
@@ -452,12 +452,9 @@ function skipBeats(beatsToSkip: number): void {
 usePlayerKeyboard({
   togglePlay,
   stop,
-  getPad: (padNumber) => padSlots.value[padNumber - 1] ?? null,
-  jump: startCuePreview,
-  previewEnd: endCuePreview,
-  addCue,
-  deleteCue,
-  skipBeats,
+  onPadTrigger: startCuePreview,
+  onPadRelease: endCuePreview,
+  onSeekBeats: seekBeats,
 });
 
 function zoomIn(): void { const view = peaks.value?.views.getView("zoomview"); if (view) view.setZoom({ seconds: Math.max(1, (view.getEndTime() - view.getStartTime()) * 0.8) }); }

@@ -113,6 +113,14 @@ class AmbiguousPlaylistError(Exception):
     """Raised when more than one ``<NODE TYPE="PLAYLIST">`` matches the requested name."""
 
 
+class RemixSetNotFoundError(Exception):
+    """Raised when no root-level ``<SET>`` matches the requested title."""
+
+
+class AmbiguousRemixSetError(Exception):
+    """Raised when more than one root-level ``<SET>`` matches the requested title."""
+
+
 class DuplicateLocationError(ValueError):
     """Raised when two collection entries normalize to the same location."""
 
@@ -342,6 +350,105 @@ class NmlParser:
         """
         entry = self.find_entry(track_path, title=title, artist=artist)
         return self._track_entry_to_metadata_dict(entry)
+
+    def list_remix_sets(self) -> list[str]:
+        """Return root-level Remix Set titles in document order.
+
+        A collection without a ``<SETS>`` element has no saved Remix Sets.
+        """
+        sets_el = self._root.find("SETS")
+        if sets_el is None:
+            return []
+        return [set_el.get("TITLE", "") for set_el in sets_el.findall("SET")]
+
+    def get_remix_set(self, title: str) -> dict[str, Any]:
+        """Extract one root-level Remix Set by exact, case-sensitive title.
+
+        The returned structure deliberately mirrors the payload accepted by
+        ``NmlWriter.write_remix_set`` so callers can load a set for editing
+        without mutating the parsed NML tree.
+        """
+        sets_el = self._root.find("SETS")
+        matches = (
+            [set_el for set_el in sets_el.findall("SET") if set_el.get("TITLE") == title]
+            if sets_el is not None
+            else []
+        )
+        if not matches:
+            raise RemixSetNotFoundError(f"No Remix Set found with TITLE={title!r}")
+        if len(matches) > 1:
+            raise AmbiguousRemixSetError(
+                f"{len(matches)} Remix Sets found with TITLE={title!r}"
+            )
+
+        set_el = matches[0]
+        tempo_el = set_el.find("TEMPO")
+        columns: list[dict[str, int]] = []
+        pads: list[dict[str, Any]] = []
+
+        for col_idx, slot_el in enumerate(set_el.findall("SLOT")):
+            columns.append(
+                {
+                    "keylock": int(slot_el.get("KEYLOCK", "0")),
+                    "punchmode": int(slot_el.get("PUNCHMODE", "0")),
+                    "fxenable": int(slot_el.get("FXENABLE", "0")),
+                }
+            )
+            for cell_el in slot_el.findall("CELL"):
+                path = nml_location_to_path(
+                    cell_el.get("VOLUME", ""),
+                    cell_el.get("DIR", ""),
+                    cell_el.get("FILE", ""),
+                )
+
+                # Cross-reference the main collection to get real duration and key
+                duration_ms = 0.0
+                key = ""
+                try:
+                    track_entry = self.find_entry(path)
+                    duration_ms = track_entry.duration_ms
+                    key = track_entry.key or ""
+                except (TrackNotFoundError, AmbiguousTrackError):
+                    pass
+
+                start_ms = float(cell_el.get("START_MARKER", "0")) * 1000
+                end_ms = float(cell_el.get("END_MARKER", "0")) * 1000
+
+                # If Traktor saved 0 as the end marker, it means the full file.
+                # Provide the real duration to the frontend so it draws the full waveform.
+                if end_ms == 0.0 and duration_ms > 0.0:
+                    end_ms = duration_ms
+
+                pads.append(
+                    {
+                        "id": chr(65 + col_idx) + str(int(cell_el.get("INDEX", "0")) + 1),
+                        "name": cell_el.get("CELLNAME", ""),
+                        "path": path,
+                        "color_id": int(cell_el.get("COLOR", "0")),
+                        "sync": int(cell_el.get("SYNC", "0")),
+                        "reverse": int(cell_el.get("REVERSE", "0")),
+                        "mode": int(cell_el.get("MODE", "0")),
+                        "type": int(cell_el.get("TYPE", "0")),
+                        "transpose": float(cell_el.get("TRANSPOSE", "0")),
+                        "gain": float(cell_el.get("GAIN", "0")),
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "duration_ms": duration_ms,
+                        "bpm": float(cell_el.get("BPM", "0")),
+                        "key": key,
+                    }
+                )
+
+        return {
+            "title": set_el.get("TITLE", ""),
+            "bpm": float(tempo_el.get("BPM", "0") if tempo_el is not None else "0"),
+            "quantize_value": int(
+                set_el.get("QUANT_VAlUE", set_el.get("QUANT_VALUE", "0"))
+            ),
+            "quantize_state": int(set_el.get("QUANT_STATE", "0")),
+            "columns": columns,
+            "pads": pads,
+        }
 
     def get_library(self) -> dict[str, Any]:
         """Build the relational Global Collection export from the live tree.

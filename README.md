@@ -2,7 +2,7 @@
 
 **Arka is an open-source preparation workspace for Traktor DJs.** It helps you analyse tracks, place and refine HotCues, correct beatgrids, organise metadata, and create rule-based playlists—while keeping Traktor's collection.nml as the source of truth.
 
-Arka is currently preparing for its public Beta. It is built for DJs who want useful automation with clear review and control before changes are saved.
+It is built for DJs who want useful automation with clear review and control before changes are saved.
 
 ## Core features
 
@@ -21,25 +21,31 @@ Arka is currently preparing for its public Beta. It is built for DJs who want us
 - Includes a **Track Format** rule for **Stems**, covering Traktor 4 dynamic Stems as well as classic native .stem.mp4 files.
 - Shows a dedicated Stems icon in the library when Traktor reports native Stem availability.
 
+### Remix Studio
+
+- A dedicated workspace for building, editing, and auditioning Traktor Remix Sets.
+- Loads tracks and loops ultra-fast in memory, avoiding redundant disk reads while you work.
+- Provides a DJ-style bipolar filter for every column, with LPF/HPF control, smooth audio ramps, and double-click reset.
+- Maximises vertical space for Remix Pads with compact headers and controls, alongside clean Traktor-style waveforms with extended zoom levels for visual headroom.
+- Uses a stable WebAudio/Tone.js engine for flawless stem isolation through Mute and Solo controls, plus reliable transport synchronisation.
+- Clearly identifies Stem-ready tracks with visual indicators in the Remix Studio sidebar.
+
 ### Grid Fixer and library tools
 
 - Edit the beatgrid directly in the player: nudge its phase, set the anchor at the playhead, shift cues with the grid when needed, and halve or double BPM.
 - Browse playlists and tracks in a Traktor-style library, then batch-edit common metadata fields.
-- Browse session history in a four-deck timeline and import a session as a regular Traktor playlist.
 - Writes collection changes atomically and creates rotating daily backups in the adjacent CueGrid Backups folder.
+
+### Session History
+
+- Visualises past Traktor sessions in a comprehensive four-deck timeline of played tracks.
+- Lets you review historic mixes and export any past session directly as a regular Traktor playlist.
 
 ## Designed for Traktor 4
 
 Arka recognises current **Traktor Pro 4** process naming conventions across Windows, macOS, and Linux. It watches for Traktor while it is running and blocks collection changes until it closes, helping prevent conflicting writes to collection.nml.
 
-The background monitor was rebuilt to reuse its system state, avoiding the CPU bottleneck previously seen on macOS.
-
-## What's new in the Beta
-
-- Arka is the application's official name.
-- Stems detection is back in the library UI, alongside Smart Playlist filtering by track format.
-- Traktor Pro 4 detection is more robust across supported operating systems.
-- Waveform colour extraction has intentionally been removed. This reduces track-load overhead and keeps the Beta focused on responsive waveform, cue, grid, and library workflows.
+The background monitor reuses its system state to minimise CPU use, including on macOS.
 
 ## Installation and usage
 
@@ -115,7 +121,7 @@ build-win.ps1           Windows production build pipeline
 
 ## Privacy and telemetry
 
-On launch, Arka sends one anonymous background ping for basic Beta usage statistics. It does not store personal data, IP addresses, or information from your Traktor library. Local analysis telemetry can be viewed and exported from the app; it is separate from this anonymous Beta usage signal.
+On launch, Arka sends one anonymous background ping for basic usage statistics. It does not store personal data, IP addresses, or information from your Traktor library. Local analysis telemetry can be viewed and exported from the app; it is separate from this anonymous usage signal.
 
 ## Safety
 

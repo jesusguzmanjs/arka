@@ -279,9 +279,11 @@ line opacity/visibility changes before calling `batchDraw()` at most once for
 each Konva layer. This loop must not mutate Vue state.
 
 `RemixStudioView.vue` MUST remain bounded inside the fixed application
-viewport. Its top row (~50vh) contains a **Mini Library & Filters** sidebar
-(~300px or 25%) and the remaining-width Stem Editor. The lower-row future
-**4×4 Pad Matrix** workspace spans the full application width. The Mini Library
+viewport. Its top row contains a **Mini Library & Filters** sidebar (~300px or
+25%) and the remaining-width Stem Editor. On desktop, the Pad Matrix receives
+the larger share of the available height after the waveform row's 300px minimum
+is met. The lower **4×4 Pad Matrix** workspace spans the full application
+width. The Mini Library
 uses a `#5a5a5e` right border within the top row; the Pad Matrix uses a
 full-width `#5a5a5e` top border to form a seamless divider. The Stem Editor
 displays the selected track title and artist when `activeStudioTrack` is non-null;
@@ -293,7 +295,7 @@ and existing cue data to that shared engine, so its beat/bar markers match the
 Collection player exactly. It supplies cached/precomputed waveform data when available and
 falls back to Peaks' Web Audio decoding path when it is not. The waveform uses
 the Arka dark surface, `#edb40b` waveform, and a high-contrast white playhead.
-Its header displays title, artist, BPM, and key; its Play/Pause transport
+Its header displays `Artist - Title`, BPM, and key on one line; its Play/Pause transport
 displays elapsed and total time. Native Peaks waveform click/drag seeking
 updates the same HTML audio playhead. The presentation configures **ZoomView only**:
 it does not create or render a Peaks overview map, and ZoomView fills the entire
@@ -1498,6 +1500,142 @@ stateDiagram-v2
     error --> running: run() again
     cancelled --> running: run() again
 ```
+
+### 6.8 Remix Pad loop-audio extraction
+
+The Rust Tauri backend MUST expose the `extract_pad_audio` command for
+creating the source audio of a Remix Deck pad from the currently selected
+loop. The command accepts these JSON arguments:
+
+| Argument | Type | Meaning |
+| --- | --- | --- |
+| `source_paths` | `Vec<String>` | One or more absolute source-audio paths. |
+| `start_sec` | `f64` | Selected loop start, in seconds. |
+| `end_sec` | `f64` | Selected loop end, in seconds. |
+| `pad_id` | `String` | Pad identifier used in the output filename, such as `A1`. |
+
+The backend calculates `duration = end_sec - start_sec`. It must reject an
+empty source-path array, and validate every source path before invoking FFmpeg.
+For every input, `-ss` MUST occur before its `-i`, which provides fast seeking
+without decoding the complete source track. The command does not apply any
+bleed or safety margin.
+
+```text
+ffmpeg -y -ss <start_sec> -i <source_path_1> ... -ss <start_sec> -i <source_path_n> -t <duration> [ -filter_complex amix=inputs=<n>:duration=longest ] -c:a pcm_s16le -ar 44100 <temp_dir>/<pad_id>_pad_sample.wav
+```
+
+The `amix` filter is omitted for exactly one input and is required for more
+than one input. `RemixDeck.vue` sends the selected standard track as a
+one-element array. When four temporary Stem WAV paths are active, it resolves
+the input array from the Stem Editor's live mix state: a soloed lane is the
+sole source; otherwise every unmuted lane is included. An empty resolved array
+must show **No audio active to extract** and must not invoke the command.
+
+The output path MUST be absolute and located in the system temporary directory
+(or an application cache directory). The successful result is JSON serializable
+with the following snake_case fields:
+
+```ts
+interface PadExtractionResult {
+  file_path: string;
+  duration_ms: number; // duration * 1000.0
+}
+```
+
+The Vue type declaration belongs in `gui/src/types/remix.ts`. The Tauri builder
+MUST register `extract_pad_audio` in its generated invoke handler.
+
+### 6.9 Remix Pad reverse playback
+
+Each Remix Deck pad MAY persist an `isReversed?: boolean` setting. Its `REV`
+toggle MUST appear with the pad's Loop, Trigger, and Sync controls, and update
+the active player immediately through `Tone.GrainPlayer.reverse`, without
+changing the source audio file. Both loading and pressing a pad MUST apply the
+persisted setting to its Remix Deck `Tone.GrainPlayer`, so later playback uses
+the selected direction. An omitted setting MUST behave as `false` for backward
+compatibility with existing pads.
+
+### 6.10 Remix Pad batch editing
+
+`RemixDeck.vue` MUST provide a **BATCH EDIT** toggle beside the Quantize
+controls. While enabled, pressing a pad selects or deselects it instead of
+starting playback; selected pads remain visibly outlined. Turning the toggle
+off MUST clear every selection.
+
+While Batch Edit is enabled, the action header displays the current selection
+count beside the Batch Edit control. The pad context menu includes **Select
+All**, which adds every audio-bearing pad in the complete 4-by-16 matrix to
+the selection, including pads on non-visible pages.
+
+The Deck owns the selected pad-ID set and passes the mode and selection state
+through `RemixColumn.vue` to `RemixPad.vue`. A pad emits a
+`toggle-selection` event with its stable settings ID, preserving props-down,
+events-up data flow.
+
+When batch mode is active and an update originates from a selected pad, the
+Deck MUST calculate the changed `PadSettings` fields and apply only those
+fields to every selected pad. Each affected audio player MUST receive the
+corresponding loop, reverse, sync, and volume updates. An update from an
+unselected pad retains ordinary single-pad behavior.
+
+The Deck owns a non-persistent pad clipboard. In Batch Edit, a right-clicked
+selected audio pad is copyable or cuttable only when it is the sole selection.
+Right clicking an empty pad exposes **Paste Pad** while the clipboard contains
+data. Paste clones the source audio and settings while retaining the target's
+stable ID and name, then loads its player. A copied pad remains in place; a
+cut pad records its source location and is cleared only after a successful
+paste, which also stops and removes its source player.
+
+### 6.11 Remix Studio UI cleanup
+
+The Remix Studio library and waveform areas MUST not render redundant **Mini
+Library**, **Stem Editor**, or **Pad Editor** labels. The matrix section MUST
+instead display a default **New Remix Set** title that can be renamed in place
+by double-clicking it; pressing Enter or moving focus away commits the trimmed
+title, while Escape restores the pre-edit title.
+
+Each Mini Library track title MUST render the same accessible native-Stems SVG
+indicator used by the Collection track list when `CollectionTrack.flags & 0x40`
+is non-zero. The indicator MUST be adjacent to the title, retain a secondary
+text color, and share the title row's flex layout so the title continues to
+truncate without wrapping. Tracks without this flag MUST render no indicator.
+
+Pad editing is available exclusively through the pad context menu; pad-surface
+double-clicking MUST NOT open the editor. The context menu MUST use a compact,
+two-row, eight-column color-picker grid containing the 16-color Traktor
+palette. Its circular swatches MUST remain keyboard accessible.
+
+At constrained window heights, the Remix Studio and editor content MUST scroll
+vertically rather than clip controls. The Matrix control header and the
+Stem/Pad Editor transport bar MUST remain non-shrinking.
+
+The Remix Set title and master-control row MUST use compact vertical spacing.
+Each Remix Column header MUST wrap its mode, volume, and filter controls at its
+natural height with no fixed-height spacer below the sliders. The Remix Pad grid
+and every column's pad stack MUST use remaining flex space so all vertical space
+released by these compact headers increases pad height.
+
+### 6.12 Remix Set loading and unsaved-change protection
+
+`RemixDeck.vue` provides **Load** beside **Save**. Opening Load invokes
+`call_cuegrid_core` with `--list-remix-sets` and presents the returned titles.
+Selecting one invokes `--get-remix-set TITLE`, parses the returned
+`RemixSetPayload`, and passes it to `useRemixAudio().loadRemixSetPayload()`.
+The payload loader resets the dirty flag, restores master BPM and quantize
+state, restores each column's keylock/punch mode, clears every existing pad,
+and reconstructs each incoming pad's settings and audio source from its
+absolute NML path before loading its player.
+
+`useRemixAudio()` owns `isRemixSetDirty`. Importing, clearing, or editing a
+pad; changing column modes; and changing BPM or global quantize marks the
+current set dirty. Save is disabled when clean and clears the flag only after
+the `--save-remix-set` request succeeds. Before loading over a dirty deck, the
+deck requires an explicit **Discard and load** confirmation. A completely empty
+deck with the default `New Remix Set` title is treated as clean for that guard.
+The header separates BPM/quantize settings from icon-only Batch Edit, New,
+Load, and Save actions. **New** uses the same discard guard, then resets the
+deck to 120.00 BPM, enabled one-beat (`4n`) quantize, default column modes,
+empty pads, a clean dirty flag, and the `New Remix Set` title.
 
 ## 7. Telemetry Export (v1.8)
 

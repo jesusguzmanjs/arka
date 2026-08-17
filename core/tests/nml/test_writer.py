@@ -9,6 +9,7 @@ existing ``<CUE_V2>`` children.
 from __future__ import annotations
 
 from datetime import date, timedelta
+import re
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -83,6 +84,316 @@ class TestDeleteCue:
     def test_rejects_invalid_hotcue_index(self, working_nml):
         with pytest.raises(ValueError):
             NmlWriter(NmlParser(working_nml)).delete_cue(KNOWN_TRACK_PATH, 8)
+
+
+class TestWriteRemixSet:
+    def test_increments_existing_sets_entries(self, working_nml):
+        writer = NmlWriter(NmlParser(working_nml))
+        writer.write_remix_set({"title": "First", "pads": []})
+        NmlWriter(NmlParser(working_nml)).write_remix_set({"title": "Second", "pads": []})
+
+        sets = ET.parse(working_nml).getroot().find("SETS")
+        assert sets is not None
+        assert sets.get("ENTRIES") == "2"
+        assert [set_el.get("TITLE") for set_el in sets.findall("SET")] == ["First", "Second"]
+
+    def test_copies_audio_and_writes_native_root_set(self, working_nml, tmp_path, monkeypatch):
+        source_path = tmp_path / "working" / "kick.wav"
+        source_path.parent.mkdir()
+        source_path.write_bytes(b"sample audio")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        payload = {
+            "title": "My/Remix Set",
+            "bpm": 126.5,
+            "quantize_state": 0,
+            "quantize_value": 8,
+            "columns": [
+                {"keylock": 0, "punchmode": 1, "active_cell_index": 4},
+                {"keylock": 1, "punchmode": 0},
+            ],
+            "pads": [
+                {
+                    "id": "A1",
+                    "path": "\\\\?\\" + str(source_path),
+                    "name": "Kick",
+                    "type": 2,
+                    "mode": 3,
+                    "sync": 0,
+                    "reverse": 1,
+                    "transpose": -2.5,
+                    "gain": 0.75,
+                    "color_id": 7,
+                    "key": "8D",
+                    "bpm": 126.5,
+                    "start_ms": 12.5,
+                    "end_ms": 999.25,
+                    "duration_ms": 2_500.5,
+                },
+                {"id": "A5", "path": str(source_path), "name": "Later row"},
+                {"id": "B1", "name": "No source"},
+            ],
+        }
+
+        parser = NmlParser(working_nml)
+        parser.tree.find("./COLLECTION/ENTRY/LOCATION").set("VOLUMEID", "fixture-volume-id")
+        NmlWriter(parser).write_remix_set(payload)
+
+        destination = (
+            tmp_path / "home" / "Music" / "Traktor" / "Samples" / "Arka"
+            / "My_Remix Set" / "A1_kick.wav"
+        )
+        assert destination.read_bytes() == b"sample audio"
+
+        root = ET.parse(working_nml).getroot()
+        collection = root.find("COLLECTION")
+        assert collection.get("ENTRIES") == "4"
+        sets = root.find("SETS")
+        assert sets is not None
+        assert sets.get("ENTRIES") == "1"
+        remix_set = sets.find("SET")
+        assert remix_set is not None
+        assert remix_set.attrib == {
+            "TITLE": "My/Remix Set",
+            "QUANT_VAlUE": "8",
+            "QUANT_STATE": "0",
+        }
+        virtual_location = remix_set.find("LOCATION")
+        assert virtual_location is not None
+        virtual_filename = virtual_location.get("FILE")
+        assert virtual_filename is not None
+        assert re.fullmatch(r"\d{4}y\d{2}m\d{2}d_\d{2}h\d{2}m\d{2}s000000\.set", virtual_filename)
+        assert [child.tag for child in remix_set] == [
+            "LOCATION",
+            "MODIFICATION_INFO",
+            "INFO",
+            "TEMPO",
+            "SLOT",
+            "SLOT",
+            "SLOT",
+            "SLOT",
+        ]
+        expected_virtual_path = working_nml.parent / virtual_filename
+        assert virtual_location.attrib == {
+            "DIR": NmlWriter._path_to_nml_location(str(expected_virtual_path))[1],
+            "FILE": virtual_filename,
+            "VOLUME": NmlWriter._path_to_nml_location(str(expected_virtual_path))[0],
+            "VOLUMEID": "fixture-volume-id",
+        }
+        assert not expected_virtual_path.exists()
+        assert remix_set.find("MODIFICATION_INFO").attrib == {"AUTHOR_TYPE": "importer"}
+        assert remix_set.find("INFO").attrib == {
+            "IMPORT_DATE": f"{date.today().year}/{date.today().month}/{date.today().day}",
+        }
+        assert remix_set.find("TEMPO").attrib == {"BPM": "126.500000"}
+
+        assert all(
+            entry.find("LOCATION").get("FILE") != virtual_filename
+            for entry in collection.findall("ENTRY")
+        )
+        first_sample_entry, second_sample_entry = collection.findall("ENTRY")[-2:]
+        assert [entry.get("TITLE") for entry in (first_sample_entry, second_sample_entry)] == [
+            "Kick",
+            "Later row",
+        ]
+        assert all(
+            entry.attrib["MODIFIED_DATE"]
+            == f"{date.today().year}/{date.today().month}/{date.today().day}"
+            and 0 <= int(entry.attrib["MODIFIED_TIME"]) < 86_400
+            and entry.attrib["LOCK"] == "1"
+            and re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+                entry.attrib["LOCK_MODIFICATION_TIME"],
+            )
+            for entry in (first_sample_entry, second_sample_entry)
+        )
+        assert [entry.find("LOCATION").get("VOLUMEID") for entry in (first_sample_entry, second_sample_entry)] == [
+            "fixture-volume-id",
+            "fixture-volume-id",
+        ]
+        assert [child.tag for child in first_sample_entry] == [
+            "LOCATION",
+            "MODIFICATION_INFO",
+            "INFO",
+            "TEMPO",
+            "MUSICAL_KEY",
+            "CUE_V2",
+        ]
+        assert first_sample_entry.find("MODIFICATION_INFO").attrib == {"AUTHOR_TYPE": "importer"}
+        assert first_sample_entry.find("INFO").attrib == {
+            "IMPORT_DATE": f"{date.today().year}/{date.today().month}/{date.today().day}",
+            "FLAGS": "28",
+            "COMMENT": "Arka: My/Remix Set",
+            "PLAYTIME": "2",
+            "PLAYTIME_FLOAT": "2.500500",
+            "FILESIZE": str(destination.stat().st_size),
+        }
+        assert first_sample_entry.find("TEMPO").attrib == {
+            "BPM": "126.500000",
+            "BPM_QUALITY": "100.000000",
+        }
+        assert first_sample_entry.find("MUSICAL_KEY").attrib == {"VALUE": "1"}
+        assert first_sample_entry.find("CUE_V2").attrib == {
+            "NAME": "AutoGrid",
+            "DISPL_ORDER": "0",
+            "TYPE": "4",
+            "START": "0.000000",
+            "LEN": "0.000000",
+            "REPEATS": "-1",
+            "HOTCUE": "-1",
+        }
+        assert first_sample_entry.find("CUE_V2/GRID").attrib == {"BPM": "126.500000"}
+        assert second_sample_entry.find("INFO").attrib == {
+            "IMPORT_DATE": f"{date.today().year}/{date.today().month}/{date.today().day}",
+            "FLAGS": "28",
+            "COMMENT": "Arka: My/Remix Set",
+            "FILESIZE": str(destination.stat().st_size),
+        }
+        assert second_sample_entry.find("TEMPO").attrib == {
+            "BPM": "120.000000",
+            "BPM_QUALITY": "100.000000",
+        }
+        assert second_sample_entry.find("MUSICAL_KEY") is None
+        assert second_sample_entry.find("CUE_V2/GRID").attrib == {"BPM": "120.000000"}
+
+        slots = remix_set.findall("SLOT")
+        assert len(slots) == 4
+        assert slots[0].attrib == {
+            "KEYLOCK": "0",
+            "PUNCHMODE": "1",
+            "FXENABLE": "1",
+            "ACTIVE_CELL_INDEX": "0",
+        }
+        assert slots[1].attrib == {
+            "KEYLOCK": "1",
+            "PUNCHMODE": "0",
+            "FXENABLE": "1",
+            "ACTIVE_CELL_INDEX": "-1",
+        }
+        assert [len(slot.findall("CELL")) for slot in slots] == [2, 0, 0, 0]
+
+        first_cell, second_cell = slots[0].findall("CELL")
+        assert first_cell.attrib == {
+            "INDEX": "0",
+            "CELLNAME": "Kick",
+            "COLOR": "7",
+            "SYNC": "0",
+            "REVERSE": "1",
+            "MODE": "3",
+            "TYPE": "2",
+            "SPEED": "1.000000",
+            "TRANSPOSE": "-2.500000",
+            "OFFSET": "0.000000",
+            "NUDGE": "0.000000",
+            "GAIN": "0.750000",
+            "START_MARKER": "12.500000",
+            "END_MARKER": "999.250000",
+            "BPM": "126.500000",
+            "DIR": NmlWriter._path_to_nml_location(str(destination))[1],
+            "FILE": "A1_kick.wav",
+            "VOLUME": NmlWriter._path_to_nml_location(str(destination))[0],
+        }
+        assert second_cell.get("INDEX") == "4"
+        assert second_cell.get("FILE") == "A5_kick.wav"
+        assert first_cell.find("LOCATION") is None
+        assert len(_backup_files(working_nml)) == 1
+
+    def test_writes_file_playtime_for_untrimmed_pad(self, working_nml, tmp_path, monkeypatch):
+        source_path = tmp_path / "full-length-loop.wav"
+        source_path.write_bytes(b"full length loop")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+        NmlWriter(NmlParser(working_nml)).write_remix_set(
+            {
+                "title": "Full length loop",
+                "pads": [{
+                    "id": "A1",
+                    "path": str(source_path),
+                    "start_ms": 0,
+                    "end_ms": 0,
+                    "duration_ms": 12_345.678,
+                }],
+            }
+        )
+
+        root = ET.parse(working_nml).getroot()
+        sample_info = root.find("./COLLECTION/ENTRY[@TITLE='A1']/INFO")
+        cell = root.find("./SETS/SET/SLOT/CELL")
+        assert sample_info is not None
+        assert sample_info.get("PLAYTIME") == "12"
+        assert sample_info.get("PLAYTIME_FLOAT") == "12.345678"
+        assert cell is not None
+        assert cell.get("END_MARKER") == "0.000000"
+
+    def test_reuses_existing_collection_audio_without_copying_or_replacing_entry(
+        self, working_nml, tmp_path, monkeypatch
+    ):
+        source_path = tmp_path / "existing.wav"
+        source_path.write_bytes(b"existing sample")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+        parser = NmlParser(working_nml)
+        collection = parser.tree.find("COLLECTION")
+        assert collection is not None
+        original_entry = ET.SubElement(
+            collection, "ENTRY", TITLE="Original sample", ARTIST="Artist"
+        )
+        volume, directory, filename = NmlWriter._path_to_nml_location(str(source_path))
+        location = ET.SubElement(original_entry, "LOCATION")
+        location.set("VOLUME", volume)
+        location.set("DIR", directory)
+        location.set("FILE", filename)
+        ET.SubElement(original_entry, "STRIPE", VERSION="preserve-me")
+        original_entry_xml = ET.tostring(original_entry)
+
+        NmlWriter(parser).write_remix_set(
+            {
+                "title": "Reuse existing",
+                "pads": [{"id": "A1", "path": str(source_path), "name": "Renamed pad"}],
+            }
+        )
+
+        root = ET.parse(working_nml).getroot()
+        collection = root.find("COLLECTION")
+        assert collection is not None
+        reloaded_original = next(
+            entry
+            for entry in collection.findall("ENTRY")
+            if entry.get("TITLE") == "Original sample"
+        )
+        assert ET.tostring(reloaded_original) == original_entry_xml
+        assert len(collection.findall("ENTRY")) == 3
+        assert not (tmp_path / "home" / "Music" / "Traktor" / "Samples" / "Arka").exists()
+
+        cell = root.find("./SETS/SET/SLOT/CELL")
+        assert cell is not None
+        assert (cell.get("VOLUME"), cell.get("DIR"), cell.get("FILE")) == (
+            volume,
+            directory,
+            filename,
+        )
+
+    def test_replaces_same_title_set_in_place_and_keeps_collection_unique(
+        self, working_nml, tmp_path, monkeypatch
+    ):
+        source_path = tmp_path / "loop.wav"
+        source_path.write_bytes(b"loop")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        payload = {"title": "Overwrite", "quantize_value": 4, "pads": [{"id": "A1", "path": str(source_path)}]}
+
+        NmlWriter(NmlParser(working_nml)).write_remix_set(payload)
+        NmlWriter(NmlParser(working_nml)).write_remix_set({"title": "Other", "pads": []})
+        payload["quantize_value"] = 16
+        NmlWriter(NmlParser(working_nml)).write_remix_set(payload)
+
+        root = ET.parse(working_nml).getroot()
+        sets = root.find("SETS")
+        collection = root.find("COLLECTION")
+        assert sets is not None
+        assert collection is not None
+        assert [set_el.get("TITLE") for set_el in sets.findall("SET")] == ["Overwrite", "Other"]
+        assert sets.get("ENTRIES") == "2"
+        assert sets.find("SET").get("QUANT_VAlUE") == "16"
+        assert len(collection.findall("ENTRY")) == 3
 
 
 class TestWriteCues:

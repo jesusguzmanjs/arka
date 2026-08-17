@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, shallowRef } from "vue";
 import { storeToRefs } from "pinia";
 import { useLibraryState } from "../composables/useLibraryState";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
 import type { CollectionTrack } from "../types/library";
 import MiniLibrary from "./MiniLibrary.vue";
+import RemixDeck from "./RemixDeck.vue";
 import StemEditor from "./StemEditor.vue";
 
 const workspaceStore = useWorkspaceStore();
 const { activeStudioTrack, activeStemTracks } = storeToRefs(workspaceStore);
 const { collection } = useLibraryState();
+const setTitle = shallowRef("New Remix Set");
 
 const miniLibraryTracks = computed(() => Object.values(collection.value)
   .sort((left, right) => left.collection_index - right.collection_index));
@@ -17,6 +19,7 @@ const miniLibraryTracks = computed(() => Object.values(collection.value)
 function loadTrackInStemEditor(track: CollectionTrack): void {
   workspaceStore.setActiveStudioTrack(track);
 }
+
 </script>
 
 <template>
@@ -29,9 +32,8 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
       <StemEditor :track="activeStudioTrack" :stem-tracks="activeStemTracks" />
     </section>
 
-    <section class="studio-zone pad-matrix" aria-labelledby="pad-matrix-heading">
-      <p id="pad-matrix-heading" class="zone-label">4×4 Pad Matrix</p>
-      <p class="empty-state">Pad Matrix workspace</p>
+    <section class="studio-zone pad-matrix" aria-label="Remix pad matrix">
+      <RemixDeck v-model:set-title="setTitle" />
     </section>
   </div>
 </template>
@@ -41,8 +43,9 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
   display: grid;
   flex: 1;
   min-height: 0;
-  grid-template-rows: minmax(320px, 1fr) minmax(180px, 1fr);
-  overflow: hidden;
+  grid-template-rows: minmax(300px, 0.85fr) minmax(360px, 1.15fr);
+  overflow-x: hidden;
+  overflow-y: auto;
   background: #1c1c1e;
 }
 
@@ -69,21 +72,13 @@ function loadTrackInStemEditor(track: CollectionTrack): void {
 
 .pad-matrix {
   display: flex;
+  min-height: 0;
   flex-direction: column;
-  padding: 1.5rem;
+  padding: 0.5rem 1.5rem;
 }
 
 .pad-matrix {
   border-top: 1px solid #5a5a5e;
-}
-
-.zone-label {
-  margin: 0;
-  color: #f7d15f;
-  font-size: 0.6875rem;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
 }
 
 

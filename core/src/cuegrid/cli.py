@@ -27,10 +27,11 @@ from cuegrid.core.smart_playlist import matches_rules
 
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,
+    AmbiguousRemixSetError,
     AmbiguousTrackError,
-    DuplicateLocationError,
     NmlParser,
     PlaylistNotFoundError,
+    RemixSetNotFoundError,
     TrackNotFoundError,
 )
 from cuegrid.nml.writer import HotcueNotFoundError, NmlWriter
@@ -200,6 +201,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Intended for populating a GUI dropdown."
         ),
     )
+    remix_set_query = parser.add_mutually_exclusive_group(required=False)
+    remix_set_query.add_argument(
+        "--list-remix-sets",
+        action="store_true",
+        default=False,
+        dest="list_remix_sets",
+        help="List Remix Set titles as a JSON array, then exit without analysis.",
+    )
+    remix_set_query.add_argument(
+        "--get-remix-set",
+        type=str,
+        default=None,
+        dest="get_remix_set",
+        metavar="TITLE",
+        help="Extract one Remix Set as JSON, then exit without analysis.",
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -309,6 +326,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="batch_save",
         metavar="JSON",
         help="Atomically persist final track and playlist state in one NML transaction.",
+    )
+    parser.add_argument(
+        "--save-remix-set",
+        type=str,
+        default=None,
+        dest="save_remix_set",
+        metavar="JSON",
+        help="Inject a fully constructed Remix Set into the NML and save it atomically.",
     )
     parser.add_argument(
         "--grid-anchor",
@@ -737,6 +762,57 @@ def main(argv: list[str] | None = None) -> int:
     if args.write_to_files and args.batch_save is None:
         build_parser().error("--write-to-files may only be used with --batch-save")
 
+    if args.save_remix_set is not None:
+        incompatible = (
+            bool(args.track_paths)
+            or args.track_title is not None
+            or args.playlist is not None
+            or args.title is not None
+            or args.artist is not None
+            or args.batch_save is not None
+            or args.list_playlists
+            or args.list_remix_sets
+            or args.get_remix_set is not None
+            or args.get_track_metadata is not None
+            or args.get_playlist_tracks is not None
+            or args.get_library
+            or args.discover_nml
+            or args.compile_smart_playlist is not None
+            or args.create_static_playlist is not None
+            or args.clear_existing
+            or args.export_gui
+            or args.export_csv_path is not None
+            or args.mode is not None
+            or args.phrase_beats is not None
+            or args.major_phrase_multiple is not None
+            or args.sample_rate is not None
+            or args.hop_length is not None
+            or args.window_beats is not None
+            or args.mfcc_count is not None
+            or args.energy_threshold is not None
+            or args.timbre_threshold is not None
+            or args.max_cues is not None
+            or args.relative_confidence_threshold is not None
+            or args.stems_dir is not None
+            or args.no_stems
+        )
+        if incompatible:
+            print("error: --save-remix-set cannot be combined with other operations", file=sys.stderr)
+            return 1
+
+        try:
+            payload = json.loads(args.save_remix_set)
+            nml_path = _resolve_nml_path(args.nml)
+            if nml_path is None:
+                raise ValueError("no collection.nml found; pass --nml PATH explicitly")
+
+            NmlWriter(NmlParser(nml_path)).write_remix_set(payload)
+            print(json.dumps({"ok": True, "message": "Remix Set saved successfully!"}))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+
     if args.batch_save is not None:
         incompatible = (
             bool(args.track_paths)
@@ -745,6 +821,8 @@ def main(argv: list[str] | None = None) -> int:
             or args.title is not None
             or args.artist is not None
             or args.list_playlists
+            or args.list_remix_sets
+            or args.get_remix_set is not None
             or args.get_track_metadata is not None
             or args.get_playlist_tracks is not None
             or args.get_library
@@ -795,6 +873,7 @@ def main(argv: list[str] | None = None) -> int:
         incompatible = (
             bool(args.track_paths) or args.track_title is not None or args.playlist is not None
             or args.title is not None or args.artist is not None or args.list_playlists
+            or args.list_remix_sets or args.get_remix_set is not None
             or args.get_track_metadata is not None or args.get_playlist_tracks is not None
             or args.get_library or args.discover_nml or args.delete_cue is not None
             or args.update_cues is not None or args.update_metadata is not None
@@ -839,6 +918,8 @@ def main(argv: list[str] | None = None) -> int:
             or args.title is not None
             or args.artist is not None
             or args.list_playlists
+            or args.list_remix_sets
+            or args.get_remix_set is not None
             or args.get_track_metadata is not None
             or args.get_playlist_tracks is not None
             or args.get_library
@@ -1073,10 +1154,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(names))
         sys.exit(0)
 
-    # --get-library: one standalone relational query for the Global Collection
-    # browser. The parser indexes the master collection once and emits playlist
-    # references only; no audio or pipeline code is involved.
-    if args.get_library:
+    # Remix Set queries are standalone read-only operations. They run before
+    # normal analysis selector validation and never initialize audio code.
+    if args.list_remix_sets:
+        nml_path = _resolve_nml_path(args.nml)
+        if nml_path is None:
+            print(
+                "error: no collection.nml found under the standard Traktor "
+                "install directories. Pass --nml PATH explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        print(json.dumps(NmlParser(nml_path).list_remix_sets()))
+        sys.exit(0)
+
+    if args.get_remix_set is not None:
         nml_path = _resolve_nml_path(args.nml)
         if nml_path is None:
             print(
@@ -1086,19 +1178,33 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         try:
+            payload = NmlParser(nml_path).get_remix_set(args.get_remix_set)
+        except RemixSetNotFoundError as exc:
+            print(json.dumps({"error": "not_found", "message": str(exc)}))
+            sys.exit(1)
+        except AmbiguousRemixSetError as exc:
+            print(json.dumps({"error": "ambiguous", "message": str(exc)}))
+            sys.exit(1)
+        print(json.dumps(payload))
+        sys.exit(0)
+
+    # --get-library: one standalone relational query for the Global Collection
+    # browser. The parser indexes the master collection once and emits playlist
+    # references only; no audio or pipeline code is involved.
+    if args.get_library:
+        nml_path = _resolve_nml_path(args.nml)
+        if nml_path is None:
+            print(json.dumps({"error": "not_found", "message": "No collection.nml found."}))
+            return 1
+        try:
             parser = NmlParser(nml_path)
             NmlWriter(parser)._backup_if_needed()
             payload = parser.get_library()
-        except DuplicateLocationError as exc:
-            print(
-                json.dumps(
-                    {"error": "duplicate_location", "message": str(exc)},
-                    separators=(",", ":"),
-                )
-            )
+            print(json.dumps(payload, separators=(",", ":")))
+            sys.exit(0)
+        except Exception as exc:
+            print(json.dumps({"error": "parse_error", "message": str(exc)}, separators=(",", ":")))
             return 1
-        print(json.dumps(payload, separators=(",", ":")))
-        sys.exit(0)
 
     # --delete-cue (spec .openspec/2-core-spec.md section 13): a
     # standalone destructive operation. It must run before normal selector
