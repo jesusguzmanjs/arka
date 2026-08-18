@@ -35,6 +35,8 @@ let stemGridBpm = 0;
 let initToken = 0;
 let watchToken = 0;
 let singleTonePlayer: Tone.Player | Tone.GrainPlayer | null = null;
+let loopFadeGain: Tone.Gain | null = null;
+let padFadePart: Tone.Part | null = null;
 let singlePlayerEmitter: any = null;
 let singlePlayerIsPlaying = false;
 let singlePlayerAnimationFrame: number | null = null;
@@ -57,7 +59,7 @@ interface StemTimeline {
 type SelectionDrag =
   | { mode: "draw"; timeline: StemTimeline; startRawTime: number; didCreateLoop: boolean }
   | { mode: "move"; timeline: StemTimeline; startClientX: number; range: NonNullable<typeof activeLoopRange.value> }
-  | { mode: "resize-left" | "resize-right"; timeline: StemTimeline; range: NonNullable<typeof activeLoopRange.value> };
+  | { mode: "resize-left" | "resize-right" | "fade-in" | "fade-out"; timeline: StemTimeline; range: NonNullable<typeof activeLoopRange.value> };
 
 let selectionDrag: SelectionDrag | null = null;
 
@@ -103,6 +105,22 @@ const editorSourcePath = computed(() => (
 const editBpm = shallowRef(120);
 const editAnchorMs = shallowRef(0);
 const editTranspose = shallowRef(0);
+const editFadeInMs = computed({
+  get: () => activeLoopRange.value?.fadeInMs ?? 0,
+  set: (value: number) => {
+    const range = activeLoopRange.value;
+    if (!range) return;
+    workspaceStore.setActiveLoopRange({ ...range, fadeInMs: Math.max(0, Number(value) || 0) });
+  },
+});
+const editFadeOutMs = computed({
+  get: () => activeLoopRange.value?.fadeOutMs ?? 0,
+  set: (value: number) => {
+    const range = activeLoopRange.value;
+    if (!range) return;
+    workspaceStore.setActiveLoopRange({ ...range, fadeOutMs: Math.max(0, Number(value) || 0) });
+  },
+});
 const isPadGridEditMode = ref(false);
 
 const {
@@ -137,12 +155,18 @@ const loopLabel = computed(() => {
   const range = activeLoopRange.value;
   return range ? `Selected: ${range.beatCount} ${range.beatCount === 1 ? "Beat" : "Beats"} | ${formatDuration(range.duration)}` : null;
 });
+const editFadeWidths = computed(() => {
+  const loopDurationMs = Math.max(0, (activeLoopRange.value?.duration ?? 0) * 1000);
+  if (loopDurationMs === 0) return { fadeInPercent: 0, fadeOutPercent: 0 };
+
+  return {
+    fadeInPercent: Math.min(100, (editFadeInMs.value / loopDurationMs) * 100),
+    fadeOutPercent: Math.min(100, (editFadeOutMs.value / loopDurationMs) * 100),
+  };
+});
 const customSelectionOverlayStyle = computed(() => {
-  // Esta línea fuerza a Vue a recalcular cuando hacemos refreshCustomSelectionOverlay()
   void selectionOverlayViewportVersion.value;
 
-  // The inline display style takes precedence over utility classes, so hide the
-  // trim overlay here while the grid anchor is being edited.
   if (isPadEditMode.value && isPadGridEditMode.value) {
     return { display: "none" };
   }
@@ -153,7 +177,6 @@ const customSelectionOverlayStyle = computed(() => {
 
   if (!range || !view) return { display: "none" };
 
-  // Usamos el API de Peaks para obtener los segundos exactos visibles ahora mismo
   const startTime = view.getStartTime();
   const endTime = view.getEndTime();
   const visibleSeconds = endTime - startTime;
@@ -162,24 +185,20 @@ const customSelectionOverlayStyle = computed(() => {
     return { display: "none" };
   }
 
-  // Calculamos el porcentaje exacto de dónde cae el inicio del bucle dentro de la ventana visible
   const rawLeftPercent = ((range.start - startTime) / visibleSeconds) * 100;
-
-  // Calculamos qué porcentaje de la ventana visible ocupa la duración del bucle
   const rawWidthPercent = (range.duration / visibleSeconds) * 100;
 
-  // Si la caja está completamente fuera de la vista por la izquierda o por la derecha, la ocultamos (opcional pero limpio)
-  // Keep the overlay within the visible viewport while Peaks recalculates after a resize.
-  const leftPercent = Math.max(0, Math.min(100, rawLeftPercent));
-  const endPercent = Math.max(leftPercent, Math.min(100, rawLeftPercent + rawWidthPercent));
-  const widthPercent = endPercent - leftPercent;
+  // Si la caja está completamente fuera de la vista por la izquierda o por la derecha, la ocultamos
+  if (rawLeftPercent + rawWidthPercent <= 0 || rawLeftPercent >= 100) {
+    return { display: "none" };
+  }
 
-  if (widthPercent <= 0) return { display: "none" };
-
+  // MAGIA: Dejamos que los porcentajes "raw" se salgan de la pantalla si es necesario
+  // Así el SVG de su interior mantendrá SIEMPRE la proporción exacta frente a la onda
   return {
     display: "block",
-    left: `${leftPercent}%`,
-    width: `${widthPercent}%`,
+    left: `${rawLeftPercent}%`,
+    width: `${rawWidthPercent}%`,
     top: 0,
     bottom: 0,
     height: "100%",
@@ -237,10 +256,86 @@ watch(activeLoopRange, (range) => {
   if (range) {
     Tone.Transport.setLoopPoints(range.start, range.end);
     Tone.Transport.loop = true;
+    clampEditFades(range);
   } else {
     Tone.Transport.loop = false;
   }
 });
+
+function clampEditFades(range: NonNullable<typeof activeLoopRange.value>): void {
+  const loopDurationMs = Math.max(0, range.duration * 1000);
+  const fadeInMs = Math.max(0, Number(range.fadeInMs) || 0);
+  const fadeOutMs = Math.max(0, Number(range.fadeOutMs) || 0);
+  const totalFadeMs = fadeInMs + fadeOutMs;
+
+  if (totalFadeMs <= loopDurationMs) {
+    return;
+  }
+
+  const scale = totalFadeMs === 0 ? 0 : loopDurationMs / totalFadeMs;
+  workspaceStore.setActiveLoopRange({
+    ...range,
+    fadeInMs: fadeInMs * scale,
+    fadeOutMs: fadeOutMs * scale,
+  });
+}
+
+function clearFadeEvents(): void {
+  if (padFadePart) {
+    padFadePart.dispose();
+    padFadePart = null;
+  }
+}
+
+function updatePadFades(): void {
+  clearFadeEvents();
+  if (!loopFadeGain || !activeLoopRange.value) {
+    if (loopFadeGain) loopFadeGain.gain.value = 1;
+    return;
+  }
+
+  const range = activeLoopRange.value;
+  const fadeInSec = editFadeInMs.value / 1000;
+  const fadeOutSec = editFadeOutMs.value / 1000;
+
+  // 1. Creamos una secuencia de eventos relativos a la duración del bucle (empezando en 0)
+  const events: Array<{ time: number, type: string }> = [];
+
+  // El evento de inicio SIEMPRE va en el segundo 0 relativo del bucle
+  events.push({ time: 0, type: "start" });
+
+  // Si hay fade out, calculamos en qué segundo del bucle debe empezar a bajar
+  if (fadeOutSec > 0) {
+    const outTime = Math.max(0, range.duration - fadeOutSec);
+    events.push({ time: outTime, type: "out" });
+  }
+
+  // 2. Tone.Part es la herramienta perfecta para sincronizar eventos en bucles sin que se pierdan
+  padFadePart = new Tone.Part((time, event) => {
+    // 'time' es el momento matemático exacto (AudioContext Time) sin fallos de coma flotante
+    loopFadeGain!.gain.cancelScheduledValues(time);
+
+    if (event.type === "start") {
+      if (fadeInSec > 0) {
+        loopFadeGain!.gain.setValueAtTime(0, time);
+        loopFadeGain!.gain.linearRampToValueAtTime(1, time + fadeInSec);
+      } else {
+        loopFadeGain!.gain.setValueAtTime(1, time);
+      }
+    } else if (event.type === "out") {
+      loopFadeGain!.gain.setValueAtTime(1, time);
+      loopFadeGain!.gain.linearRampToValueAtTime(0, time + fadeOutSec);
+    }
+  }, events);
+
+  // 3. Le decimos al Part que dura exactamente lo mismo que nuestro bucle
+  padFadePart.loop = true;
+  padFadePart.loopStart = 0;
+  padFadePart.loopEnd = range.duration;
+
+  // 4. Y lo enganchamos al Transport maestro para que arranque justo con nuestra selección
+  padFadePart.start(range.start);
+}
 
 function formatTime(seconds: number): string {
   const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
@@ -266,6 +361,8 @@ function setPadEditSelection(): void {
     end: end > start ? end : Math.min(duration.value, start + beatLength),
     duration: Math.max(0, end - start) || Math.min(beatLength, duration.value - start),
     beatCount: Math.max(1, Math.round(Math.max(beatLength, end - start) / beatLength)),
+    fadeInMs: target.settings.fadeInMs ?? 0,
+    fadeOutMs: target.settings.fadeOutMs ?? 0,
   });
 }
 
@@ -297,6 +394,8 @@ function savePadEdit(): void {
     transpose,
     loopStart: range.start,
     loopEnd: range.end,
+    fadeInMs: editFadeInMs.value,
+    fadeOutMs: editFadeOutMs.value,
   };
   updatePlayerTranspose(pad.settings.id, transpose);
   updatePlayerLoopRange(pad.settings.id, range.start, range.end);
@@ -317,6 +416,10 @@ watch(editingPad, (target) => {
   editTranspose.value = target.pad.settings.transpose ?? target.pad.audio.pitchShift ?? 0;
   setPadEditSelection();
 }, { immediate: true });
+
+watch([editFadeInMs, editFadeOutMs, activeLoopRange], () => {
+  updatePadFades();
+}, { deep: true });
 
 watch(editTranspose, (newValue) => {
   if (singleTonePlayer && 'detune' in singleTonePlayer) {
@@ -421,6 +524,11 @@ function destroyPeaks(): void {
   stopSelectionDrag();
   stopOpacitySync();
   destroyStemPeaks();
+  clearFadeEvents();
+  if (loopFadeGain) {
+    loopFadeGain.dispose();
+    loopFadeGain = null;
+  }
   workspaceStore.setActiveLoopRange(null);
   isPlaying.value = false;
   currentTime.value = 0;
@@ -698,7 +806,12 @@ function rawTimeAtClientX(clientX: number, timeline: StemTimeline): number {
   return timeline.startTime + ratio * timeline.visibleSeconds;
 }
 
-function setStemLoopRange(startRawTime: number, endRawTime: number, timeline: StemTimeline): void {
+function setStemLoopRange(
+  startRawTime: number,
+  endRawTime: number,
+  timeline: StemTimeline,
+  previousRange: NonNullable<typeof activeLoopRange.value> | null = null,
+): void {
   const beatLength = beatMs(timeline.bpm) / 1000;
   let start = Math.max(0, snapToGrid(Math.min(startRawTime, endRawTime) * 1000, timeline.bpm, timeline.anchorMs) / 1000);
   let end = Math.max(0, snapToGrid(Math.max(startRawTime, endRawTime) * 1000, timeline.bpm, timeline.anchorMs) / 1000);
@@ -721,6 +834,8 @@ function setStemLoopRange(startRawTime: number, endRawTime: number, timeline: St
     end,
     duration: rangeDuration,
     beatCount: Math.max(1, Math.round(rangeDuration / beatLength)),
+    fadeInMs: previousRange?.fadeInMs ?? 0,
+    fadeOutMs: previousRange?.fadeOutMs ?? 0,
   });
 }
 
@@ -781,6 +896,28 @@ function startResizeRight(event: MouseEvent): void {
   startResizeSelection(event, "resize-right");
 }
 
+function startFadeInDrag(event: MouseEvent): void {
+  startFadeDrag(event, "fade-in");
+}
+
+function startFadeOutDrag(event: MouseEvent): void {
+  startFadeDrag(event, "fade-out");
+}
+
+function adjustFadeWithKeyboard(event: KeyboardEvent, mode: "fade-in" | "fade-out"): void {
+  if ((event.key !== "ArrowLeft" && event.key !== "ArrowRight") || !activeLoopRange.value) return;
+
+  event.preventDefault();
+  const loopDurationMs = Math.max(0, activeLoopRange.value.duration * 1000);
+  const moveRightMs = event.key === "ArrowRight" ? 100 : -100;
+
+  if (mode === "fade-in") {
+    editFadeInMs.value = Math.max(0, Math.min(editFadeInMs.value + moveRightMs, loopDurationMs - editFadeOutMs.value));
+  } else {
+    editFadeOutMs.value = Math.max(0, Math.min(editFadeOutMs.value - moveRightMs, loopDurationMs - editFadeInMs.value));
+  }
+}
+
 function startResizeSelection(event: MouseEvent, mode: "resize-left" | "resize-right"): void {
   if (event.button !== 0 || !activeLoopRange.value) return;
 
@@ -788,6 +925,18 @@ function startResizeSelection(event: MouseEvent, mode: "resize-left" | "resize-r
   if (!(handle instanceof HTMLElement)) return;
   const overlay = handle.parentElement;
   if (!(overlay instanceof HTMLElement)) return;
+  const timeline = getStemTimeline();
+  if (!timeline) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  selectionDrag = { mode, timeline, range: activeLoopRange.value };
+  startSelectionDrag();
+}
+
+function startFadeDrag(event: MouseEvent, mode: "fade-in" | "fade-out"): void {
+  if (event.button !== 0 || !activeLoopRange.value) return;
+
   const timeline = getStemTimeline();
   if (!timeline) return;
 
@@ -828,10 +977,25 @@ function handleSelectionDrag(event: MouseEvent): void {
     return;
   }
 
+  if (drag.mode === "fade-in" || drag.mode === "fade-out") {
+    const range = activeLoopRange.value ?? drag.range;
+    const loopDurationMs = Math.max(0, range.duration * 1000);
+
+    if (drag.mode === "fade-in") {
+      const fadeInMs = (currentRawTime - range.start) * 1000;
+      editFadeInMs.value = Math.max(0, Math.min(Math.round(fadeInMs), loopDurationMs - editFadeOutMs.value));
+    } else {
+      const fadeOutMs = (range.end - currentRawTime) * 1000;
+      editFadeOutMs.value = Math.max(0, Math.min(Math.round(fadeOutMs), loopDurationMs - editFadeInMs.value));
+    }
+
+    return;
+  }
+
   if (drag.mode === "resize-left") {
     const snappedStart = Math.max(0, snapToGrid(currentRawTime * 1000, drag.timeline.bpm, drag.timeline.anchorMs) / 1000);
     const start = Math.max(0, Math.min(snappedStart, drag.range.end - beatLength));
-    setStemLoopRange(start, drag.range.end, drag.timeline);
+    setStemLoopRange(start, drag.range.end, drag.timeline, drag.range);
     return;
   }
 
@@ -876,6 +1040,7 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
 
   await Tone.start();
 
+  loopFadeGain = new Tone.Gain(1).toDestination();
   if (isPadEditMode.value) {
     // Si estamos editando un Pad, necesitamos GrainPlayer para poder usar el Transpose
     singleTonePlayer = new Tone.GrainPlayer({
@@ -883,16 +1048,17 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
       grainSize: 0.2,
       overlap: 0.1,
       loop: false,
-    }).toDestination();
+    }).connect(loopFadeGain);
     singleTonePlayer.detune = (Number(editTranspose.value) || 0) * 100;
   } else {
     // Si es una pista normal de librería, usamos el Player estándar (¡Cero clicks en loops!)
     singleTonePlayer = new Tone.Player({
       url: convertFileSrc(sourcePath),
       loop: false,
-    }).toDestination();
+    }).connect(loopFadeGain);
   }
   singleTonePlayer.sync().start(0);
+  updatePadFades();
 
   // 1. Carga en paralelo del audio + metadatos
   await Tone.loaded();
@@ -1213,6 +1379,12 @@ onBeforeUnmount(() => {
         </article>
         <div class="overlay-wrapper">
           <div class="custom-selection-overlay" :style="customSelectionOverlayStyle" @mousedown.stop="startMoveSelection" @wheel.prevent="handleZoomWheel">
+            <svg class="fade-svg-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <polygon :points="`0,0 0,100 ${editFadeWidths.fadeInPercent},0`" fill="rgba(23, 23, 26, 0.75)" />
+              <polygon :points="`100,0 100,100 ${100 - editFadeWidths.fadeOutPercent},0`" fill="rgba(23, 23, 26, 0.75)" />
+            </svg>
+            <div class="fade-handle fade-in-handle" role="slider" tabindex="0" aria-label="Fade in duration" aria-orientation="horizontal" aria-valuemin="0" :aria-valuemax="Math.max(0, (activeLoopRange?.duration ?? 0) * 1000 - editFadeOutMs)" :aria-valuenow="editFadeInMs" :style="{ left: `calc(${editFadeWidths.fadeInPercent}% - 5px)` }" @mousedown.stop="startFadeInDrag" @keydown="adjustFadeWithKeyboard($event, 'fade-in')" />
+            <div class="fade-handle fade-out-handle" role="slider" tabindex="0" aria-label="Fade out duration" aria-orientation="horizontal" aria-valuemin="0" :aria-valuemax="Math.max(0, (activeLoopRange?.duration ?? 0) * 1000 - editFadeInMs)" :aria-valuenow="editFadeOutMs" :style="{ left: `calc(${100 - editFadeWidths.fadeOutPercent}% - 5px)` }" @mousedown.stop="startFadeOutDrag" @keydown="adjustFadeWithKeyboard($event, 'fade-out')" />
             <div class="selection-handle handle-left" @mousedown.stop="startResizeLeft" />
             <div class="selection-handle handle-right" role="separator" aria-label="Trim end" @mousedown.stop="startResizeRight" />
           </div>
@@ -1226,6 +1398,12 @@ onBeforeUnmount(() => {
           <div class="trim-mask mask-right" :style="{ left: `${trimMaskGeometry.leftPercent + trimMaskGeometry.widthPercent}%`, width: `${trimMaskGeometry.rightPercent}%` }" />
         </template>
         <div class="custom-selection-overlay" :class="{ 'is-trim-selection': isPadEditMode, hidden: isPadEditMode && isPadGridEditMode, 'pointer-events-none': isPadEditMode }" :style="customSelectionOverlayStyle" @mousedown.stop="startMoveSelection" @wheel.prevent="handleZoomWheel">
+          <svg class="fade-svg-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+            <polygon :points="`0,0 0,100 ${editFadeWidths.fadeInPercent},0`" fill="rgba(23, 23, 26, 0.75)" />
+            <polygon :points="`100,0 100,100 ${100 - editFadeWidths.fadeOutPercent},0`" fill="rgba(23, 23, 26, 0.75)" />
+          </svg>
+          <div class="fade-handle fade-in-handle" role="slider" tabindex="0" aria-label="Fade in duration" aria-orientation="horizontal" aria-valuemin="0" :aria-valuemax="Math.max(0, (activeLoopRange?.duration ?? 0) * 1000 - editFadeOutMs)" :aria-valuenow="editFadeInMs" :style="{ left: `calc(${editFadeWidths.fadeInPercent}% - 5px)` }" @mousedown.stop="startFadeInDrag" @keydown="adjustFadeWithKeyboard($event, 'fade-in')" />
+          <div class="fade-handle fade-out-handle" role="slider" tabindex="0" aria-label="Fade out duration" aria-orientation="horizontal" aria-valuemin="0" :aria-valuemax="Math.max(0, (activeLoopRange?.duration ?? 0) * 1000 - editFadeInMs)" :aria-valuenow="editFadeOutMs" :style="{ left: `calc(${100 - editFadeWidths.fadeOutPercent}% - 5px)` }" @mousedown.stop="startFadeOutDrag" @keydown="adjustFadeWithKeyboard($event, 'fade-out')" />
           <div class="selection-handle handle-left" @mousedown.stop="startResizeLeft" />
           <div class="selection-handle handle-right" role="separator" aria-label="Trim end" @mousedown.stop="startResizeRight" />
         </div>
@@ -1296,6 +1474,37 @@ onBeforeUnmount(() => {
 .custom-selection-overlay.is-trim-selection .selection-handle {
   width: 14px;
   background: transparent;
+}
+
+.fade-svg-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.fade-handle {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  width: 10px;
+  height: 10px;
+  border: 1px solid #17171a;
+  border-radius: 1px;
+  background: #f7d15f;
+  box-shadow: 0 0 0 1px rgb(247 209 95 / 45%);
+  cursor: ew-resize;
+  pointer-events: auto !important;
+}
+
+.fade-handle:hover {
+  background: #fff;
+}
+
+.fade-handle:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
 }
 
 /* 2. Izquierda: Lo pegamos al borde al 0 y pintamos una línea sólida usando el borde izquierdo */

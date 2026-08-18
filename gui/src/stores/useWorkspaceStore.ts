@@ -11,6 +11,8 @@ export interface ActiveLoopRange {
   end: number;
   duration: number;
   beatCount: number;
+  fadeInMs: number;
+  fadeOutMs: number;
 }
 
 export type EditorMode = "library" | "pad";

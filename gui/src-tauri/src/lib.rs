@@ -66,6 +66,245 @@ fn float_sample_to_pcm16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemixPadFadeRequest {
+    pad_id: String,
+    path: String,
+    #[serde(default)]
+    fade_in_ms: f64,
+    #[serde(default)]
+    fade_out_ms: f64,
+}
+
+#[derive(serde::Serialize)]
+struct RemixPadFadeResult {
+    pad_id: String,
+    file_path: String,
+}
+
+fn sanitized_pad_id(pad_id: &str) -> String {
+    let sanitized = pad_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "pad".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn faded_pad_output_path(source_path: &Path, pad_id: &str) -> Result<PathBuf, String> {
+    let parent = source_path.parent().ok_or_else(|| {
+        format!(
+            "Cannot determine an output directory for source WAV {}",
+            source_path.display()
+        )
+    })?;
+    let stem = source_path.file_stem().ok_or_else(|| {
+        format!(
+            "Cannot determine a filename for source WAV {}",
+            source_path.display()
+        )
+    })?;
+
+    Ok(parent.join(format!(
+        "{}__pad_{}_faded.wav",
+        stem.to_string_lossy(),
+        sanitized_pad_id(pad_id),
+    )))
+}
+
+fn fade_multiplier(
+    frame_index: usize,
+    total_frames: usize,
+    fade_in_frames: usize,
+    fade_out_frames: usize,
+) -> f64 {
+    if fade_in_frames > 0 && frame_index < fade_in_frames {
+        frame_index as f64 / fade_in_frames as f64
+    } else if fade_out_frames > 0 && frame_index >= total_frames.saturating_sub(fade_out_frames) {
+        let frames_into_fade = frame_index - (total_frames - fade_out_frames);
+        1.0 - (frames_into_fade as f64 / fade_out_frames as f64)
+    } else {
+        1.0
+    }
+}
+
+fn finalize_faded_wav(temp_path: &Path, output_path: &Path) -> Result<(), String> {
+    if output_path.exists() {
+        fs::remove_file(output_path).map_err(|error| {
+            format!(
+                "Unable to replace faded WAV output {}: {error}",
+                output_path.display()
+            )
+        })?;
+    }
+    fs::rename(temp_path, output_path).map_err(|error| {
+        format!(
+            "Unable to finalize faded WAV output {}: {error}",
+            output_path.display()
+        )
+    })
+}
+
+fn render_faded_wav(
+    source_path: &Path,
+    output_path: &Path,
+    fade_in_ms: f64,
+    fade_out_ms: f64,
+) -> Result<(), String> {
+    let mut reader = hound::WavReader::open(source_path).map_err(|error| {
+        format!(
+            "Unable to read source WAV {}: {error}",
+            source_path.display()
+        )
+    })?;
+    let specification = reader.spec();
+    let channels = specification.channels as usize;
+    if channels == 0 {
+        return Err("Source WAV channel count must be greater than zero".to_string());
+    }
+
+    let fade_in_frames = ((fade_in_ms / 1000.0) * specification.sample_rate as f64) as usize;
+    let fade_out_frames = ((fade_out_ms / 1000.0) * specification.sample_rate as f64) as usize;
+    let temp_path = output_path.with_extension("fade.tmp");
+    if temp_path.exists() {
+        fs::remove_file(&temp_path).map_err(|error| {
+            format!(
+                "Unable to clear previous temporary faded WAV {}: {error}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    match specification.sample_format {
+        hound::SampleFormat::Int => {
+            let samples = reader
+                .samples::<i32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read integer WAV samples: {error}"))?;
+            let total_frames = samples.len() / channels;
+            let fade_in_frames = fade_in_frames.min(total_frames);
+            let fade_out_frames = fade_out_frames.min(total_frames);
+            let mut writer =
+                hound::WavWriter::create(&temp_path, specification).map_err(|error| {
+                    format!(
+                        "Unable to create faded WAV {}: {error}",
+                        temp_path.display()
+                    )
+                })?;
+
+            for (sample_index, sample) in samples.into_iter().enumerate() {
+                let multiplier = fade_multiplier(
+                    sample_index / channels,
+                    total_frames,
+                    fade_in_frames,
+                    fade_out_frames,
+                );
+                let faded_sample = ((sample as f64) * multiplier)
+                    .round()
+                    .clamp(i32::MIN as f64, i32::MAX as f64)
+                    as i32;
+                writer
+                    .write_sample(faded_sample)
+                    .map_err(|error| format!("Unable to write faded WAV sample: {error}"))?;
+            }
+            writer.finalize().map_err(|error| {
+                format!(
+                    "Unable to finalize faded WAV {}: {error}",
+                    temp_path.display()
+                )
+            })?;
+        }
+        hound::SampleFormat::Float => {
+            let samples = reader
+                .samples::<f32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read floating-point WAV samples: {error}"))?;
+            let total_frames = samples.len() / channels;
+            let fade_in_frames = fade_in_frames.min(total_frames);
+            let fade_out_frames = fade_out_frames.min(total_frames);
+            let mut writer =
+                hound::WavWriter::create(&temp_path, specification).map_err(|error| {
+                    format!(
+                        "Unable to create faded WAV {}: {error}",
+                        temp_path.display()
+                    )
+                })?;
+
+            for (sample_index, sample) in samples.into_iter().enumerate() {
+                let multiplier = fade_multiplier(
+                    sample_index / channels,
+                    total_frames,
+                    fade_in_frames,
+                    fade_out_frames,
+                );
+                writer
+                    .write_sample((sample as f64 * multiplier) as f32)
+                    .map_err(|error| format!("Unable to write faded WAV sample: {error}"))?;
+            }
+            writer.finalize().map_err(|error| {
+                format!(
+                    "Unable to finalize faded WAV {}: {error}",
+                    temp_path.display()
+                )
+            })?;
+        }
+    }
+
+    finalize_faded_wav(&temp_path, output_path)
+}
+
+fn render_requested_remix_pad_fades(
+    pads: Vec<RemixPadFadeRequest>,
+) -> Result<Vec<RemixPadFadeResult>, String> {
+    let mut results = Vec::new();
+
+    for pad in pads {
+        if !pad.fade_in_ms.is_finite()
+            || !pad.fade_out_ms.is_finite()
+            || pad.fade_in_ms < 0.0
+            || pad.fade_out_ms < 0.0
+        {
+            return Err(format!("Pad {} has invalid fade durations", pad.pad_id));
+        }
+        if pad.fade_in_ms == 0.0 && pad.fade_out_ms == 0.0 {
+            continue;
+        }
+
+        let source_path = PathBuf::from(&pad.path);
+        if !source_path.is_file() {
+            return Err(format!(
+                "Pad {} source WAV does not exist or is not a file: {}",
+                pad.pad_id,
+                source_path.display()
+            ));
+        }
+
+        let output_path = faded_pad_output_path(&source_path, &pad.pad_id)?;
+        render_faded_wav(&source_path, &output_path, pad.fade_in_ms, pad.fade_out_ms)?;
+        let file_path = output_path
+            .canonicalize()
+            .map_err(|error| format!("Unable to resolve faded WAV output: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        results.push(RemixPadFadeResult {
+            pad_id: pad.pad_id,
+            file_path,
+        });
+    }
+
+    Ok(results)
+}
+
 fn is_within_arka_directory(path: &Path) -> bool {
     path.components()
         .any(|component| component.as_os_str() == "Arka")
@@ -678,6 +917,15 @@ async fn extract_pad_audio(
     .map_err(|error| format!("Pad extraction worker failed: {error}"))?
 }
 
+#[tauri::command]
+async fn render_remix_pad_fades(
+    pads: Vec<RemixPadFadeRequest>,
+) -> Result<Vec<RemixPadFadeResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || render_requested_remix_pad_fades(pads))
+        .await
+        .map_err(|error| format!("Remix pad fade worker failed: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -696,6 +944,7 @@ pub fn run() {
             check_stem_exists,
             extract_stems,
             extract_pad_audio,
+            render_remix_pad_fades,
             save_generated_audio,
             delete_generated_audio,
         ])
@@ -712,7 +961,7 @@ mod tests {
     use super::{
         append_nml_path, ffmpeg_pad_audio_arguments, ffmpeg_stem_arguments, float_sample_to_pcm16,
         generated_audio_working_directory, is_traktor_process_name, is_within_arka_directory,
-        pad_audio_output_path, reset_stem_temp_directory, stem_output_paths,
+        pad_audio_output_path, render_faded_wav, reset_stem_temp_directory, stem_output_paths,
         validated_generated_audio_path,
     };
     use std::fs;
@@ -890,6 +1139,43 @@ mod tests {
         assert_eq!(float_sample_to_pcm16(0.0), 0);
         assert_eq!(float_sample_to_pcm16(0.5), 16383);
         assert_eq!(float_sample_to_pcm16(2.0), i16::MAX);
+    }
+
+    #[test]
+    fn renders_a_separate_linear_fade_without_changing_the_source_wav() {
+        let directory =
+            std::env::temp_dir().join(format!("arka-fade-test-{}", std::process::id(),));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("source.wav");
+        let output_path = directory.join("source__pad_A1_faded.wav");
+        let specification = hound::WavSpec {
+            channels: 1,
+            sample_rate: 1_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&source_path, specification).unwrap();
+        for _ in 0..4 {
+            writer.write_sample(1_000_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        render_faded_wav(&source_path, &output_path, 2.0, 0.0).unwrap();
+
+        let source_samples = hound::WavReader::open(&source_path)
+            .unwrap()
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let faded_samples = hound::WavReader::open(&output_path)
+            .unwrap()
+            .into_samples::<i32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(source_samples, vec![1_000, 1_000, 1_000, 1_000]);
+        assert_eq!(faded_samples, vec![0, 500, 1_000, 1_000]);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

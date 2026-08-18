@@ -33,6 +33,10 @@ export interface PadSettings {
   loopStart?: number;
   /** Trimmed playback end, in seconds. Null means the source duration. */
   loopEnd?: number | null;
+  /** Fade-in duration for the trimmed loop, in milliseconds. */
+  fadeInMs?: number;
+  /** Fade-out duration for the trimmed loop, in milliseconds. */
+  fadeOutMs?: number;
 }
 
 /**
@@ -56,6 +60,20 @@ export interface PadAudioData {
 export interface PadExtractionResult {
   file_path: string;
   duration_ms: number;
+}
+
+/** Input sent to Rust before persisting a Remix Set. */
+export interface PadFadeRenderRequest {
+  padId: string;
+  path: string;
+  fadeInMs: number;
+  fadeOutMs: number;
+}
+
+/** A separate rendered WAV path for a fade-enabled pad. */
+export interface PadFadeRenderResult {
+  pad_id: string;
+  file_path: string;
 }
 
 /** Read-only Remix Set payload returned by CueGrid's ``--get-remix-set`` command. */

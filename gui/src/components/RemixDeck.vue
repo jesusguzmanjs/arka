@@ -9,7 +9,7 @@ import { useConfigState } from "../composables/useConfigState";
 import { useRemixAudio } from "../composables/useRemixAudio";
 import { showAppToast } from "../composables/useAppToast";
 import { useWorkspaceStore } from "../stores/useWorkspaceStore";
-import { TRAKTOR_COLORS, type PadExtractionResult, type PadSettings, type RemixPadData, type RemixSetPayload } from "../types/remix";
+import { TRAKTOR_COLORS, type PadExtractionResult, type PadFadeRenderRequest, type PadFadeRenderResult, type PadSettings, type RemixPadData, type RemixSetPayload } from "../types/remix";
 
 const setTitle = defineModel<string>("setTitle", { required: true });
 
@@ -179,6 +179,30 @@ function updateColumnFilter(columnIndex: number, value: number): void {
 async function exportRemixSet(): Promise<void> {
   if (isExportingRemixSet.value) return;
 
+  const pads = remixPads.value.flatMap((columnPads) => columnPads.flatMap((pad) => {
+    const audio = pad.audio;
+    if (!audio?.filePath) return [];
+
+    return [{
+      id: pad.settings.id,
+      name: pad.settings.name,
+      path: audio.filePath,
+      type: pad.settings.playType === "loop" ? 0 : 1,
+      mode: pad.settings.triggerMode === "gate" ? 1 : 0,
+      sync: pad.settings.sync ? 1 : 0,
+      reverse: pad.settings.isReversed ? 1 : 0,
+      transpose: Number(pad.settings.transpose) || 0,
+      gain: Math.max(0, Math.min(1, (pad.settings.volume + 1) / 2)),
+      color_id: traktorColorIndex(pad.settings.color),
+      start_ms: (pad.settings.loopStart ?? 0) * 1000,
+      end_ms: (pad.settings.loopEnd ?? 0) * 1000,
+      duration_ms: audio.durationMs ?? 0,
+      bpm: audio.originalBpm,
+      key: audio.originalKey ?? "",
+      fadeInMs: Math.max(0, Number(pad.settings.fadeInMs) || 0),
+      fadeOutMs: Math.max(0, Number(pad.settings.fadeOutMs) || 0),
+    }];
+  }));
   const payload = {
     title: setTitle.value.trim() || DEFAULT_REMIX_SET_TITLE,
     bpm: Number(masterBpm.value),
@@ -188,34 +212,29 @@ async function exportRemixSet(): Promise<void> {
       keylock: keylock ? 1 : 0,
       punchmode: columnPunchMode[index] ? 1 : 0,
     })),
-    pads: remixPads.value.flatMap((columnPads) => columnPads.flatMap((pad) => {
-      const audio = pad.audio;
-      if (!audio?.filePath) return [];
-
-      return [{
-        id: pad.settings.id,
-        name: pad.settings.name,
-        path: audio.filePath,
-        type: pad.settings.playType === "loop" ? 0 : 1,
-        mode: pad.settings.triggerMode === "gate" ? 1 : 0,
-        sync: pad.settings.sync ? 1 : 0,
-        reverse: pad.settings.isReversed ? 1 : 0,
-        transpose: Number(pad.settings.transpose) || 0,
-        gain: Math.max(0, Math.min(1, (pad.settings.volume + 1) / 2)),
-        color_id: traktorColorIndex(pad.settings.color),
-        start_ms: (pad.settings.loopStart ?? 0) * 1000,
-        end_ms: (pad.settings.loopEnd ?? 0) * 1000,
-        duration_ms: audio.durationMs ?? 0,
-        bpm: audio.originalBpm,
-        key: audio.originalKey ?? "",
-      }];
-    })),
+    pads,
   };
 
   isExportingRemixSet.value = true;
   try {
+    const fadeRequests: PadFadeRenderRequest[] = pads.map((pad) => ({
+      padId: pad.id,
+      path: pad.path,
+      fadeInMs: pad.fadeInMs,
+      fadeOutMs: pad.fadeOutMs,
+    }));
+    const fadeResults = await invoke<PadFadeRenderResult[]>("render_remix_pad_fades", { pads: fadeRequests });
+    const fadedPaths = new Map(fadeResults.map((result) => [result.pad_id, result.file_path]));
+    const pythonPayload = {
+      ...payload,
+      pads: pads.map(({ fadeInMs: _fadeInMs, fadeOutMs: _fadeOutMs, ...pad }) => ({
+        ...pad,
+        path: fadedPaths.get(pad.id) ?? pad.path,
+      })),
+    };
+
     await invoke<string>("call_cuegrid_core", {
-      args: ["--save-remix-set", JSON.stringify(payload)],
+      args: ["--save-remix-set", JSON.stringify(pythonPayload)],
       nmlPath: currentNmlPath.value ?? null,
     });
     setRemixSetDirty(false);
@@ -716,6 +735,8 @@ async function importLoopToPad({ colIndex, padIndex, padId }: PadImportTarget): 
       ...pad.settings,
       color: TRAKTOR_COLORS[Math.floor(Math.random() * TRAKTOR_COLORS.length)],
       name: pad.settings.id,
+      fadeInMs: loopRange.fadeInMs,
+      fadeOutMs: loopRange.fadeOutMs,
     };
     loadPadAudio(pad.settings.id, colIndex, result.file_path, pad.settings, pad.audio);
   } catch (error) {
