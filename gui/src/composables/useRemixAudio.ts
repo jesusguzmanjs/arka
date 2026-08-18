@@ -211,8 +211,8 @@ function createRemixAudioState() {
     const player = new Tone.GrainPlayer({
       url: convertFileSrc(filePath),
       loop: settings.playType === "loop",
-      grainSize: 0.05,
-      overlap: 0.05,
+      grainSize: 0.2,
+      overlap: 0.1,
       onload: () => {
         const dur = player.buffer.duration;
         player.loopStart = settings.loopStart ?? 0;

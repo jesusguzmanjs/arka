@@ -4,7 +4,7 @@ import { storeToRefs } from "pinia";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import Peaks from "peaks.js";
 import * as Tone from "tone";
-import { fetchTrackMetadata } from "../composables/useTrackMetadata";
+import { fetchTrackMetadata, usePlayerState } from "../composables/useTrackMetadata";
 import { usePeaksMarkers, type PlayerCue } from "../composables/usePeaksMarkers";
 import { usePlayerKeyboard } from "../composables/usePlayerKeyboard";
 import { useRemixAudio } from "../composables/useRemixAudio";
@@ -17,6 +17,7 @@ import PlayerGridControls from "./PlayerGridControls.vue";
 
 const props = defineProps<{ track: CollectionTrack | null; stemTracks: string[] }>();
 const workspaceStore = useWorkspaceStore();
+const { previewCache } = usePlayerState();
 const { activeLoopRange, editorMode, editingPadId, remixPads } = storeToRefs(workspaceStore);
 const { isDeckPlaying, updatePlayerLoopRange, updatePlayerTranspose } = useRemixAudio();
 const waveformElement = useTemplateRef<HTMLDivElement>("waveform");
@@ -33,7 +34,7 @@ let syncRaf: number | null = null;
 let stemGridBpm = 0;
 let initToken = 0;
 let watchToken = 0;
-let singleTonePlayer: Tone.GrainPlayer | null = null;
+let singleTonePlayer: Tone.Player | Tone.GrainPlayer | null = null;
 let singlePlayerEmitter: any = null;
 let singlePlayerIsPlaying = false;
 let singlePlayerAnimationFrame: number | null = null;
@@ -318,14 +319,14 @@ watch(editingPad, (target) => {
 }, { immediate: true });
 
 watch(editTranspose, (newValue) => {
-  if (singleTonePlayer) {
-    singleTonePlayer.detune = (Number(newValue) || 0) * 100;
+  if (singleTonePlayer && 'detune' in singleTonePlayer) {
+    (singleTonePlayer as any).detune = (Number(newValue) || 0) * 100;
   }
 });
 
-/*function createPeaksWaveformData(data: number[]) {
+function createPeaksWaveformData(data: number[]) {
   return { json: { version: 2, channels: 1, sample_rate: 11025, samples_per_pixel: 64, bits: 8, length: Math.floor(data.length / 2), data } };
-}*/
+}
 
 function startOpacitySync(): void {
   if (syncRaf === null) {
@@ -423,16 +424,24 @@ function destroyPeaks(): void {
   workspaceStore.setActiveLoopRange(null);
   isPlaying.value = false;
   currentTime.value = 0;
+
   const instance = peaks.value;
   peaks.value = null;
   try { instance?.destroy?.(); } catch (error) { console.warn("[StemEditor] Peaks destroy failed:", error); }
+
   if (singlePlayerAnimationFrame !== null) cancelAnimationFrame(singlePlayerAnimationFrame);
   singlePlayerAnimationFrame = null;
   singlePlayerEmitter = null;
   singlePlayerIsPlaying = false;
   singlePlayerStoppedByAudioMutex = false;
-  singleTonePlayer?.dispose();
-  singleTonePlayer = null;
+
+  // --- EL EXORCISMO ANTI-FANTASMAS ---
+  if (singleTonePlayer) {
+    singleTonePlayer.unsync(); // 1. Lo desenganchamos de la línea de tiempo global
+    singleTonePlayer.stop();   // 2. Paramos su reproducción inmediatamente
+    singleTonePlayer.dispose(); // 3. Destruimos el nodo de audio
+    singleTonePlayer = null;
+  }
 }
 
 function wirePlayerEvents(instance: any): void {
@@ -866,24 +875,27 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
   if (!container || token !== initToken) return;
 
   await Tone.start();
-  singleTonePlayer = new Tone.GrainPlayer({
-    url: convertFileSrc(sourcePath),
-    grainSize: 0.05,
-    overlap: 0.05,
-    loop: false,
-  }).toDestination();
-  singleTonePlayer.detune = (Number(editTranspose.value) || 0) * 100;
+
+  if (isPadEditMode.value) {
+    // Si estamos editando un Pad, necesitamos GrainPlayer para poder usar el Transpose
+    singleTonePlayer = new Tone.GrainPlayer({
+      url: convertFileSrc(sourcePath),
+      grainSize: 0.2,
+      overlap: 0.1,
+      loop: false,
+    }).toDestination();
+    singleTonePlayer.detune = (Number(editTranspose.value) || 0) * 100;
+  } else {
+    // Si es una pista normal de librería, usamos el Player estándar (¡Cero clicks en loops!)
+    singleTonePlayer = new Tone.Player({
+      url: convertFileSrc(sourcePath),
+      loop: false,
+    }).toDestination();
+  }
   singleTonePlayer.sync().start(0);
 
   // 1. Carga en paralelo del audio + metadatos
   await Tone.loaded();
-  if (track && (track.bpm || track.grid_anchor_ms)) {
-    preciseMetadata.value = {
-      bpm: track.bpm,
-      grid_anchor_ms: track.grid_anchor_ms,
-      existing_cues: track.existing_cues ?? [],
-    };
-  }
 
   if (token !== initToken || !singleTonePlayer) return;
 
@@ -907,18 +919,28 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
       showAxisLabels: false,
       axisGridlineColor: "transparent",
       axisLabelColor: "transparent",
-      enablePoints: true
+      enablePoints: true,
     },
     player: createSingleCustomPlayer(),
-    webAudio: {
-      audioContext: new (window.AudioContext || (window as any).webkitAudioContext)(),
-      audioBuffer,
-    },
     zoomLevels: isPadEditMode.value ? PAD_ZOOM_LEVELS : TRACK_ZOOM_LEVELS,
     keyboard: false,
     pointMarkerColor: "#facf25",
     createPointMarker,
   };
+
+  // Si tenemos los picos de Traktor en memoria, los inyectamos al instante
+  console.log("Precise metadata:", preciseMetadata.value);
+  if (preciseMetadata.value?.waveform_peaks) {
+    console.log("[StemEditor] Using precomputed waveform peaks for", preciseMetadata.value?.waveform_peaks);
+    // MAGIA: Multiplicamos cada pico por 0.6 para aplastar la onda matemáticamente
+    // const scaledPeaks = preciseMetadata.value.waveform_peaks.map((peak: number) => Math.round(peak * 0.75));
+
+    peaksOptions.waveformData = createPeaksWaveformData(preciseMetadata.value.waveform_peaks);
+    peaksOptions.webAudio = false as never; // Apagamos el cálculo en vivo
+  } else {
+    // Para recortes de Pads extraídos, calculamos del audio
+    peaksOptions.webAudio = { audioBuffer };
+  }
 
   await new Promise<void>((resolve, reject) => {
     Peaks.init(peaksOptions, (error: Error | null, instance: unknown) => {
@@ -1054,22 +1076,42 @@ watch([editorSourcePath, () => props.track, () => props.stemTracks, isPadEditMod
       existing_cues: [],
     };
   }
-  // Si venimos de la colección y la pista ya tiene metadatos en Vue, los reutilizamos
-  else if (track && (track.bpm || track.grid_anchor_ms)) {
-    preciseMetadata.value = {
-      bpm: track.bpm,
-      grid_anchor_ms: track.grid_anchor_ms,
-      existing_cues: track.existing_cues ?? [],
-    };
-  }
-  // Solo si es un archivo totalmente desconocido en Vue, llamamos a Python
+  // Si es una pista normal, OBLIGAMOS a buscar los picos nativos
   else {
-    try {
-      const metaResult = await fetchTrackMetadata(sourcePath);
-      if (currentToken !== watchToken) return;
-      preciseMetadata.value = metaResult.ok && metaResult.metadata ? metaResult.metadata : null;
-    } catch {
-      preciseMetadata.value = null;
+    let meta = previewCache.value.get(sourcePath);
+    console.log('En el else, meta', meta)
+
+    // Si la caché está vacía, hacemos la llamada a Python
+    if (!meta) {
+      try {
+        const metaResult = await fetchTrackMetadata(sourcePath);
+        console.log("meta resulte", metaResult)
+        if (currentToken !== watchToken) return;
+        if (metaResult.ok && metaResult.metadata) {
+          meta = metaResult.metadata;
+          previewCache.value.set(sourcePath, meta);
+        }
+      } catch (error) {
+        console.warn("[StemEditor] Failed to fetch metadata for waveform:", error);
+      }
+    }
+
+    // Si hemos conseguido el SuperJSON, inyectamos TODO (incluyendo waveform_peaks)
+    if (meta) {
+      preciseMetadata.value = {
+        bpm: meta.bpm,
+        grid_anchor_ms: meta.grid_anchor_ms,
+        existing_cues: meta.existing_cues ?? [],
+        waveform_peaks: meta.waveform_peaks, // <--- EL SANTO GRIAL
+      };
+    }
+    // Fallback de emergencia por si Python falla por algún motivo
+    else if (track) {
+      preciseMetadata.value = {
+        bpm: track.bpm,
+        grid_anchor_ms: track.grid_anchor_ms,
+        existing_cues: track.existing_cues ?? [],
+      };
     }
   }
 
@@ -1291,14 +1333,6 @@ onBeforeUnmount(() => {
   left: var(--stem-controls-width);
   right: 0;
   pointer-events: none; /* Vital para no bloquear los clics de la onda */
-}
-
-/* Escala mágicamente la onda un 25% hacia el centro para dejar espacio (headroom),
-   sin afectar a las líneas del Grid ni a los Cues que están en otra capa */
-:deep(.konvajs-content canvas:first-child) {
-  transform: scaleY(0.75) !important;
-  transform-origin: center !important;
-  opacity: 0.95 !important;
 }
 
 </style>
