@@ -1,0 +1,88 @@
+name: 'Release Arka'
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          cd core
+          pip install -r requirements.txt 
+
+      # -- FASE 2: BUILD PYTHON (WINDOWS) --
+      - name: Freeze Python Core (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd core
+          $env:PYTHONPATH = "."
+          pyinstaller --clean --noconfirm --onedir --name cuegrid-core cuegrid/cli.py
+          $ResourcesDir = "..\gui\src-tauri\resources\cuegrid-core"
+          if (Test-Path $ResourcesDir) { Remove-Item -Recurse -Force $ResourcesDir }
+          New-Item -ItemType Directory -Path (Split-Path $ResourcesDir) -Force | Out-Null
+          Copy-Item -Recurse -Force -Path "dist\cuegrid-core" -Destination $ResourcesDir
+
+      # -- FASE 2: BUILD PYTHON (macOS) --
+      - name: Freeze Python Core (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          cd core
+          export PYTHONPATH="."
+          pyinstaller --clean --noconfirm --onedir --name cuegrid-core cuegrid/cli.py
+          RESOURCES_DIR="../gui/src-tauri/resources/cuegrid-core"
+          rm -rf "$RESOURCES_DIR"
+          mkdir -p "$(dirname "$RESOURCES_DIR")"
+          cp -R dist/cuegrid-core/ "$RESOURCES_DIR"
+          chmod +x "$RESOURCES_DIR/cuegrid-core"
+
+      # -- FASE 1: BUILD FRONTEND (VUE) --
+      - name: Install Frontend Dependencies & Build Vue
+        run: |
+          cd gui
+          npm install
+          npm run build
+
+      # -- FASE 3: BUILD NATIVO & PUBLISH (TAURI) --
+      - name: Build and Publish Tauri App
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          projectPath: './gui'
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Arka ${{ github.ref_name }}'
+          releaseBody: 'Update available. Please review the release notes.'
+          releaseDraft: true
+          prerelease: false
