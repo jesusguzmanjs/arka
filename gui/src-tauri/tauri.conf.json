@@ -1,13 +1,21 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Arka",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "identifier": "com.arka.dj",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://gist.githubusercontent.com/jesusguzmanjs/7b02aa1e30ac4b3a9daf82ccc554af19/raw/update.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM0NjVFMjREMkI2QzI1QjQKUldTMEpXd3JUZUpsTkxVZy9sQjhLdjFkUVdBYXd6aUYwSlo1ZmxMNmNBWWs2NUZvT1FEdmJNQ0UK"
+    }
   },
   "app": {
     "windows": [
