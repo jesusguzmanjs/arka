@@ -91,21 +91,18 @@ jobs:
           prerelease: false
 
   update-gist:
-    needs: build-and-publish # Espera a que Mac y Windows terminen
+    needs: build-and-publish
     runs-on: ubuntu-latest
     steps:
       - name: Download latest.json from Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Descarga el latest.json que la Acción de Tauri acaba de generar
-        run: gh release download ${{ github.ref_name }} --pattern latest.json
+        # Añadimos el parámetro --repo para que sepa de dónde descargarlo sin contexto de git
+        run: gh release download ${{ github.ref_name }} --pattern latest.json --repo ${{ github.repository }}
 
       - name: Update Gist
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
-          # 1. Metemos el contenido del archivo en un formato que la API de GitHub entienda
           jq -n --arg content "$(cat latest.json)" '{"files": {"update.json": {"content": $content}}}' > payload.json
-          
-          # 2. Hacemos la petición PATCH a tu Gist para sobrescribirlo
           gh api -X PATCH /gists/7b02aa1e30ac4b3a9daf82ccc554af19 --input payload.json
