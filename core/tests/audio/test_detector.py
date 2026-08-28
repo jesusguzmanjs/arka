@@ -19,16 +19,17 @@ significant candidate (the deliberate jump), so it produces a single
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import soundfile as sf
+from pathlib import Path
+
 from cuegrid.audio.detector import detect_events
 from cuegrid.audio.loader import load_window
 from cuegrid.config import AppConfig
-
 from tests.fixtures import generate_synthetic_fixture as fixture_gen
+
+
 @pytest.fixture(scope="module")
 def synthetic_track_path() -> Path:
     """(Re)generate the deterministic synthetic fixture at its canonical

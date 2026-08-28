@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from mutagen.id3 import ID3
 import pytest
+from mutagen.id3 import ID3
 
-from cuegrid.audio.metadata import (
+from cuegrid.audio import (
     UnsupportedAudioFormatError,
     write_metadata_to_file,
 )

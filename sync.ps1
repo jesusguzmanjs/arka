@@ -2,7 +2,7 @@
 
 Write-Host "`n[1/3] Compilando motor de Python con PyInstaller (ONEDIR)..." -ForegroundColor Cyan
 cd core
-$env:PYTHONPATH="src"
+$env:PYTHONPATH="."
 pyinstaller --clean --noconfirm cuegrid.spec
 cd ..
 

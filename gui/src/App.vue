@@ -3,19 +3,20 @@ import { computed, onMounted, onUnmounted, watch } from "vue";
 import { storeToRefs } from "pinia";
 import { type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import AppHeader from "./components/AppHeader.vue";
-import CollectionView from "./components/CollectionView.vue";
-import SessionHistoryView from "./components/SessionHistoryView.vue";
-import RemixStudioView from "./components/RemixStudioView.vue";
-import TraktorSafetyOverlay from "./components/TraktorSafetyOverlay.vue";
-import { useTraktorStatus } from "./composables/useTraktorStatus";
-import { useUnsavedChangesGuard } from "./composables/useUnsavedChangesGuard";
-import { useRunState } from "./composables/useRunState";
+import AppHeader from "./components/layout/AppHeader.vue";
+import CollectionView from "./components/collection/CollectionView.vue";
+import SessionHistoryView from "./components/history/SessionHistoryView.vue";
+import RemixStudioView from "./components/remix-studio/RemixStudioView.vue";
+import TraktorSafetyOverlay from "./components/layout/TraktorSafetyOverlay.vue";
+import CrashReportModal from "./components/ui/CrashReportModal.vue";
+import { useTraktorStatus } from "./composables/core/useTraktorStatus.ts";
+import { useUnsavedChangesGuard } from "./composables/core/useUnsavedChangesGuard.ts";
+import { useRunState } from "./composables/core/useRunState.ts";
 import { useSaveStore } from "./stores/useSaveStore";
-import { useLibraryState } from "./composables/useLibraryState";
-import { useAppToast } from "./composables/useAppToast";
-import { useConfigState } from "./composables/useConfigState";
-import { syncActiveRemixSet } from "./composables/useRemixAudio";
+import { useLibraryState } from "./composables/collection/useLibraryState.ts";
+import { useAppToast } from "./composables/core/useAppToast.ts";
+import { useConfigState } from "./composables/core/useConfigState.ts";
+import { syncActiveRemixSet } from "./composables/remix-studio/useRemixAudio.ts";
 import { type WorkspaceTab, useWorkspaceStore } from "./stores/useWorkspaceStore";
 
 const workspaceStore = useWorkspaceStore();
@@ -150,20 +151,21 @@ onUnmounted(() => {
       </button>
     </nav>
 
-    <main id="workspace-view" class="flex-1 min-h-0 flex flex-col overflow-hidden" role="tabpanel" :aria-labelledby="`${activeTab}-tab`">
+    <main id="workspace-view" class="flex-1 min-h-0 flex flex-col overflow-auto" role="tabpanel" :aria-labelledby="`${activeTab}-tab`">
       <component :is="activeView" />
     </main>
 
     <TraktorSafetyOverlay :is-running="isTraktorRunning" />
+    <CrashReportModal />
 
     <div
       v-if="toastMessage"
       class="fixed bottom-5 right-5 z-[10000] max-w-sm rounded border px-4 py-3 text-sm shadow-xl"
-      :class="toastKind === 'error' ? 'border-warning/70 bg-zinc-900 text-zinc-100' : 'border-success/50 bg-zinc-900 text-zinc-100'"
+      :class="toastKind === 'error' || toastKind === 'warning' ? 'border-warning/70 bg-zinc-900 text-zinc-100' : 'border-success/50 bg-zinc-900 text-zinc-100'"
       :role="toastKind === 'error' ? 'alert' : 'status'"
       :aria-live="toastKind === 'error' ? 'assertive' : 'polite'"
     >
-      <span class="mr-2" :class="toastKind === 'error' ? 'text-warning' : 'text-success'" aria-hidden="true">{{ toastKind === "error" ? "!" : "✓" }}</span>{{ toastMessage }}
+      <span class="mr-2" :class="toastKind === 'error' || toastKind === 'warning' ? 'text-warning' : 'text-success'" aria-hidden="true">{{ toastKind === "error" || toastKind === "warning" ? "!" : "✓" }}</span>{{ toastMessage }}
     </div>
   </div>
 </template>

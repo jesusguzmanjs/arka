@@ -1,9 +1,10 @@
 import { defineStore } from "pinia";
-import { useCueGridSidecar } from "../composables/useCueGridSidecar";
-import { useLibraryState } from "../composables/useLibraryState";
-import { syncPlayerAfterMetadataMutation } from "../composables/useTrackMetadata";
-import { showAppToast } from "../composables/useAppToast";
-import { isTraktorRunning } from "../composables/useTraktorStatus";
+import { useCueGridSidecar } from "../composables/core/useCueGridSidecar.ts";
+import { useLibraryState } from "../composables/collection/useLibraryState.ts";
+import { syncPlayerAfterMetadataMutation } from "../composables/player/useTrackMetadata.ts";
+import { showAppToast } from "../composables/core/useAppToast.ts";
+import { isTraktorRunning } from "../composables/core/useTraktorStatus.ts";
+import { useErrorReporter } from "../composables/core/useErrorReporter.ts";
 import type { CollectionTrack, MetadataPatch } from "../types/library";
 
 let activeSave: Promise<void> | null = null;
@@ -72,6 +73,9 @@ export const useSaveStore = defineStore("save", {
           await loadLibrary();
           await syncPlayerAfterMetadataMutation(paths);
           this.clearDirtyState();
+        } catch (error) {
+          useErrorReporter().triggerError(error);
+          throw error;
         } finally {
           this.isSaving = false;
           activeSave = null;

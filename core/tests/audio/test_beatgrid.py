@@ -5,7 +5,8 @@ Covers the formula and edge cases from ``.openspec/2-spec.md`` section 4
 """
 
 import pytest
-from cuegrid.audio.beatgrid import beat_length_ms, generate_phrase_candidates
+
+from cuegrid.audio import beat_length_ms, generate_phrase_candidates
 
 
 class TestBeatLengthMs:

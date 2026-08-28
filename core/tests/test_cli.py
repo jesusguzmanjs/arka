@@ -11,26 +11,23 @@ dataclass defaults on a per-flag basis.
 from __future__ import annotations
 
 import json
+import pytest
 import shutil
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import pytest
 from cuegrid import cli
 from cuegrid.config import AppConfig
-from cuegrid.core.pipeline import (
+from cuegrid.engine import (
     BatchResult,
     BatchSaveResult,
     BatchSaveTrackResult,
-    MetadataBatchResult,
-    MetadataTrackResult,
     PipelineResult,
 )
 from cuegrid.nml.constants import CueType
 from cuegrid.nml.models import TempoInfo, TrackEntry
 from cuegrid.nml.parser import AmbiguousTrackError, NmlParser, TrackNotFoundError
-
 from tests.fixtures import generate_synthetic_fixture as fixture_gen
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

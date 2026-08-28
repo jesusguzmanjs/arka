@@ -6,9 +6,9 @@ correctly extract its BPM and grid anchor (spec sections 2.1, 2.3, 7).
 """
 
 import logging
+import pytest
 from pathlib import Path
 
-import pytest
 from cuegrid.nml.constants import CueType
 from cuegrid.nml.parser import (
     AmbiguousPlaylistError,

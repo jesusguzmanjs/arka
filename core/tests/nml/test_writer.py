@@ -8,13 +8,13 @@ existing ``<CUE_V2>`` children.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+import pytest
 import re
 import shutil
 import xml.etree.ElementTree as ET
+from datetime import date, timedelta
 from pathlib import Path
 
-import pytest
 from cuegrid.nml.constants import CueType
 from cuegrid.nml.models import CuePoint
 from cuegrid.nml.parser import NmlParser
@@ -667,22 +667,61 @@ class TestManualCueAndGridUpdates:
         assert cue.start_ms == pytest.approx(12_345.678)
         assert 'START="987.654321"' in working_nml.read_text(encoding="utf-8")
 
-    def test_rejects_grid_update_for_flex_grid_without_writing(self, working_nml):
+    def test_skips_grid_update_for_flex_grid_and_saves_hotcues(self, working_nml):
         tree = ET.parse(working_nml)
         entry = tree.getroot().findall("./COLLECTION/ENTRY")[1]
         ET.SubElement(entry, "CUE_V2", TYPE="4", START="999.000000")
         tree.write(working_nml, encoding="UTF-8", xml_declaration=True)
-        original = working_nml.read_bytes()
 
-        with pytest.raises(ValueError, match="Flex Grid"):
-            NmlWriter(NmlParser(working_nml)).update_track_hotcues(
-                KNOWN_TRACK_PATH,
-                [],
-                grid_anchor_ms=500.0,
-            )
+        NmlWriter(NmlParser(working_nml)).update_track_hotcues(
+            KNOWN_TRACK_PATH,
+            [{"hotcue": 2, "start_ms": 500.0}],
+            grid_anchor_ms=500.0,
+        )
 
-        assert working_nml.read_bytes() == original
-        assert not _backup_files(working_nml)
+        entry = ET.parse(working_nml).getroot().findall("./COLLECTION/ENTRY")[1]
+        assert [cue.get("START") for cue in entry.findall("CUE_V2") if cue.get("TYPE") == "4"] == [
+            "63.084743",
+            "999.000000",
+        ]
+        assert any(
+            cue.get("TYPE") == "0" and cue.get("HOTCUE") == "2" and cue.get("START") == "500.000000"
+            for cue in entry.findall("CUE_V2")
+        )
+        assert len(_backup_files(working_nml)) == 1
+
+    def test_batch_save_skips_missing_analysis_nodes_and_saves_metadata(self, working_nml):
+        parser = NmlParser(working_nml)
+        entry = parser.find_entry_element(KNOWN_TRACK_PATH)
+        grid = next(cue for cue in entry.findall("CUE_V2") if cue.get("TYPE") == "4")
+        entry.remove(grid)
+        tempo = entry.find("TEMPO")
+        assert tempo is not None
+        entry.remove(tempo)
+
+        NmlWriter(parser).write_batch_save(
+            [(entry, [{"hotcue": 2, "start_ms": 500.0}], 0.0, 120.0, {"genre": "Techno"})]
+        )
+
+        saved_entry = ET.parse(working_nml).getroot().findall("./COLLECTION/ENTRY")[1]
+        assert not saved_entry.findall("CUE_V2[@TYPE='4']")
+        assert saved_entry.find("TEMPO") is None
+        assert saved_entry.find("INFO").get("GENRE") == "Techno"
+        assert any(
+            cue.get("TYPE") == "0" and cue.get("HOTCUE") == "2" and cue.get("START") == "500.000000"
+            for cue in saved_entry.findall("CUE_V2")
+        )
+        assert len(_backup_files(working_nml)) == 1
+
+    def test_treats_parser_default_bpm_as_no_update(self, working_nml):
+        NmlWriter(NmlParser(working_nml)).update_track_hotcues(
+            KNOWN_TRACK_PATH,
+            [],
+            bpm=0.0,
+        )
+
+        entry = NmlParser(working_nml).find_entry(KNOWN_TRACK_PATH)
+        assert entry.tempo.bpm == pytest.approx(60.000179)
 
     def test_updates_tempo_bpm_and_preserves_utf8_nml(self, working_nml):
         NmlWriter(NmlParser(working_nml)).update_track_hotcues(

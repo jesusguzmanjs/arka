@@ -2,7 +2,7 @@
 
 Status: Current implementation contract, synchronized 2026-07-16. Smart Playlist architecture added 2026-07-21.
 
-The checked-out Python source under `core/src/cuegrid/` is the source of truth. This specification records the active behavior; it does not preserve retired designs as future work.
+The checked-out Python source under `../core/cuegrid/` is the source of truth. This specification records the active behavior; it does not preserve retired designs as future work.
 
 ## 1. Scope and package layout
 
@@ -187,7 +187,7 @@ backup before processing the resolved batch, appends each successful track's
 new standard HotCue nodes in memory, and performs one atomic NML write after
 the complete processing loop only when at least one track produced cues.
 
-Flex Grid tracks are protected: single-track and batch analysis return a `flex_grid` skip before decoding. A batch-saved grid-anchor update requires exactly one Grid marker.
+Flex Grid tracks are protected: single-track and batch analysis return a `flex_grid` skip before decoding. A batch-saved grid-anchor update is applied only when the entry has exactly one Grid marker; absent and Flex Grid markers are left unchanged so the remaining track edits can persist.
 
 ### 5.1 Smart Playlist compilation
 
@@ -201,7 +201,8 @@ The evaluator must read XML attributes defensively. Missing child elements,
 missing attributes, empty strings, and malformed numeric/date values must not
 raise an exception or abort evaluation of later entries. A missing or invalid
 numeric value is treated as `0`; a missing or invalid text/key value as the
-empty string; and a missing or invalid date as no date. Therefore, a
+empty string; and a missing or invalid date as no date. For BPM only, this
+`0` value means no tempo data and matches no BPM rule. Therefore, a
 never-played track, for which Traktor commonly omits `INFO@PLAYCOUNT` and
 `INFO@LAST_PLAYED`, has `playcount = 0` and does not match a positive
 last-played date predicate. Invalid rule input is rejected before the NML tree
@@ -253,7 +254,9 @@ MUST NEVER use strict floating-point equality. BPM comparisons use a `0.5` BPM
 tolerance. For `equals`, a track matches when its stored BPM, half of its
 stored BPM, or double its stored BPM is within `0.5` BPM of the requested
 value. This supports equivalent half/double tempo representations used in DJ
-libraries. The half/double alternatives apply only to `equals`.
+libraries. A stored BPM of `0` represents missing Traktor analysis and MUST
+match no BPM rule, including `equals`, `greater_than`, `less_than`, and
+`between`. The half/double alternatives apply only to `equals`.
 
 For BPM `greater_than` and `less_than`, the stored value must be at least
 `0.5` BPM above or below the requested bound, respectively. For BPM `between`,
@@ -681,8 +684,10 @@ an incremental patch: it is an array of unique numeric `hotcue` indexes from 0
 through 7 with finite, non-negative `start_ms` values. The core updates or
 creates listed HotCues and removes standard HotCues not listed; it never
 changes Grid (`TYPE="4"`) or Load (`TYPE="3"`) markers. `grid_anchor_ms` is
-finite and non-negative and requires exactly one Grid marker. `bpm` is finite
-and inclusively between 50 and 200. `metadata` uses the supported partial-field
+finite and non-negative and is applied only when exactly one Grid marker
+exists. `bpm` is finite and inclusively between 50 and 200; the parser-default
+value `0` means no BPM update. Missing Grid or `TEMPO` nodes leave the relevant
+update unapplied without rejecting the batch. `metadata` uses the supported partial-field
 mapping in section 5.2 and must contain at least one supported key when
 present.
 

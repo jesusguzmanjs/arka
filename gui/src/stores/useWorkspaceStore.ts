@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
-import { useConfigState } from "../composables/useConfigState";
+import { useConfigState } from "../composables/core/useConfigState.ts";
 import type { CollectionTrack } from "../types/library";
 import type { RemixPadData } from "../types/remix";
 
@@ -11,8 +11,6 @@ export interface ActiveLoopRange {
   end: number;
   duration: number;
   beatCount: number;
-  fadeInMs: number;
-  fadeOutMs: number;
 }
 
 export type EditorMode = "library" | "pad";

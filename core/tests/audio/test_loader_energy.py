@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 import soundfile as sf
+
 from cuegrid.audio.legacy_stems import (
     DRUM_STEM_SILENCE_RMS_THRESHOLD,
     is_drum_stem_empty,

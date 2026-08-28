@@ -25,10 +25,9 @@ import them rather than hard-coding duplicate values.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import soundfile as sf
+from pathlib import Path
 
 # --- Fixture parameters (shared with tests/audio/test_detector.py) --------
 

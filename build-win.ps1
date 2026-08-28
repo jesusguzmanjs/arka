@@ -22,9 +22,12 @@ Write-Host ""
 Write-Host "[2/3] Freezing Python core with PyInstaller (--onedir)..." -ForegroundColor Cyan
 Push-Location $CoreDir
 try {
-    $env:PYTHONPATH = "src"
-    # Forzamos onedir y le damos el nombre esperado
-    pyinstaller --clean --noconfirm --onedir --name cuegrid-core src/cuegrid/cli.py
+    # Al estar dentro de 'core', el PYTHONPATH es el directorio actual
+    $env:PYTHONPATH = "."
+
+    # La ruta parte directamente de 'cuegrid'
+    pyinstaller --clean --noconfirm --onedir --name cuegrid-core cuegrid/cli.py
+
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE"
     }

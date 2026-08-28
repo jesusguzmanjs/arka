@@ -376,6 +376,25 @@ double-click alone calls `selectTrackForPreview`; it must not alter the Auto
 Cue target. Changing library context clears `selectedLibraryPaths` but does not
 unload the player preview.
 
+### Unanalyzed-track safeguards
+
+A track is unanalyzed when its `bpm` is `0`, `null`, or absent. The Collection
+table MUST render **Unanalyzed** in place of a numeric BPM, with a subdued
+warning treatment. These tracks remain selectable for metadata and playlist
+operations, but grid-dependent actions are unavailable: double-clicking a row
+must not load the Player; sending the track to Remix Studio or importing its
+loop into a Remix Deck pad must not load it; and the single-track Auto Cue
+context action must be disabled. Each blocked Player or Remix action shows:
+**"This track lacks BPM/Grid data in the collection. Please analyze or run
+Check Consistency in Traktor."** as a warning toast.
+
+`useCueGridSidecar().runSelectedTracks()` is the single batch Auto Cue guard.
+It filters unanalyzed tracks before constructing a Core request. If one or more
+tracks were removed, it shows a warning toast in the form **"N track(s)
+skipped. Lacks BPM/Grid data in the collection. Please analyze or run Check
+Consistency in Traktor."**; when no analyzed tracks remain, it does not start
+an analysis request.
+
 ### Auto Cue modal architecture (current)
 
 `AutoCueModal.vue` is the sole Auto Cue configuration and execution surface.
@@ -387,9 +406,11 @@ does not mutate configuration or start analysis.
 `LibraryBrowser.vue` remains the feature-composition owner. It must render a
 primary **Auto Cue (X)** button next to **Edit Metadata** in the top-right
 library header, where `X` is the current `selectedLibraryPaths.length`. This
-button opens the modal. The enabled/disabled target guard is unchanged: Auto
-Cue is available only when one or more tracks are selected or an active
-playlist provides a valid target; it is unavailable while analysis is active.
+button opens the modal. Auto Cue is enabled only when the selection contains at
+least one analyzed track (`bpm > 0`) or an active playlist provides a valid
+target; it is unavailable while analysis is active. The Edit Metadata button
+remains enabled for every non-empty selection, including selections consisting
+solely of unanalyzed tracks.
 
 The existing **Auto Cue Selected** track-context action and **Auto Cue
 Playlist** playlist-context action must no longer invoke the sidecar directly.

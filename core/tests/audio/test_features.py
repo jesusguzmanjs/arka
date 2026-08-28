@@ -7,7 +7,8 @@ scalar/vector inputs.
 
 import numpy as np
 import pytest
-from cuegrid.audio.features import (
+
+from cuegrid.audio import (
     confidence_score,
     energy_delta_db,
     is_significant_change,

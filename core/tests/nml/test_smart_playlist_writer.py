@@ -8,7 +8,6 @@ from pathlib import Path
 from cuegrid.nml.parser import NmlParser
 from cuegrid.nml.writer import NmlWriter, build_playlist_node, generate_playlist_uuid
 
-
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 SAMPLE_COLLECTION = FIXTURES_DIR / "sample_collection.nml"
 

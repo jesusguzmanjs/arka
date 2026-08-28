@@ -10,9 +10,9 @@ native Music folder -> NML-sibling fallback.
 """
 
 import base64
+import pytest
 from pathlib import Path
 
-import pytest
 from cuegrid.nml.models import TempoInfo, TrackEntry
 from cuegrid.nml.stems import (
     STEM_FLAG_BIT,

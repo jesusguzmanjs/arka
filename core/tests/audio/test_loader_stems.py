@@ -1,9 +1,9 @@
 """Tests for the dormant, opt-in legacy Stem extraction reference code."""
 
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 from cuegrid.audio.legacy_stems import DRUMS_STEM_STREAM_INDEX, extract_drum_stem
 
 

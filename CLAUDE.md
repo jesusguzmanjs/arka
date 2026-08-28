@@ -22,12 +22,12 @@ This is a monorepo containing a hybrid Vue + Tauri + Python application.
 Stop looking for a root `/src` directory or exactly `.openspec/2-spec.md`. Use the following map:
 
 ## 📂 Directory Layout
-- **Python Core:** `/core/` (Source code is in `/core/src/`, tests in `/core/tests/`).
+- **Python Core:** `/core/` (Source code is in `/core/cuegrid/`, tests in `/core/tests/`).
 - **Frontend (Vue):** `/gui/src/`
 - **Backend (Tauri/Rust):** `/gui/src-tauri/`
 - **Specifications:** `/.openspec/` (Note that files are named `2-core-spec.md`, `3-gui-spec.md`, etc. Read the directory contents if you need a spec).
 
 ## 🤖 Agent Guidelines
-1. When modifying audio analysis or librosa logic, work inside `/core/src/`.
+1. When modifying audio analysis or librosa logic, work inside `/core/cuegrid/`.
 2. When modifying UI components or Peaks.js, work inside `/gui/src/components/`.
 3. Do not complain about missing `2-spec.md`. If a spec is needed, I will provide it in the prompt or you can read `.openspec/2-core-spec.md`.

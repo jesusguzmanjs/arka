@@ -1317,7 +1317,7 @@ focus, matching native Traktor hardware's always-on pad behavior.
 
 ### 3.13 Delete Cue Context-Menu Action
 
-The implemented menu boundary is `gui/src/components/CueContextMenu.vue`.
+The implemented menu boundary is `../gui/src/components/collection/CueContextMenu.vue`.
 It renders only while `visible` is true, positions itself from `x`/`y`, adds
 a full-screen close backdrop, closes on Escape, and emits `close` or `delete`
 without owning cue state. `AudioPlayer.vue` owns the selected cue and the

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller build recipe for the CueGrid Python core resource (v2.0).
 
-Freezes ``src/cuegrid/cli.py`` into an uncompressed directory structure (--onedir)
+Freezes ``cuegrid/cli.py`` into an uncompressed directory structure (--onedir)
 that Tauri packages inside its ``resources`` bundle under the ``resources/cuegrid-core``
 path. This eliminates runtime extraction latency (0ms cold start).
 See ``../.openspec/3-gui-spec.md`` and ``../README.md`` for the full pipeline.
@@ -30,8 +30,8 @@ hiddenimports = (
 )
 
 a = Analysis(
-    ['src\\cuegrid\\cli.py'],
-    pathex=['src'],
+    ['cuegrid\\cli.py'],
+    pathex=['cuegrid'],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,

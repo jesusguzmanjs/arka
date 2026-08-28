@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['src\\cuegrid\\cli.py'],
+    ['cuegrid\\cli.py'],
     pathex=[],
     binaries=[],
     datas=[],
