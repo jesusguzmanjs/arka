@@ -1,6 +1,6 @@
 [package]
 name = "arka"
-version = "2.1.4"
+version = "2.1.5"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -30,3 +30,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 dirs = "6"
 quick-xml = "0.37"
 hound = "3.5.1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
