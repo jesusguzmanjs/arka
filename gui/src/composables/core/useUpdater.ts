@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import { shallowRef } from "vue";
 
 const currentAppVersion = shallowRef("");
@@ -31,7 +32,7 @@ async function loadCurrentVersion(): Promise<void> {
   }
 }
 
-async function executeUpdate(update: Update): Promise<void> {
+async function executeUpdate(update: Update, silent = false): Promise<void> {
   if (isUpdating.value) return;
 
   isUpdating.value = true;
@@ -40,7 +41,12 @@ async function executeUpdate(update: Update): Promise<void> {
     await relaunch();
   } catch (error) {
     console.error("Unable to install the available update:", error);
-    window.alert(`Unable to install the update. ${errorMessage(error)}`);
+    if (!silent) {
+      await message(`Unable to install the update. ${errorMessage(error)}`, {
+        title: "Update Error",
+        kind: "error"
+      });
+    }
   } finally {
     isUpdating.value = false;
   }
@@ -52,10 +58,19 @@ async function checkOnStartup(): Promise<void> {
     if (update === null) return;
 
     updateInfo.value = update;
-    const shouldInstall = window.confirm(
-      `Arka ${update.version} is available. Download, install, and restart now?`,
+
+    // ask() lanza una ventana a nivel de OS, imposible de saltar por el navegador
+    const shouldInstall = await ask(
+        `Arka v${update.version} is available. Download, install, and restart now?`,
+        {
+          title: "Update Available",
+          kind: "info",
+          okLabel: "Install and Restart",
+          cancelLabel: "Later",
+        }
     );
-    if (shouldInstall) await executeUpdate(update);
+
+    if (shouldInstall) await executeUpdate(update, true);
   } catch (error) {
     console.error("Unable to check for updates on startup:", error);
   }
@@ -68,10 +83,15 @@ async function checkManually(): Promise<void> {
   try {
     const update = await checkForUpdate();
     updateInfo.value = update;
-    if (update === null) window.alert("Arka is up to date.");
+    if (update === null) {
+      await message("Arka is up to date.", { title: "Updater", kind: "info" });
+    }
   } catch (error) {
     console.error("Unable to check for updates:", error);
-    window.alert(`Unable to check for updates. ${errorMessage(error)}`);
+    await message(`Unable to check for updates. ${errorMessage(error)}`, {
+      title: "Update Error",
+      kind: "error"
+    });
   } finally {
     isChecking.value = false;
   }
