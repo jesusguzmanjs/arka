@@ -68,6 +68,8 @@ jobs:
 
       # -- FASE 1: BUILD FRONTEND (VUE) --
       - name: Install Frontend Dependencies & Build Vue
+        env:
+          VITE_DISCORD_WEBHOOK_URL: ${{ secrets.VITE_DISCORD_WEBHOOK_URL }}
         run: |
           cd gui
           npm install
@@ -87,3 +89,23 @@ jobs:
           releaseBody: 'Update available. Please review the release notes.'
           releaseDraft: true
           prerelease: false
+
+  update-gist:
+    needs: build-and-publish # Espera a que Mac y Windows terminen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest.json from Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Descarga el latest.json que la Acción de Tauri acaba de generar
+        run: gh release download ${{ github.ref_name }} --pattern latest.json
+
+      - name: Update Gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          # 1. Metemos el contenido del archivo en un formato que la API de GitHub entienda
+          jq -n --arg content "$(cat latest.json)" '{"files": {"update.json": {"content": $content}}}' > payload.json
+          
+          # 2. Hacemos la petición PATCH a tu Gist para sobrescribirlo
+          gh api -X PATCH /gists/7b02aa1e30ac4b3a9daf82ccc554af19 --input payload.json
