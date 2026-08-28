@@ -1,16 +1,20 @@
 <script setup lang="ts">
 // AppHeader.vue
 // See .openspec/3-gui-spec.md §3.3 — title/branding + NML path indicator.
-import { computed } from "vue";
+import { computed, shallowRef } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useConfigState } from "../../composables/core/useConfigState.ts";
 import { useRunState } from "../../composables/core/useRunState.ts";
 import { useUnsavedChangesGuard } from "../../composables/core/useUnsavedChangesGuard.ts";
+import { useUpdater } from "../../composables/core/useUpdater.ts";
+import AboutUpdateModal from "../ui/AboutUpdateModal.vue";
 import BugReportModal from "../ui/BugReportModal.vue";
 
 const { customNmlPath, setCustomNmlPath } = useConfigState();
 const { isSystemBusy } = useRunState();
 const { resolveUnsavedChanges } = useUnsavedChangesGuard();
+const { currentAppVersion } = useUpdater();
+const isAboutModalOpen = shallowRef(false);
 
 const collectionButtonLabel = computed(() => {
   const path = customNmlPath.value;
@@ -40,8 +44,16 @@ async function selectCustomCollection(): Promise<void> {
       class="flex items-center justify-between px-6 py-3 bg-panel border-b border-border select-none"
   >
     <div class="flex items-center gap-2">
-      <span class="text-accent text-lg font-semibold tracking-wide">Arka</span>
-      <span class="text-xs text-dim uppercase tracking-widest">v2.0</span>
+      <button
+        type="button"
+        class="rounded text-accent text-lg font-semibold tracking-wide transition-colors hover:text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary/70"
+        aria-haspopup="dialog"
+        :aria-expanded="isAboutModalOpen"
+        @click="isAboutModalOpen = true"
+      >
+        Arka
+      </button>
+      <span class="text-xs text-dim uppercase tracking-widest">v{{ currentAppVersion || "…" }}</span>
     </div>
 
     <div class="flex items-center gap-3">
@@ -63,4 +75,6 @@ async function selectCustomCollection(): Promise<void> {
       </button>
     </div>
   </header>
+
+  <AboutUpdateModal :open="isAboutModalOpen" @close="isAboutModalOpen = false" />
 </template>

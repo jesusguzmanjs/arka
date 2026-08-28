@@ -16,6 +16,7 @@ import { useSaveStore } from "./stores/useSaveStore";
 import { useLibraryState } from "./composables/collection/useLibraryState.ts";
 import { useAppToast } from "./composables/core/useAppToast.ts";
 import { useConfigState } from "./composables/core/useConfigState.ts";
+import { useUpdater } from "./composables/core/useUpdater.ts";
 import { syncActiveRemixSet } from "./composables/remix-studio/useRemixAudio.ts";
 import { type WorkspaceTab, useWorkspaceStore } from "./stores/useWorkspaceStore";
 
@@ -33,6 +34,7 @@ const { resolveUnsavedChanges } = useUnsavedChangesGuard();
 const { loadLibrary } = useLibraryState();
 const { nmlPathOverride } = useConfigState();
 const { message: toastMessage, kind: toastKind, showAppToast } = useAppToast();
+const { loadCurrentVersion, checkOnStartup } = useUpdater();
 let unlistenCloseRequested: UnlistenFn | undefined;
 let isForceClosing = false;
 let traktorCloseReloadToken = 0;
@@ -65,6 +67,9 @@ watch(isTraktorRunning, async (isRunning, wasRunning) => {
 });
 
 onMounted(async () => {
+  void loadCurrentVersion();
+  void checkOnStartup();
+
   const appWindow = getCurrentWindow();
   unlistenCloseRequested = await appWindow.onCloseRequested(async (event) => {
     if (isForceClosing || !saveStore.isDirty) return;

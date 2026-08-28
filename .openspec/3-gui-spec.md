@@ -1,6 +1,6 @@
 # Spec: CueGrid GUI (Phase 2 — Tauri + Vue 3)
 
-Status: Current implementation synchronized 2026-07-22 (Vue/Tauri shell, Peaks.js player, library browser, modal Auto Cue flow, and Python sidecar flow). Smart Playlist architecture added 2026-07-21.
+Status: Current implementation synchronized 2026-08-28 (Vue/Tauri shell, Peaks.js player, library browser, modal Auto Cue flow, Python sidecar flow, and in-app updater). Smart Playlist architecture added 2026-07-21.
 
 ### Manual collection path fallback
 
@@ -34,6 +34,45 @@ state pattern, and the Tauri sidecar plumbing — is preserved
 unchanged.)
 
 ## Current implementation synchronization
+
+### In-app update system
+
+The desktop application MUST use Tauri v2's updater plugin to retrieve signed
+release artifacts from the configured update endpoint. The endpoint and public
+key are configured in `gui/src-tauri/tauri.conf.json`; updater artifacts are
+created by the Tauri bundle configuration. The Rust builder MUST register both
+the updater plugin and the process plugin. The desktop capability MUST grant
+the updater defaults and the process restart permission.
+
+`gui/src/composables/core/useUpdater.ts` owns module-scoped shared updater
+state. It exposes `currentAppVersion: Ref<string>`, `isChecking: Ref<boolean>`,
+`isUpdating: Ref<boolean>`, and `updateInfo: Ref<Update | null>`, together with
+the following actions:
+
+- `loadCurrentVersion()` reads the packaged version through
+  `@tauri-apps/api/app`'s `getVersion()`.
+- `checkOnStartup()` performs a background `check()` without presenting a
+  no-update message. When a new version exists, it records the `Update` and
+  asks the user whether to download, install, and restart immediately.
+- `checkManually()` marks its check as in progress, records a returned
+  `Update`, and presents a native latest-version message when `check()` returns
+  `null`.
+- `executeUpdate(update)` marks installation as in progress, awaits
+  `update.downloadAndInstall()`, then calls the process plugin's `relaunch()`.
+
+Only one updater check may be in flight at a time. Updater failures must not
+block application startup; manual checks and installs must show an actionable
+native error message.
+
+`App.vue` starts `loadCurrentVersion()` and `checkOnStartup()` on mount without
+delaying normal shell initialization. `AppHeader.vue` owns the visibility of
+`AboutUpdateModal.vue`. The visible **Arka** brand control opens that modal.
+The modal receives an `open` boolean and emits `close`; it displays the current
+version, supports manual checking, and, after finding an update, replaces its
+check action with **Install and Restart**. Its controls expose checking and
+installation progress, are disabled while their work is in flight, support
+keyboard focus and Escape-to-close when no installation is running, and use the
+existing dark amber/ochre interface tokens.
 
 ### Traktor process safety interlock
 
@@ -543,7 +582,7 @@ Out of scope (deferred to a future spec revision):
   the UI. The Configuration Panel exposes Target, Sensitivity, Max Cues,
   and Clear Existing; advanced tuning stays CLI-only
   until a future proposal revision asks for it.
-- CSV export (`--export-csv`), multi-window support, and auto-update.
+- CSV export (`--export-csv`) and multi-window support.
 - Any change to the Python core itself. Section 6 identifies one core
   change this spec *requires* (a machine-readable output mode) and flags
   it explicitly as a dependency to raise against `2-core-spec.md`, per
