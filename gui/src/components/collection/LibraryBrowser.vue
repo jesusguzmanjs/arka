@@ -9,11 +9,13 @@ import { showAppToast } from "../../composables/core/useAppToast.ts";
 import { normalizeHarmonicKey } from "../../utils/harmonicKeys.ts";
 import { isUnanalyzedTrack, MISSING_BPM_GRID_MESSAGE } from "../../utils/trackAnalysis.ts";
 import { useSaveStore } from "../../stores/useSaveStore.ts";
+import { useSmartFilterStore, type Track } from "../../stores/useSmartFilterStore.ts";
 import { useWorkspaceStore } from "../../stores/useWorkspaceStore.ts";
 import type { LibraryTrack } from "../../types/library.ts";
 import AutoCueModal from "./AutoCueModal.vue";
 import MetadataEditModal from "./MetadataEditModal.vue";
 import SmartPlaylistModal from "./SmartPlaylistModal.vue";
+import SmartFilterModal from "./SmartFilterModal.vue";
 import StaticPlaylistModal from "./StaticPlaylistModal.vue";
 import TrackContextMenu from "./TrackContextMenu.vue";
 import PlaylistContextMenu from "./PlaylistContextMenu.vue";
@@ -48,6 +50,7 @@ const {
 const { selectedTrackPath } = useConfigState();
 const { isLoadingTrack, activeDirectKeys, activeAdjacentKeys } = usePlayerState();
 const saveStore = useSaveStore();
+const smartFilterStore = useSmartFilterStore();
 const workspaceStore = useWorkspaceStore();
 
 const trackScrollElement = useTemplateRef<HTMLDivElement>("trackScrollElement");
@@ -69,6 +72,7 @@ const dragOverPlaylistUuid = shallowRef<string | null>(null);
 const isMetadataModalOpen = shallowRef(false);
 const isAutoCueModalOpen = shallowRef(false);
 const isSmartPlaylistModalOpen = shallowRef(false);
+const smartFilterTarget = shallowRef<LibraryTrack | null>(null);
 const isStaticPlaylistModalOpen = shallowRef(false);
 const toastMessage = shallowRef<string | null>(null);
 let toastTimer: number | undefined;
@@ -93,9 +97,30 @@ const isContextAutoCueEnabled = computed(() => {
   return !props.disabled && (target?.kind !== "track" || !isUnanalyzedTrack(target.track));
 });
 
+const isContextSmartFilterEnabled = computed(() => {
+  const target = contextMenu.value?.target;
+  return !props.disabled
+    && target?.kind === "track"
+    && target.track.bpm !== null
+    && Boolean(target.track.key?.trim());
+});
+
+type SmartFilterLibraryTrack = LibraryTrack & Track;
+
+function toSmartFilterTrack(track: LibraryTrack): SmartFilterLibraryTrack {
+  return {
+    ...track,
+    id: track.location_path,
+    bpm: track.bpm ?? 0,
+    key: track.key ?? "",
+  };
+}
+
 const filteredTracks = computed(() => {
   const query = searchQuery.value.trim().toLowerCase();
-  const baseTracks = currentViewTracks.value;
+  const baseTracks = smartFilterStore.filterTracks(
+    currentViewTracks.value.map(toSmartFilterTrack),
+  );
 
   if (!query) return baseTracks;
 
@@ -257,6 +282,27 @@ function openAutoCuePlaylist(): void {
 
 function closeContextMenu(): void {
   contextMenu.value = null;
+}
+
+function openSmartFilterModal(): void {
+  const target = contextMenu.value?.target;
+
+  // Guardamos el estado ANTES de destruir el menú
+  const canOpen = isContextSmartFilterEnabled.value && target?.kind === "track";
+
+  closeContextMenu();
+
+  if (!canOpen) return;
+
+  smartFilterTarget.value = target.track;
+}
+
+function closeSmartFilterModal(): void {
+  smartFilterTarget.value = null;
+}
+
+function showAllTracksForSmartFilter(): void {
+  selectContext(ALL_TRACKS_CONTEXT);
 }
 
 function startPlaylistRename(): void {
@@ -631,6 +677,29 @@ onUnmounted(() => {
         </div>
 
         <div
+            v-if="smartFilterStore.isActive && smartFilterStore.targetTrack"
+            class="mx-4 mt-3 flex shrink-0 items-center justify-between gap-4 rounded border border-primary/50 bg-zinc-950/80 px-3 py-2 text-xs shadow-[inset_3px_0_0_rgba(237,180,11,0.9)]"
+            role="status"
+            aria-live="polite"
+        >
+          <div class="min-w-0 text-zinc-200">
+            <p class="truncate font-semibold text-primary">
+              🎯 Dynamic Filter: Showing tracks compatible with {{ smartFilterStore.targetTrack.title ?? "selected track" }}
+            </p>
+            <p class="mt-0.5 truncate font-mono tabular-nums text-muted">
+              [BPM: ±{{ smartFilterStore.bpmTolerance }}% ({{ smartFilterStore.currentBpmRange.min.toFixed(1) }} – {{ smartFilterStore.currentBpmRange.max.toFixed(1) }})] | [Key: Max {{ smartFilterStore.keyJumps }} jumps]
+            </p>
+          </div>
+          <button
+              type="button"
+              class="shrink-0 rounded border border-primary/50 px-2.5 py-1.5 font-semibold text-primary transition-colors hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              @click="smartFilterStore.clearFilter()"
+          >
+            ✖ Clear Filter
+          </button>
+        </div>
+
+        <div
             v-if="libraryError"
             class="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-warn"
             role="alert"
@@ -788,10 +857,12 @@ onUnmounted(() => {
         :action-enabled="isContextAutoCueEnabled"
         :metadata-enabled="selectedMetadataTracks.length > 0 && !props.disabled"
         :selectAllEnabled="currentViewTracks.length > 0 && !props.disabled"
+        :compatible-filter-enabled="isContextSmartFilterEnabled"
         :remove-from-playlist-enabled="activePlaylist !== undefined && selectedLibraryPaths.length > 0 && !props.disabled"
         @action="runContextMenuAction"
         @selectAll="selectAllSongs"
         @edit-metadata="openMetadataEditor"
+        @find-compatible-tracks="openSmartFilterModal"
         @send-to-remix-studio="sendToRemixStudio"
         @remove-from-playlist="removeSelectedTracksFromPlaylist"
         @close="closeContextMenu"
@@ -817,6 +888,13 @@ onUnmounted(() => {
         v-if="isAutoCueModalOpen"
         :tracks="selectedMetadataTracks"
         @close="isAutoCueModalOpen = false"
+    />
+
+    <SmartFilterModal
+        v-if="smartFilterTarget"
+        :target-track="smartFilterTarget"
+        @close="closeSmartFilterModal"
+        @applied="showAllTracksForSmartFilter"
     />
 
     <SmartPlaylistModal

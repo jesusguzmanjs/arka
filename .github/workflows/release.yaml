@@ -87,7 +87,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Arka ${{ github.ref_name }}'
           releaseBody: 'Update available. Please review the release notes.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
 
   update-gist:

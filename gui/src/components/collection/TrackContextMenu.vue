@@ -9,6 +9,7 @@ const props = defineProps<{
   actionEnabled?: boolean;
   metadataEnabled?: boolean;
   selectAllEnabled?: boolean;
+  compatibleFilterEnabled?: boolean;
   removeFromPlaylistEnabled?: boolean;
 }>();
 
@@ -18,6 +19,7 @@ const emit = defineEmits<{
   action: [];
   selectAll: [];
   editMetadata: [];
+  findCompatibleTracks: [];
   sendToRemixStudio: [];
   removeFromPlaylist: [];
 }>();
@@ -83,6 +85,15 @@ onUnmounted(() => {
         @click="emit('action')"
     >
       {{ actionLabel }}
+    </button>
+    <button
+        type="button"
+        class="whitespace-nowrap rounded-sm px-2.5 py-1.5 text-left text-xs transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:cursor-not-allowed disabled:text-zinc-600 enabled:text-zinc-200 enabled:hover:bg-zinc-800 enabled:hover:text-primary"
+        role="menuitem"
+        :disabled="!compatibleFilterEnabled"
+        @click="emit('findCompatibleTracks')"
+    >
+      Find Compatible Tracks
     </button>
     <button
         type="button"
