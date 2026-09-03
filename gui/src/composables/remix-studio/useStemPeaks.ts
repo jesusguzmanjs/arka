@@ -257,7 +257,7 @@ export function useStemPeaks(options: StemPeaksOptions) {
     try {
       await Tone.start();
       tonePlayers = stemPaths.map((path) => {
-        const player = new Tone.Player({ url: convertFileSrc(path), autostart: false }).toDestination();
+        const player = new Tone.Player({ url: convertFileSrc(path), autostart: false, fadeIn: 0.004, fadeOut: 0.004, }).toDestination();
         player.sync().start(0);
         return player;
       });
@@ -340,9 +340,14 @@ export function useStemPeaks(options: StemPeaksOptions) {
     isLoading.value = false;
   }
 
+  function getTonePlayers(): Tone.Player[] {
+    return tonePlayers;
+  }
+
   return {
     getMasterPeaks,
     getStemPeaks,
+    getTonePlayers,
     isLoading,
     isReady,
     muted,

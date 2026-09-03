@@ -112,6 +112,7 @@ const isPadGridEditMode = ref(false);
 const {
   getMasterPeaks,
   getStemPeaks,
+  getTonePlayers,
   isLoading: isStemLoading, // <--- RECUPERADO: Faltaba extraelo aquí
   isReady: isStemReady,
   muted: mutedStems,
@@ -1059,6 +1060,8 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
     singleTonePlayer = new Tone.Player({
       url: convertFileSrc(sourcePath),
       loop: false,
+      fadeIn: 0.004,
+      fadeOut: 0.004,
     }).toDestination();
   }
   singleTonePlayer.sync().start(0);
@@ -1161,7 +1164,24 @@ async function restartLoop(): Promise<void> {
   const loopRange = activeLoopRange.value;
   if (!instance || !loopRange) return;
 
+  const now = Tone.now();
+  const playersToRamp = isMultiTrackMode.value
+      ? getTonePlayers()
+      : (singleTonePlayer ? [singleTonePlayer] : []);
+
+  for (const player of playersToRamp) {
+    player.volume.cancelScheduledValues(now);
+    player.volume.setValueAtTime(player.volume.value, now);
+    player.volume.linearRampToValueAtTime(-100, now + 0.002);
+  }
+
   instance.player.seek(loopRange.start);
+
+  for (const player of playersToRamp) {
+    player.volume.setValueAtTime(-100, now + 0.003);
+    player.volume.linearRampToValueAtTime(0, now + 0.006);
+  }
+
   if (isPlaying.value) return;
 
   activateStemPlayback();

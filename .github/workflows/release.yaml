@@ -65,6 +65,7 @@ jobs:
           mkdir -p "$(dirname "$RESOURCES_DIR")"
           cp -R dist/cuegrid-core/ "$RESOURCES_DIR"
           chmod +x "$RESOURCES_DIR/cuegrid-core"
+          codesign --force --deep --sign - "$RESOURCES_DIR/cuegrid-core"
 
       # -- FASE 1: BUILD FRONTEND (VUE) --
       - name: Install Frontend Dependencies & Build Vue
