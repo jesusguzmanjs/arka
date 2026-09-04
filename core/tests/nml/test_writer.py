@@ -120,7 +120,7 @@ class TestWriteRemixSet:
                     "mode": 3,
                     "sync": 0,
                     "reverse": 1,
-                    "transpose": -2.5,
+                    "transpose": -2,
                     "gain": 0.75,
                     "color_id": 7,
                     "key": "8D",
@@ -281,12 +281,12 @@ class TestWriteRemixSet:
             "MODE": "3",
             "TYPE": "2",
             "SPEED": "1.000000",
-            "TRANSPOSE": "-2.500000",
+            "TRANSPOSE": "-0.166667",
             "OFFSET": "0.000000",
             "NUDGE": "0.000000",
             "GAIN": "0.750000",
-            "START_MARKER": "12.500000",
-            "END_MARKER": "999.250000",
+            "START_MARKER": "0.012500",
+            "END_MARKER": "0.999250",
             "BPM": "126.500000",
             "DIR": NmlWriter._path_to_nml_location(str(destination))[1],
             "FILE": "A1_kick.wav",
@@ -322,7 +322,7 @@ class TestWriteRemixSet:
         assert sample_info.get("PLAYTIME") == "12"
         assert sample_info.get("PLAYTIME_FLOAT") == "12.345678"
         assert cell is not None
-        assert cell.get("END_MARKER") == "0.000000"
+        assert cell.get("END_MARKER") == "12.345678"
 
     def test_reuses_existing_collection_audio_without_copying_or_replacing_entry(
         self, working_nml, tmp_path, monkeypatch

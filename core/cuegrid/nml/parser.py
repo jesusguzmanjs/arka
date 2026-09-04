@@ -411,13 +411,17 @@ class NmlParser:
                 except (TrackNotFoundError, AmbiguousTrackError):
                     pass
 
-                start_ms = float(cell_el.get("START_MARKER", "0")) * 1000
-                end_ms = float(cell_el.get("END_MARKER", "0")) * 1000
+                start_ms = float(cell_el.get("START_MARKER", "0")) * 1000.0
+                end_ms = float(cell_el.get("END_MARKER", "0")) * 1000.0
 
                 # If Traktor saved 0 as the end marker, it means the full file.
                 # Provide the real duration to the frontend so it draws the full waveform.
                 if end_ms == 0.0 and duration_ms > 0.0:
                     end_ms = duration_ms
+
+                # Desnormalización: Traktor guarda fracción de octava (-1.0 .. +1.0) -> Semitonos (-12 .. +12)
+                raw_transpose = float(cell_el.get("TRANSPOSE", "0.0"))
+                transpose_semitones = int(round(raw_transpose * 12.0))
 
                 pads.append(
                     {
@@ -429,7 +433,7 @@ class NmlParser:
                         "reverse": int(cell_el.get("REVERSE", "0")),
                         "mode": int(cell_el.get("MODE", "0")),
                         "type": int(cell_el.get("TYPE", "0")),
-                        "transpose": float(cell_el.get("TRANSPOSE", "0")),
+                        "transpose": transpose_semitones,
                         "gain": float(cell_el.get("GAIN", "0")),
                         "start_ms": start_ms,
                         "end_ms": end_ms,

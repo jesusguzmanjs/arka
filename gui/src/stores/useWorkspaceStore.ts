@@ -52,6 +52,8 @@ export const useWorkspaceStore = defineStore("workspace", {
     activeTab: "collection" as WorkspaceTab,
     /** The track currently loaded into Remix Studio's Stem Editor. */
     activeStudioTrack: null as CollectionTrack | null,
+    /** Non-destructive pitch offset auditioned on the active source track, in semitones. */
+    sourceTranspose: 0,
     /** Temporary WAV paths returned from the native Stem extractor, in lane order. */
     activeStemTracks: [] as string[],
     /** Current Stem Editor mix state, in the same order as `activeStemTracks`. */
@@ -74,6 +76,7 @@ export const useWorkspaceStore = defineStore("workspace", {
 
     sendToRemixStudio(track: CollectionTrack): void {
       this.activeStudioTrack = track;
+      this.resetSourceTranspose();
       this.activeLoopRange = null;
       this.selectedStems = [];
       this.resetStemMixState();
@@ -83,6 +86,7 @@ export const useWorkspaceStore = defineStore("workspace", {
 
     setActiveStudioTrack(track: CollectionTrack | null): void {
       this.activeStudioTrack = track;
+      this.resetSourceTranspose();
       this.activeLoopRange = null;
       this.selectedStems = [];
       this.resetStemMixState();
@@ -96,6 +100,17 @@ export const useWorkspaceStore = defineStore("workspace", {
 
     setActiveLoopRange(range: ActiveLoopRange | null): void {
       this.activeLoopRange = range;
+    },
+
+    setSourceTranspose(value: number): void {
+      const normalized = Number(value);
+      this.sourceTranspose = Number.isFinite(normalized)
+        ? Math.max(-12, Math.min(12, Math.round(normalized)))
+        : 0;
+    },
+
+    resetSourceTranspose(): void {
+      this.sourceTranspose = 0;
     },
 
     setEditorMode(mode: EditorMode, padId: string | null = null): void {

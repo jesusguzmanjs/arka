@@ -19,6 +19,10 @@ const props = defineProps<{ track: CollectionTrack | null; stemTracks: string[] 
 const workspaceStore = useWorkspaceStore();
 const { previewCache } = usePlayerState();
 const { activeLoopRange, editorMode, editingPadId, remixPads } = storeToRefs(workspaceStore);
+const sourceTranspose = computed({
+  get: () => workspaceStore.sourceTranspose,
+  set: (value: number) => workspaceStore.setSourceTranspose(value),
+});
 const { isDeckPlaying, updatePlayerLoopRange, updatePlayerTranspose } = useRemixAudio();
 const waveformElement = useTemplateRef<HTMLDivElement>("waveform");
 const stemWaveformElements = useTemplateRef<HTMLDivElement[]>("stemWaveform");
@@ -35,6 +39,7 @@ let stemGridBpm = 0;
 let initToken = 0;
 let watchToken = 0;
 let singleTonePlayer: Tone.Player | Tone.GrainPlayer | null = null;
+let singleSourcePitchShift: Tone.PitchShift | null = null;
 let loopFadeGain: Tone.Gain | null = null;
 let padFadePart: Tone.Part | null = null;
 let singlePlayerEmitter: any = null;
@@ -82,6 +87,10 @@ const keyLabel = computed(() => {
   }
   return props.track?.key?.trim() || "—";
 });
+const sourceTransposeLabel = computed(() => {
+  const value = sourceTranspose.value;
+  return `${value > 0 ? "+" : ""}${value} st`;
+});
 const timeLabel = computed(() => `${formatTime(currentTime.value)} / ${formatTime(duration.value)}`);
 const playLabel = computed(() => isPlaying.value ? "Pause" : "Play");
 const isMultiTrackMode = computed(() => !isPadEditMode.value && props.stemTracks.length === 4);
@@ -113,6 +122,7 @@ const {
   getMasterPeaks,
   getStemPeaks,
   getTonePlayers,
+  setSourceTranspose: setStemSourceTranspose,
   isLoading: isStemLoading, // <--- RECUPERADO: Faltaba extraelo aquí
   isReady: isStemReady,
   muted: mutedStems,
@@ -413,6 +423,12 @@ watch(editTranspose, (newValue) => {
   }
 });
 
+watch(sourceTranspose, (value) => {
+  if (isPadEditMode.value) return;
+  if (singleSourcePitchShift) singleSourcePitchShift.pitch = value;
+  setStemSourceTranspose(value);
+}, { immediate: true });
+
 function createPeaksWaveformData(data: number[]) {
   return { json: { version: 2, channels: 1, sample_rate: 11025, samples_per_pixel: 64, bits: 8, length: Math.floor(data.length / 2), data } };
 }
@@ -475,18 +491,38 @@ function observeWaveformResize(container: HTMLDivElement | null): void {
 watch(waveformElement, observeWaveformResize, { flush: "post" });
 
 function handleZoomWheel(event: WheelEvent): void {
+  event.preventDefault();
+
   const activeInstance = activePeaks.value;
   const view = activeInstance?.views?.getView("zoomview");
   const container = isMultiTrackMode.value ? stemWaveformElements.value?.[0] : waveformElement.value;
 
-  if (!view || !container || duration.value <= 0) return;
+  if (!view || !container) return;
 
   const totalSeconds = duration.value;
   const startTime = view.getStartTime();
   const visibleSeconds = view.getEndTime() - startTime;
   const rect = container.getBoundingClientRect();
 
-  if (rect.width <= 0) return;
+  if (
+    !Number.isFinite(totalSeconds) || totalSeconds <= 0 ||
+    !Number.isFinite(startTime) ||
+    !Number.isFinite(visibleSeconds) || visibleSeconds <= 0 ||
+    !Number.isFinite(rect.width) || rect.width <= 0
+  ) return;
+
+  if (event.shiftKey) {
+    if (!Number.isFinite(event.deltaY)) return;
+
+    const panDelta = event.deltaY * (visibleSeconds / rect.width) * 1.5;
+    const maxStartTime = Math.max(0, totalSeconds - visibleSeconds);
+    const newStartTime = Math.max(0, Math.min(startTime + panDelta, maxStartTime));
+
+    view.setStartTime(newStartTime);
+    refreshCustomSelectionOverlay();
+    syncGridOpacity();
+    return;
+  }
 
   const ratio = (event.clientX - rect.left) / rect.width;
 
@@ -549,6 +585,10 @@ function destroyPeaks(): void {
     singleTonePlayer.stop();   // 2. Paramos su reproducción inmediatamente
     singleTonePlayer.dispose(); // 3. Destruimos el nodo de audio
     singleTonePlayer = null;
+  }
+  if (singleSourcePitchShift) {
+    singleSourcePitchShift.dispose();
+    singleSourcePitchShift = null;
   }
 }
 
@@ -1056,13 +1096,14 @@ async function loadTrack(track: CollectionTrack, sourcePath = track.location_pat
     }).connect(loopFadeGain);
     singleTonePlayer.detune = (Number(editTranspose.value) || 0) * 100;
   } else {
-    // Si es una pista normal de librería, usamos el Player estándar (¡Cero clicks en loops!)
+    // Keep source audition pitch changes independent from transport timing.
+    singleSourcePitchShift = new Tone.PitchShift(sourceTranspose.value).toDestination();
     singleTonePlayer = new Tone.Player({
       url: convertFileSrc(sourcePath),
       loop: false,
       fadeIn: 0.004,
       fadeOut: 0.004,
-    }).toDestination();
+    }).connect(singleSourcePitchShift);
   }
   singleTonePlayer.sync().start(0);
   if (isPadEditMode.value) updatePadFades();
@@ -1381,7 +1422,18 @@ onBeforeUnmount(() => {
             <button type="button" class="save-pad-button" :disabled="!activeLoopRange" @click="savePadEdit">Save Changes</button>
             <button type="button" class="cancel-pad-button" @click="cancelPadEdit">Cancel</button>
           </div>
-          <dl class="track-details" aria-label="Track details"><div><dt>BPM</dt><dd>{{ bpm }}</dd></div><div><dt>Key</dt><dd>{{ keyLabel }}</dd></div></dl>
+          <dl class="track-details" aria-label="Track details">
+            <div><dt>BPM</dt><dd>{{ bpm }}</dd></div>
+            <div><dt>Key</dt><dd>{{ keyLabel }}</dd></div>
+            <div v-if="!isPadEditMode" class="source-transpose-detail">
+              <dt>Transpose</dt>
+              <dd>
+                <button type="button" :disabled="sourceTranspose <= -12" aria-label="Lower source transpose by one semitone" @click="sourceTranspose -= 1">−</button>
+                <output aria-label="Source transpose">{{ sourceTransposeLabel }}</output>
+                <button type="button" :disabled="sourceTranspose >= 12" aria-label="Raise source transpose by one semitone" @click="sourceTranspose += 1">+</button>
+              </dd>
+            </div>
+          </dl>
         </div>
       </header>
       <div v-if="isMultiTrackMode" class="stem-lanes" aria-label="Stem tracks" @mousedown.capture="handleLanesMousedown">
@@ -1483,7 +1535,7 @@ onBeforeUnmount(() => {
 .stem-editor { position: relative; }
 .track-header { display: flex; min-width: 0; margin-top: 0; align-items: center; justify-content: space-between; gap: 1rem; }.track-identification { min-width: 0; }.track-title { margin: 0; overflow: hidden; color: #f2f2f2; font-size: 1.125rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }.empty-state { margin-top: .75rem; color: #8a8a8e; font-size: .875rem; }
 .track-header-actions { display: flex; flex: 0 0 auto; flex-direction: column; align-items: flex-end; gap: .5rem; }
-.track-details { display: flex; margin: 0; gap: 1rem; font-variant-numeric: tabular-nums; }.track-details div { display: grid; gap: .15rem; }.track-details dt { color: #8a8a8e; font-size: .625rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }.track-details dd { margin: 0; color: #f7d15f; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .8125rem; }
+.track-details { display: flex; margin: 0; gap: 1rem; font-variant-numeric: tabular-nums; }.track-details div { display: grid; gap: .15rem; }.track-details dt { color: #8a8a8e; font-size: .625rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }.track-details dd { margin: 0; color: #f7d15f; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .8125rem; }.source-transpose-detail dd { display: inline-flex; align-items: center; gap: .1875rem; }.source-transpose-detail button { display: grid; width: 1.25rem; height: 1.25rem; padding: 0; place-items: center; border: 1px solid #5a5a5e; border-radius: .1875rem; background: #2a2a2e; color: #f7d15f; cursor: pointer; font: inherit; font-weight: 800; line-height: 1; }.source-transpose-detail button:hover:not(:disabled) { border-color: #f7d15f; background: #3a3a3e; }.source-transpose-detail button:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }.source-transpose-detail button:disabled { cursor: not-allowed; opacity: .45; }.source-transpose-detail output { min-width: 3.25rem; color: #f7d15f; text-align: center; }
 .waveform-shell { position: relative; min-height: 240px; margin-top: .375rem; flex: 1; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.waveform-shell.is-loading { opacity: .6; }.waveform { width: 100%; height: 100%; min-height: 150px; }.waveform-status { position: absolute; inset: 0; display: grid; margin: 0; place-items: center; color: #8a8a8e; font-size: .75rem; pointer-events: none; }
 .stem-lanes { position: relative; display: grid; min-width: 0; min-height: 0; margin-top: .375rem; flex: 1 1 0; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 0; overflow: hidden; border: 1px solid #3a3a3e; background: #17171a; }.stem-lane { display: grid; min-height: 0; grid-template-columns: var(--stem-controls-width) minmax(0, 1fr); overflow: hidden; background: #17171a; }.stem-lane + .stem-lane { border-top: 1px solid #3a3a3e; }.stem-controls { display: grid; width: var(--stem-controls-width); min-width: var(--stem-controls-width); align-content: center; gap: .125rem; padding: .125rem .375rem; border-right: 1px solid #3a3a3e; background: #202024; }.stem-actions { display: flex; min-width: 0; gap: .1875rem; }.stem-control { min-width: 0; flex: 1; padding: .125rem 0; border: 1px solid #5a5a5e; border-radius: .125rem; background: #2a2a2e; color: #f2f2f2; cursor: pointer; font-family: ui-monospace, "Cascadia Code", monospace; font-size: .625rem; font-weight: 800; }.stem-control:hover { border-color: #f7d15f; color: #f7d15f; }.stem-control.is-active { border-color: var(--stem-color); background: var(--stem-color); color: #17171a; }.stem-control:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }.stem-waveform { min-width: 0; height: 100%; overflow: hidden; background: linear-gradient(90deg, rgb(237 180 11 / 5%), transparent 35%); }.stem-waveform.is-dimmed { pointer-events: none; opacity: .3; transition: opacity .2s ease-in-out; }.stem-name { color: var(--stem-color); font-size: .5625rem; font-weight: 700; letter-spacing: .08em; text-align: center; text-transform: uppercase; }.stem-loading { margin: .5rem 0 0; color: #8a8a8e; font-size: .75rem; }
 .trim-mask { position: absolute; z-index: 5; top: 0; bottom: 0; background: rgba(23, 23, 26, 0.6); backdrop-filter: grayscale(100%); pointer-events: none; }.custom-selection-overlay { position: absolute; z-index: 10; pointer-events: auto; background-color: rgba(247, 209, 95, 0.25); box-shadow: -0.5px 0 0 0.5px rgba(247, 209, 95, 0.8), 0.5px 0 0 0.5px rgba(247, 209, 95, 0.8); cursor: move; }.custom-selection-overlay.is-trim-selection { background: transparent; box-shadow: none; pointer-events: none !important; cursor: default !important; }.custom-selection-overlay.is-trim-selection .selection-handle { pointer-events: auto !important; cursor: ew-resize; }.selection-handle { position: absolute; top: 0; bottom: 0; width: 10px; cursor: ew-resize; background: transparent; }.handle-left { left: -5px; }.handle-right { right: -5px; }

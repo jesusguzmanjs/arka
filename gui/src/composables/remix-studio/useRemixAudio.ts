@@ -492,7 +492,7 @@ function createRemixAudioState() {
           name: incomingPad.name,
           color,
           playType: incomingPad.type === 0 ? "loop" : "one-shot",
-          triggerMode: incomingPad.mode === 1 ? "gate" : "trigger",
+          triggerMode: incomingPad.mode === 0 ? "gate" : "trigger",
           sync: incomingPad.sync === 1,
           reverse: incomingPad.reverse === 1,
           keylock: columnKeylock[location.columnIndex],

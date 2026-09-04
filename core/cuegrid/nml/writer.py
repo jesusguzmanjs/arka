@@ -215,12 +215,24 @@ class NmlWriter:
                     cell_el.set("MODE", str(pad_data.get("mode", 0)))
                     cell_el.set("TYPE", str(pad_data.get("type", 1)))
                     cell_el.set("SPEED", "1.000000")
-                    cell_el.set("TRANSPOSE", f"{pad_data.get('transpose', 0):.6f}")
+
+                    semitones = float(pad_data.get("transpose", 0.0))
+                    traktor_transpose = semitones / 12.0
+
+                    cell_el.set("TRANSPOSE", f"{traktor_transpose:.6f}")
                     cell_el.set("OFFSET", "0.000000")
                     cell_el.set("NUDGE", "0.000000")
                     cell_el.set("GAIN", f"{pad_data.get('gain', 0.5):.6f}")
-                    cell_el.set("START_MARKER", f"{pad_data.get('start_ms', 0.0):.6f}")
-                    cell_el.set("END_MARKER", f"{pad_data.get('end_ms', 0.0):.6f}")
+
+
+                    start_marker_sec = pad_data.get("start_ms", 0.0) / 1000.0
+                    end_marker_sec = pad_data.get("end_ms", 0.0) / 1000.0
+                    duration_sec = pad_data.get("duration_ms", 0.0) / 1000.0
+                    if end_marker_sec <= 0.0 < duration_sec:
+                        end_marker_sec = duration_sec
+
+                    cell_el.set("START_MARKER", f"{start_marker_sec:.6f}")
+                    cell_el.set("END_MARKER", f"{end_marker_sec:.6f}")
                     cell_el.set("BPM", f"{pad_data.get('bpm', 120.0):.6f}")
 
                     sample_volume, sample_directory, file_ = self._path_to_nml_location(str(destination))

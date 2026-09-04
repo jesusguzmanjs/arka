@@ -60,7 +60,7 @@ const {
 } = useRemixAudio();
 const workspaceStore = useWorkspaceStore();
 const { nmlPathOverride: currentNmlPath } = useConfigState();
-const { activeLoopRange, activeStemTracks, activeStudioTrack, stemMuted, stemSoloed, remixPads } = storeToRefs(workspaceStore);
+const { activeLoopRange, activeStemTracks, activeStudioTrack, sourceTranspose, stemMuted, stemSoloed, remixPads } = storeToRefs(workspaceStore);
 const isImportingLoop = shallowRef(false);
 const isExportingRemixSet = shallowRef(false);
 const isLoadRemixSetModalOpen = shallowRef(false);
@@ -185,19 +185,27 @@ async function exportRemixSet(): Promise<void> {
     const audio = pad.audio;
     if (!audio?.filePath) return [];
 
+    const padStartMs = pad.settings.loopStart !== null && pad.settings.loopStart !== undefined
+        ? pad.settings.loopStart * 1000
+        : (audio.startMs ?? 0);
+
+    const padEndMs = pad.settings.loopEnd !== null && pad.settings.loopEnd !== undefined
+        ? pad.settings.loopEnd * 1000
+        : (audio.endMs ?? audio.durationMs ?? 0);
+
     return [{
       id: pad.settings.id,
       name: pad.settings.name,
       path: audio.filePath,
       type: pad.settings.playType === "loop" ? 0 : 1,
-      mode: pad.settings.triggerMode === "gate" ? 1 : 0,
+      mode: pad.settings.triggerMode === "gate" ? 0 : 1,
       sync: pad.settings.sync ? 1 : 0,
       reverse: pad.settings.isReversed ? 1 : 0,
       transpose: Number(pad.settings.transpose) || 0,
       gain: Math.max(0, Math.min(1, (pad.settings.volume + 1) / 2)),
       color_id: traktorColorIndex(pad.settings.color),
-      start_ms: (pad.settings.loopStart ?? 0) * 1000,
-      end_ms: (pad.settings.loopEnd ?? 0) * 1000,
+      start_ms: padStartMs,
+      end_ms: padEndMs,
       duration_ms: audio.durationMs ?? 0,
       bpm: audio.originalBpm,
       key: audio.originalKey ?? "",
@@ -743,8 +751,11 @@ async function importLoopToPad({ colIndex, padIndex, padId }: PadImportTarget): 
       ...pad.settings,
       color: TRAKTOR_COLORS[Math.floor(Math.random() * TRAKTOR_COLORS.length)],
       name: pad.settings.id,
+      transpose: sourceTranspose.value,
       fadeInMs: 0,
       fadeOutMs: 0,
+      loopStart: 0,
+      loopEnd: result.duration_ms / 1000.0,
     };
     loadPadAudio(pad.settings.id, colIndex, result.file_path, pad.settings, pad.audio);
   } catch (error) {

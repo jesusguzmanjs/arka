@@ -67,7 +67,7 @@ class TestRemixSetParsing:
 <SET TITLE="Live Set" QUANT_VAlUE="8" QUANT_STATE="1">
 <TEMPO BPM="128.5" />
 <SLOT KEYLOCK="1" PUNCHMODE="0" FXENABLE="1">
-  <CELL INDEX="0" CELLNAME="Kick" COLOR="7" SYNC="1" REVERSE="0" MODE="3" TYPE="2" TRANSPOSE="-2.5" GAIN="0.75" START_MARKER="12.5" END_MARKER="99.25" BPM="126.5" VOLUME="C:" DIR="/:Samples/:" FILE="kick.wav" />
+  <CELL INDEX="0" CELLNAME="Kick" COLOR="7" SYNC="1" REVERSE="0" MODE="3" TYPE="2" TRANSPOSE="-0.166667" GAIN="0.75" START_MARKER="12.5" END_MARKER="99.25" BPM="126.5" VOLUME="C:" DIR="/:Samples/:" FILE="kick.wav" />
 </SLOT>
 <SLOT KEYLOCK="0" PUNCHMODE="1" FXENABLE="0" />
 </SET>
@@ -97,7 +97,7 @@ class TestRemixSetParsing:
                     "reverse": 0,
                     "mode": 3,
                     "type": 2,
-                    "transpose": -2.5,
+                    "transpose": -2,
                     "gain": 0.75,
                     "start_ms": 12500.0,
                     "end_ms": 99250.0,

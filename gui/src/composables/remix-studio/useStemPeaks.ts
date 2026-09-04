@@ -31,6 +31,8 @@ export function useStemPeaks(options: StemPeaksOptions) {
   const soloed = shallowRef<number | null>(null);
   let instances: any[] = [];
   let tonePlayers: Tone.Player[] = [];
+  let tonePitchShifts: Tone.PitchShift[] = [];
+  let sourceTranspose = 0;
   let initToken = 0;
   let syncFrame: number | null = null;
   let resizeFrame: number | null = null;
@@ -257,7 +259,10 @@ export function useStemPeaks(options: StemPeaksOptions) {
     try {
       await Tone.start();
       tonePlayers = stemPaths.map((path) => {
-        const player = new Tone.Player({ url: convertFileSrc(path), autostart: false, fadeIn: 0.004, fadeOut: 0.004, }).toDestination();
+        const player = new Tone.Player({ url: convertFileSrc(path), autostart: false, fadeIn: 0.004, fadeOut: 0.004, });
+        const pitchShift = new Tone.PitchShift(sourceTranspose).toDestination();
+        player.connect(pitchShift);
+        tonePitchShifts.push(pitchShift);
         player.sync().start(0);
         return player;
       });
@@ -337,6 +342,8 @@ export function useStemPeaks(options: StemPeaksOptions) {
     eventEmitters.clear();
     for (const player of tonePlayers) player.dispose();
     tonePlayers = [];
+    for (const pitchShift of tonePitchShifts) pitchShift.dispose();
+    tonePitchShifts = [];
     isLoading.value = false;
   }
 
@@ -344,10 +351,17 @@ export function useStemPeaks(options: StemPeaksOptions) {
     return tonePlayers;
   }
 
+  /** Applies source pitch without changing the shared transport timing. */
+  function setSourceTranspose(value: number): void {
+    sourceTranspose = Number.isFinite(value) ? Math.max(-12, Math.min(12, Math.round(value))) : 0;
+    for (const pitchShift of tonePitchShifts) pitchShift.pitch = sourceTranspose;
+  }
+
   return {
     getMasterPeaks,
     getStemPeaks,
     getTonePlayers,
+    setSourceTranspose,
     isLoading,
     isReady,
     muted,
